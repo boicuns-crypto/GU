@@ -64,6 +64,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 /**
@@ -102,6 +104,7 @@ class CockpitProjectionManager(
     private var cockpitPresentation: CockpitPresentation? = null
     private var encoderDrainJob: Job? = null
 
+    private val projectionMutex = Mutex()
     private val isEncoding = AtomicBoolean(false)
     private var cachedSpsPpsAnnexB: ByteArray? = null
 
@@ -116,46 +119,39 @@ class CockpitProjectionManager(
         frameRate: Int = 60,
         bitRate: Int = 12_000_000,
         densityDpi: Int = DisplayMetrics.DENSITY_XHIGH
-    ): Boolean {
-        stopProjection()
+    ): Boolean = projectionMutex.withLock {
+        stopProjectionLocked()
 
-        return try {
-            val codec = configureLowLatencyAvcEncoder(width, height, frameRate, bitRate)
-            val inputSurface = codec.createInputSurface()
+        var codec: MediaCodec? = null
+        var inputSurface: Surface? = null
+        var vDisplay: VirtualDisplay? = null
+
+        return@withLock try {
+            codec = configureLowLatencyAvcEncoder(width, height, frameRate, bitRate)
+            inputSurface = codec.createInputSurface()
             codec.start()
 
-            val vDisplay = displayManager.createVirtualDisplay(
+            // Private Presentation VirtualDisplay: sets Display.FLAG_PRIVATE | Display.FLAG_PRESENTATION |
+            // Display.FLAG_OWN_CONTENT_ONLY so Presentation uses TYPE_PRIVATE_PRESENTATION (2030) and
+            // WindowManagerService registers DisplayContent without MediaProjection or SYSTEM_ALERT_WINDOW.
+            vDisplay = displayManager.createVirtualDisplay(
                 VIRTUAL_DISPLAY_NAME,
                 width,
                 height,
                 densityDpi,
                 inputSurface,
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY or
-                    DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION or
+                    DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY
             )
 
+            val createdDisplay = vDisplay.display
+            awaitDisplayRegistered(createdDisplay.displayId)
+
+            val presentation = showPresentationWithRetry(createdDisplay)
+
             withContext(Dispatchers.Main.immediate) {
-                val displayContext = appContext.createDisplayContext(vDisplay.display)
-                val presentationContext = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                    runCatching {
-                        displayContext.createWindowContext(
-                            vDisplay.display,
-                            WINDOW_TYPE_PRESENTATION,
-                            null
-                        )
-                    }.getOrElse { displayContext }
-                } else {
-                    displayContext
-                }
-                val presentation = CockpitPresentation(
-                    outerContext = presentationContext,
-                    display = vDisplay.display,
-                    statsFlow = _stats
-                )
-                presentation.show()
                 cockpitPresentation = presentation
             }
-
             mediaCodec = codec
             encoderInputSurface = inputSurface
             virtualDisplay = vDisplay
@@ -178,15 +174,78 @@ class CockpitProjectionManager(
             true
         } catch (t: Throwable) {
             Log.e(TAG, "Failed to initialize CockpitProjectionManager", t)
+            runCatching { vDisplay?.release() }
+            runCatching { codec?.stop() }
+            runCatching { codec?.release() }
+            runCatching { inputSurface?.release() }
+            stopProjectionLocked(updateStatus = false)
             _stats.update {
                 it.copy(
                     isRunning = false,
+                    spsPpsConfigured = false,
                     statusMessage = "Projection Init Error: ${t.message}"
                 )
             }
-            stopProjection()
             false
         }
+    }
+
+    private suspend fun awaitDisplayRegistered(displayId: Int) {
+        repeat(12) { attempt ->
+            val resolved = displayManager.getDisplay(displayId)
+            if (resolved != null && resolved.isValid) {
+                if (attempt > 0) {
+                    Log.d(TAG, "VirtualDisplay id=$displayId became ready after ${attempt * 25}ms")
+                }
+                return
+            }
+            delay(25L)
+        }
+    }
+
+    private suspend fun showPresentationWithRetry(display: Display): CockpitPresentation {
+        var lastError: WindowManager.InvalidDisplayException? = null
+        val isPrivateDisplay = (display.flags and Display.FLAG_PRIVATE) != 0
+        val windowType = if (isPrivateDisplay) {
+            WINDOW_TYPE_PRIVATE_PRESENTATION
+        } else {
+            WINDOW_TYPE_PRESENTATION
+        }
+
+        for (attempt in 0 until 4) {
+            try {
+                return withContext(Dispatchers.Main.immediate) {
+                    val displayContext = appContext.createDisplayContext(display)
+                    val presentationContext = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                        runCatching {
+                            displayContext.createWindowContext(
+                                display,
+                                windowType,
+                                null
+                            )
+                        }.getOrElse { displayContext }
+                    } else {
+                        displayContext
+                    }
+                    val presentation = CockpitPresentation(
+                        outerContext = presentationContext,
+                        display = display,
+                        statsFlow = _stats
+                    )
+                    presentation.show()
+                    presentation
+                }
+            } catch (e: WindowManager.InvalidDisplayException) {
+                lastError = e
+                Log.w(
+                    TAG,
+                    "Presentation.show() attempt ${attempt + 1} got InvalidDisplayException " +
+                        "(displayId=${display.displayId}, flags=0x${display.flags.toString(16)})"
+                )
+                delay(75L * (attempt + 1))
+            }
+        }
+        throw lastError ?: WindowManager.InvalidDisplayException("Unable to show Presentation on display ${display.displayId}")
     }
 
     fun requestInstantIdrKeyFrame() {
@@ -286,7 +345,11 @@ class CockpitProjectionManager(
         }
     }
 
-    suspend fun stopProjection() {
+    suspend fun stopProjection() = projectionMutex.withLock {
+        stopProjectionLocked(updateStatus = true)
+    }
+
+    private suspend fun stopProjectionLocked(updateStatus: Boolean = true) {
         isEncoding.set(false)
         encoderDrainJob?.cancel()
         encoderDrainJob = null
@@ -307,12 +370,14 @@ class CockpitProjectionManager(
         encoderInputSurface = null
         cachedSpsPpsAnnexB = null
 
-        _stats.update {
-            it.copy(
-                isRunning = false,
-                spsPpsConfigured = false,
-                statusMessage = "Projection Stopped"
-            )
+        if (updateStatus) {
+            _stats.update {
+                it.copy(
+                    isRunning = false,
+                    spsPpsConfigured = false,
+                    statusMessage = "Projection Stopped"
+                )
+            }
         }
     }
 
@@ -506,7 +571,8 @@ class CockpitProjectionManager(
         private const val TAG = "CockpitProjectionMgr"
         private const val VIRTUAL_DISPLAY_NAME = "JettaVS7_CarLife_Cockpit"
         private const val DEQUEUE_TIMEOUT_US = 10_000L
-        // AOSP WindowManager.LayoutParams.TYPE_PRESENTATION = 2037 (@hide in public android.jar)
+        // AOSP WindowManager.LayoutParams.TYPE_PRIVATE_PRESENTATION = 2030 / TYPE_PRESENTATION = 2037
+        private const val WINDOW_TYPE_PRIVATE_PRESENTATION = 2030
         private const val WINDOW_TYPE_PRESENTATION = 2037
     }
 }
@@ -601,8 +667,8 @@ class CockpitPresentation(
     }
 
     override fun dismiss() {
-        lifecycleOwner.onDestroy()
         super.dismiss()
+        lifecycleOwner.onDestroy()
     }
 }
 
