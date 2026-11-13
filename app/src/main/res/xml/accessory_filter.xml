@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Canonical Baidu CarLife AOA v1/v2 descriptor used by most OEM Head Units -->
+    <usb-accessory
+        manufacturer="Baidu"
+        model="CarLife" />
+
+    <!-- Extended Baidu CarLife descriptors used by Changan / Geely / Haval / Chery / BYD Head Units -->
+    <usb-accessory
+        manufacturer="Baidu_CarLife"
+        model="CarLife" />
+
+    <usb-accessory
+        manufacturer="Baidu"
+        model="CarLife_Module" />
+
+    <usb-accessory
+        manufacturer="Baidu Inc."
+        model="CarLife" />
+
+    <usb-accessory
+        manufacturer="Baidu CarLife"
+        model="CarLife" />
+
+    <!-- Legacy Baidu CarLife SDK & reference board descriptors -->
+    <usb-accessory
+        manufacturer="Analysis"
+        model="CarLife" />
+
+    <!-- Fallback AOA descriptors used by aftermarket Linux/Android CarLife bridge adapters -->
+    <usb-accessory
+        manufacturer="Google, Inc."
+        model="CarLife" />
+</resources>
