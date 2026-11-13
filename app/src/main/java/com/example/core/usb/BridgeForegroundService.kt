@@ -19,10 +19,8 @@ import android.view.MotionEvent
 import androidx.core.app.NotificationCompat
 import com.example.MainActivity
 import com.example.R
-import com.example.core.carlife.CarLifeEngineCallbacks
 import com.example.core.carlife.CarLifeHardKeyPacket
 import com.example.core.carlife.CarLifeTouchPacket
-import com.example.core.carlife.CarLifeUsbEngine
 import com.example.core.projection.CockpitProjectionManager
 import com.example.core.projection.ProjectionPipelineStats
 import com.example.protocol.carlife.CarLifeChannel
@@ -31,7 +29,9 @@ import com.example.protocol.carlife.CarLifeControlStateMachine
 import com.example.protocol.carlife.CarLifeFrame
 import com.example.protocol.carlife.CarLifeFrameCodec
 import com.example.protocol.carlife.CarLifeInputEvent
+import com.example.protocol.carlife.CarLifeMsgType
 import com.example.protocol.carlife.CarLifeTouchDecoder
+import com.example.protocol.carlife.CarLifeTouchEventType
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -43,6 +43,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 /**
@@ -69,6 +70,7 @@ data class BridgeRuntimeState(
     val transportState: UsbTransportState = UsbTransportState.Disconnected,
     val controlSession: CarLifeControlSessionState = CarLifeControlSessionState(),
     val projectionStats: ProjectionPipelineStats = ProjectionPipelineStats(),
+    val useNestedVideoMsgHeader: Boolean = CarLifeFrameCodec.useNestedVideoMsgHeader,
     val lastTouchOrKeyEvent: String = "None — Waiting for Touch/Hardkey Channel (0x0006)",
     val rxBytes: Long = 0L,
     val txBytes: Long = 0L,
@@ -144,11 +146,11 @@ object BridgeTelemetryBus {
 }
 
 /**
- * Foreground Service (`connectedDevice` type) with `PARTIAL_WAKE_LOCK` orchestrating:
- * - **Core 1**: [CarLifeUsbEngine] & [UsbAccessoryTransport] (USB AOA + Control Handshake + Heartbeat)
+ * Foreground Service (`connectedDevice|microphone` type) with `PARTIAL_WAKE_LOCK` orchestrating:
+ * - **Core 1**: [UsbAccessoryTransport] + [CarLifeControlStateMachine] (USB AOA + Control Handshake + Heartbeat)
  * - **Core 2**: [CockpitProjectionManager] (`MediaCodec` H.264 + `VirtualDisplay` + `CockpitPresentation` + `dispatchTouchEvent`)
  */
-class BridgeForegroundService : Service(), CarLifeEngineCallbacks {
+class BridgeForegroundService : Service() {
 
     inner class LocalBinder : Binder() {
         fun getService(): BridgeForegroundService = this@BridgeForegroundService
@@ -160,9 +162,6 @@ class BridgeForegroundService : Service(), CarLifeEngineCallbacks {
     private var wakeLock: PowerManager.WakeLock? = null
 
     lateinit var usbTransport: UsbAccessoryTransport
-        private set
-
-    lateinit var carLifeUsbEngine: CarLifeUsbEngine
         private set
 
     lateinit var projectionManager: CockpitProjectionManager
@@ -181,18 +180,10 @@ class BridgeForegroundService : Service(), CarLifeEngineCallbacks {
             externalScope = serviceScope
         )
 
-        carLifeUsbEngine = CarLifeUsbEngine(
-            context = applicationContext,
-            callbacks = this,
-            ioDispatcher = Dispatchers.IO,
-            engineScope = serviceScope
-        )
-
         projectionManager = CockpitProjectionManager(
             context = applicationContext,
             onEncodedVideoNal = { nalBytes, timestampMs, _ ->
-                // Forward H.264 NAL units into both the USB AOA engine and telemetry counters
-                carLifeUsbEngine.enqueueVideoNalUnit(nalBytes, timestampMs)
+                // Forward H.264 NAL units directly into the active USB AOA transport
                 val videoFrame = CarLifeFrameCodec.createVideoFrame(nalBytes, timestampMs)
                 serviceScope.launch {
                     usbTransport.sendFrame(videoFrame)
@@ -262,6 +253,17 @@ class BridgeForegroundService : Service(), CarLifeEngineCallbacks {
         serviceScope.launch {
             usbTransport.incomingFrames.collect { frame ->
                 handleIncomingCarLifeFrame(frame)
+            }
+        }
+
+        // Periodic 1,000ms Heartbeat loop to prevent Jetta VS7 (MQB) Head Unit watchdog disconnect
+        serviceScope.launch {
+            while (isActive) {
+                kotlinx.coroutines.delay(1_000L)
+                if (usbTransport.state.value is UsbTransportState.Connected) {
+                    val hb = controlStateMachine.createHeartbeatFrame()
+                    usbTransport.sendFrameImmediate(hb)
+                }
             }
         }
     }
@@ -357,10 +359,25 @@ class BridgeForegroundService : Service(), CarLifeEngineCallbacks {
                 }
             }
 
+            ACTION_TOGGLE_VIDEO_HEADER_MODE -> {
+                val newMode = !CarLifeFrameCodec.useNestedVideoMsgHeader
+                CarLifeFrameCodec.useNestedVideoMsgHeader = newMode
+                projectionManager.requestInstantIdrKeyFrame()
+                BridgeTelemetryBus.updateState {
+                    it.copy(
+                        useNestedVideoMsgHeader = newMode,
+                        lastProtocolEvent = if (newMode) {
+                            "Video Framing: Nested MSG_VIDEO_DATA (0x00020001) + 12B Header enabled"
+                        } else {
+                            "Video Framing: Standard 12B Media Header (Raw Annex-B NAL) enabled"
+                        }
+                    )
+                }
+            }
+
             ACTION_DISCONNECT_STOP -> {
                 serviceScope.launch {
                     projectionManager.stopProjection()
-                    carLifeUsbEngine.closeSession()
                     usbTransport.closeSession("Stopped by user")
                     releaseWakeLock()
                     stopForeground(STOP_FOREGROUND_REMOVE)
@@ -378,7 +395,6 @@ class BridgeForegroundService : Service(), CarLifeEngineCallbacks {
         releaseWakeLock()
         serviceScope.launch {
             projectionManager.stopProjection()
-            carLifeUsbEngine.shutdown()
             usbTransport.shutdown()
         }
         BridgeTelemetryBus.updateState {
@@ -391,60 +407,6 @@ class BridgeForegroundService : Service(), CarLifeEngineCallbacks {
         }
         serviceScope.cancel()
         super.onDestroy()
-    }
-
-    // =========================================================================
-    // CarLifeEngineCallbacks (Core 1 -> Core 2 Bridge)
-    // =========================================================================
-
-    override fun onVideoSizeNegotiated(width: Int, height: Int, frameRate: Int) {
-        serviceScope.launch {
-            projectionManager.startProjection(width = width, height = height, frameRate = frameRate)
-        }
-    }
-
-    override fun onVideoStartRequested() {
-        serviceScope.launch {
-            if (!projectionManager.stats.value.isRunning) {
-                val s = controlStateMachine.sessionState.value
-                projectionManager.startProjection(
-                    width = s.negotiatedVideoWidth,
-                    height = s.negotiatedVideoHeight,
-                    frameRate = s.negotiatedFps
-                )
-            } else {
-                projectionManager.requestInstantIdrKeyFrame()
-            }
-        }
-    }
-
-    override fun onVideoPauseRequested() {
-        serviceScope.launch {
-            projectionManager.stopProjection()
-        }
-    }
-
-    override fun onVideoResetRequested() {
-        serviceScope.launch {
-            val s = controlStateMachine.sessionState.value
-            projectionManager.startProjection(
-                width = s.negotiatedVideoWidth,
-                height = s.negotiatedVideoHeight,
-                frameRate = s.negotiatedFps
-            )
-        }
-    }
-
-    override fun onTouchPacketReceived(packet: CarLifeTouchPacket) {
-        serviceScope.launch {
-            projectionManager.injectTouchPacket(packet)
-        }
-    }
-
-    override fun onHardKeyPacketReceived(packet: CarLifeHardKeyPacket) {
-        serviceScope.launch {
-            projectionManager.injectHardKeyPacket(packet)
-        }
     }
 
     private suspend fun handleIncomingCarLifeFrame(frame: CarLifeFrame) {
@@ -473,6 +435,34 @@ class BridgeForegroundService : Service(), CarLifeEngineCallbacks {
                         )
                     }
                 }
+
+                val cmd = frame.parseCommandMessageOrNull()
+                when (cmd?.serviceType) {
+                    CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT,
+                    CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_RESET -> {
+                        val s = transition.updatedState
+                        projectionManager.startProjection(
+                            width = s.negotiatedVideoWidth,
+                            height = s.negotiatedVideoHeight,
+                            frameRate = s.negotiatedFps
+                        )
+                    }
+                    CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START -> {
+                        val s = transition.updatedState
+                        if (!projectionManager.stats.value.isRunning) {
+                            projectionManager.startProjection(
+                                width = s.negotiatedVideoWidth,
+                                height = s.negotiatedVideoHeight,
+                                frameRate = s.negotiatedFps
+                            )
+                        } else {
+                            projectionManager.requestInstantIdrKeyFrame()
+                        }
+                    }
+                    CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_PAUSE -> {
+                        projectionManager.stopProjection()
+                    }
+                }
             }
 
             CarLifeChannel.TOUCH -> {
@@ -484,13 +474,16 @@ class BridgeForegroundService : Service(), CarLifeEngineCallbacks {
                 )
                 when (decodedEvent) {
                     is CarLifeInputEvent.Touch -> {
+                        val isClick = decodedEvent.type == CarLifeTouchEventType.SINGLE_CLICK ||
+                            decodedEvent.type == CarLifeTouchEventType.DOUBLE_CLICK
                         projectionManager.injectTouchPacket(
                             CarLifeTouchPacket(
-                                androidAction = decodedEvent.type.androidMotionAction,
+                                androidAction = if (isClick) MotionEvent.ACTION_DOWN else decodedEvent.type.androidMotionAction,
                                 rawX = decodedEvent.rawX,
                                 rawY = decodedEvent.rawY,
                                 huWidth = decodedEvent.huWidth,
-                                huHeight = decodedEvent.huHeight
+                                huHeight = decodedEvent.huHeight,
+                                synthesizeClickUp = isClick
                             )
                         )
                     }
@@ -674,6 +667,7 @@ class BridgeForegroundService : Service(), CarLifeEngineCallbacks {
         const val ACTION_INJECT_TEST_TOUCH = "com.example.core.usb.action.INJECT_TEST_TOUCH"
         const val ACTION_SEND_VERSION_MATCH = "com.example.core.usb.action.SEND_VERSION_MATCH"
         const val ACTION_SEND_VIDEO_HEARTBEAT = "com.example.core.usb.action.SEND_VIDEO_HEARTBEAT"
+        const val ACTION_TOGGLE_VIDEO_HEADER_MODE = "com.example.core.usb.action.TOGGLE_VIDEO_HEADER_MODE"
         const val ACTION_DISCONNECT_STOP = "com.example.core.usb.action.DISCONNECT_STOP"
 
         const val EXTRA_WIDTH = "extra_width"

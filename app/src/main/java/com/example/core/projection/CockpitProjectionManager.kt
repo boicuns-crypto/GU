@@ -135,8 +135,20 @@ class CockpitProjectionManager(
             )
 
             withContext(Dispatchers.Main.immediate) {
+                val displayContext = appContext.createDisplayContext(vDisplay.display)
+                val presentationContext = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    runCatching {
+                        displayContext.createWindowContext(
+                            vDisplay.display,
+                            WINDOW_TYPE_PRESENTATION,
+                            null
+                        )
+                    }.getOrElse { displayContext }
+                } else {
+                    displayContext
+                }
                 val presentation = CockpitPresentation(
-                    outerContext = appContext,
+                    outerContext = presentationContext,
                     display = vDisplay.display,
                     statsFlow = _stats
                 )
@@ -494,6 +506,8 @@ class CockpitProjectionManager(
         private const val TAG = "CockpitProjectionMgr"
         private const val VIRTUAL_DISPLAY_NAME = "JettaVS7_CarLife_Cockpit"
         private const val DEQUEUE_TIMEOUT_US = 10_000L
+        // AOSP WindowManager.LayoutParams.TYPE_PRESENTATION = 2037 (@hide in public android.jar)
+        private const val WINDOW_TYPE_PRESENTATION = 2037
     }
 }
 

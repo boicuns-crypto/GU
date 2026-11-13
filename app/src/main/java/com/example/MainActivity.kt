@@ -711,6 +711,49 @@ private fun ProjectionEngineCard(
                     }
                 }
             }
+
+            // One-tap Video Framing Header Toggle (for Jetta VS7 / MQB Head Unit compatibility)
+            val context = LocalContext.current
+            OutlinedButton(
+                onClick = {
+                    val newMode = !CarLifeFrameCodec.useNestedVideoMsgHeader
+                    CarLifeFrameCodec.useNestedVideoMsgHeader = newMode
+                    BridgeTelemetryBus.updateState {
+                        it.copy(
+                            useNestedVideoMsgHeader = newMode,
+                            lastProtocolEvent = if (newMode) {
+                                "Video Framing: Nested MSG_VIDEO_DATA (0x00020001) + 12B Header enabled"
+                            } else {
+                                "Video Framing: Standard 12B Media Header (Raw Annex-B NAL) enabled"
+                            }
+                        )
+                    }
+                    if (state.isServiceRunning) {
+                        val intent = Intent(context, BridgeForegroundService::class.java).apply {
+                            action = BridgeForegroundService.ACTION_TOGGLE_VIDEO_HEADER_MODE
+                        }
+                        context.startService(intent)
+                    }
+                },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("toggle_video_header_mode_btn"),
+                shape = RoundedCornerShape(10.dp),
+                border = BorderStroke(
+                    width = 1.dp,
+                    color = if (state.useNestedVideoMsgHeader) AmberSignal else ElectricCyan.copy(alpha = 0.5f)
+                )
+            ) {
+                Text(
+                    text = if (state.useNestedVideoMsgHeader) {
+                        "Video Packet Mode: Nested MSG_VIDEO_DATA (0x00020001) [Tap to Switch]"
+                    } else {
+                        "Video Packet Mode: Standard 12B Header + Raw H.264 NAL [Tap to Switch]"
+                    },
+                    style = MaterialTheme.typography.labelMedium,
+                    color = if (state.useNestedVideoMsgHeader) AmberSignal else ElectricCyan
+                )
+            }
         }
     }
 }

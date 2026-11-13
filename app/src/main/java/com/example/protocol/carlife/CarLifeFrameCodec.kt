@@ -537,18 +537,38 @@ object CarLifeFrameCodec {
         )
     }
 
+    /**
+     * Runtime toggle for Baidu CarLife Video Channel (`0x0002`) payload framing:
+     * - `false` (default): Raw H.264 Annex-B NAL payload immediately follows the 12-byte media header.
+     * - `true`: Prepends an 8-byte inner message header `[NAL_Length(4B)][MSG_VIDEO_DATA = 0x00020001(4B)]`
+     *   inside the `0x0002` payload (required by certain MIB/MQB CarLife head unit firmwares).
+     */
+    @Volatile
+    var useNestedVideoMsgHeader: Boolean = false
+
     fun createVideoFrame(
         nalData: ByteArray,
-        timestampMs: Long = System.currentTimeMillis() and 0xFFFF_FFFFL
+        timestampMs: Long = System.currentTimeMillis() and 0xFFFF_FFFFL,
+        nestedVideoMsgHeader: Boolean = useNestedVideoMsgHeader
     ): CarLifeFrame {
+        val framePayload = if (nestedVideoMsgHeader) {
+            ByteBuffer.allocate(8 + nalData.size)
+                .order(ByteOrder.BIG_ENDIAN)
+                .putInt(nalData.size)
+                .putInt(CarLifeMsgType.MSG_VIDEO_DATA)
+                .put(nalData)
+                .array()
+        } else {
+            nalData
+        }
         return CarLifeFrame(
             header = CarLifeHeader(
                 channel = CarLifeChannel.VIDEO,
                 rawChannelId = CarLifeChannel.VIDEO.id,
-                payloadLength = nalData.size,
+                payloadLength = framePayload.size,
                 timestamp = timestampMs and 0xFFFF_FFFFL
             ),
-            payload = nalData
+            payload = framePayload
         )
     }
 

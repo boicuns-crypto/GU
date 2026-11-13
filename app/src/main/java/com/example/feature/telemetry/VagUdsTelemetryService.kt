@@ -372,10 +372,17 @@ class VagUdsTelemetryService(
         var activeTxHeader = ""
         var activeRxHeader = ""
         var queueIndex = 0
+        var activeGearboxAtfDid = DID_GEARBOX_ATF_TEMP
 
         while (isActive && isRunning.get()) {
-            val req = udsPollingQueue[queueIndex % udsPollingQueue.size]
+            val baseReq = udsPollingQueue[queueIndex % udsPollingQueue.size]
             queueIndex++
+
+            val req = if (baseReq.did == DID_GEARBOX_ATF_TEMP && activeGearboxAtfDid != DID_GEARBOX_ATF_TEMP) {
+                baseReq.copy(did = activeGearboxAtfDid)
+            } else {
+                baseReq
+            }
 
             // Switch CAN physical addressing when changing between 01-Engine (7E0) and 02-Gearbox (7E1)
             if (req.txHeader != activeTxHeader || req.rxHeader != activeRxHeader) {
@@ -387,7 +394,34 @@ class VagUdsTelemetryService(
 
             val rawResponse = sendElmCommand(output, input, req.commandHex)
             val responseBytes = parseHexResponseToBytes(rawResponse)
-            if (responseBytes.isNotEmpty()) {
+
+            if (req.txHeader == "7E1" &&
+                (req.did == DID_GEARBOX_ATF_TEMP ||
+                    req.did == DID_GEARBOX_ATF_TEMP_FALLBACK_F446 ||
+                    req.did == DID_GEARBOX_ATF_TEMP_FALLBACK_2021) &&
+                isNegativeUdsResponseOrNoData(rawResponse, responseBytes)
+            ) {
+                // Fallback chain for Aisin AQ250 (7E1 -> 7E9): 0x101E -> 0xF446 -> 0x2021
+                val fallbackCandidates = listOf(
+                    DID_GEARBOX_ATF_TEMP_FALLBACK_F446,
+                    DID_GEARBOX_ATF_TEMP_FALLBACK_2021,
+                    DID_GEARBOX_ATF_TEMP
+                ).filter { it != req.did }
+
+                for (candidateDid in fallbackCandidates) {
+                    val fallbackReq = req.copy(
+                        did = candidateDid,
+                        label = "AQ250 ATF Temp (0x%04X)".format(candidateDid)
+                    )
+                    val fbRaw = sendElmCommand(output, input, fallbackReq.commandHex)
+                    val fbBytes = parseHexResponseToBytes(fbRaw)
+                    if (!isNegativeUdsResponseOrNoData(fbRaw, fbBytes)) {
+                        activeGearboxAtfDid = candidateDid
+                        applyUdsResponseBytes(fallbackReq, fbBytes)
+                        break
+                    }
+                }
+            } else if (responseBytes.isNotEmpty()) {
                 applyUdsResponseBytes(req, responseBytes)
             }
             delay(35L)
@@ -403,7 +437,6 @@ class VagUdsTelemetryService(
             decodeUdsResponseBytes(current, request, responseBytes)
         }
     }
-
 
     /**
      * Realistic physics-based Demo Mode loop that synthesizes raw UDS `0x62` responses
@@ -530,6 +563,8 @@ class VagUdsTelemetryService(
             val c = ch.toChar()
             if (c != '\r' && c != '\n') {
                 sb.append(c)
+            } else {
+                sb.append(' ')
             }
         }
         return sb.toString().trim()
@@ -548,18 +583,53 @@ class VagUdsTelemetryService(
         const val DID_ENGINE_OIL_TEMP: Int = 0xF45C
         const val DID_TURBO_BOOST_PRESSURE: Int = 0x11E4
         const val DID_GEARBOX_ATF_TEMP: Int = 0x101E
+        const val DID_GEARBOX_ATF_TEMP_FALLBACK_F446: Int = 0xF446
+        const val DID_GEARBOX_ATF_TEMP_FALLBACK_2021: Int = 0x2021
         const val DID_GEARBOX_SELECTED_GEAR: Int = 0x102A
 
+        /**
+         * Detects `NODATA` or UDS Negative Response `7F 22 xx` (e.g. `7F 22 31` RequestOutOfRange).
+         */
+        fun isNegativeUdsResponseOrNoData(rawHex: String, responseBytes: ByteArray): Boolean {
+            val upper = rawHex.uppercase()
+            if (responseBytes.isEmpty() || upper.contains("NODATA") || upper.contains("NO DATA") || upper.contains("ERROR")) {
+                return true
+            }
+            for (i in 0 until responseBytes.size - 1) {
+                val b0 = responseBytes[i].toInt() and 0xFF
+                val b1 = responseBytes[i + 1].toInt() and 0xFF
+                if (b0 == 0x7F && b1 == 0x22) {
+                    return true
+                }
+            }
+            return false
+        }
+
         fun parseHexResponseToBytes(rawHex: String): ByteArray {
-            val cleaned = rawHex.replace(" ", "")
-                .replace("\r", "")
-                .replace("\n", "")
-                .uppercase()
-            if (cleaned.length < 2 || cleaned.contains("NODATA") || cleaned.contains("ERROR")) {
+            val upper = rawHex.uppercase()
+            if (upper.contains("NODATA") ||
+                upper.contains("NO DATA") ||
+                upper.contains("ERROR") ||
+                upper.contains("UNABLE") ||
+                upper.contains("STOPPED")
+            ) {
                 return ByteArray(0)
             }
-            val validHex = cleaned.filter { it in '0'..'9' || it in 'A'..'F' }
+            // Strip non-hex ELM327 status words ("SEARCHING...", "BUS INIT", "OK") and ISO-TP frame indices ("0:", "1:")
+            val stripped = upper
+                .replace("SEARCHING...", "")
+                .replace("SEARCHING", "")
+                .replace("BUSINIT", "")
+                .replace("BUS INIT", "")
+                .replace("OK", "")
+                .replace(Regex("[0-9A-F]:"), "")
+                .replace(" ", "")
+                .replace("\r", "")
+                .replace("\n", "")
+
+            val validHex = stripped.filter { it in '0'..'9' || it in 'A'..'F' }
             val pairCount = validHex.length / 2
+            if (pairCount == 0) return ByteArray(0)
             val out = ByteArray(pairCount)
             for (i in 0 until pairCount) {
                 val hi = Character.digit(validHex[i * 2], 16)
@@ -571,20 +641,32 @@ class VagUdsTelemetryService(
 
         /**
          * Pure VAG MQB UDS `0x62` Positive Response decoder for unit testing and state updates.
+         *
+         * Handles `ATH0` / `ATS0` single-frame responses (even if an ELM327 clone prepends a PCI
+         * length byte or appends CAN 8-byte `0x55`/`0xAA`/`0x00` padding).
          */
         fun decodeUdsResponseBytes(
             current: VagTelemetryState,
             request: VagUdsDidRequest,
             responseBytes: ByteArray
         ): VagTelemetryState {
-            val serviceIdx = responseBytes.indexOfFirst { (it.toInt() and 0xFF) == 0x62 }
-            if (serviceIdx < 0 || responseBytes.size < serviceIdx + 4) return current
+            val expectedDidHi = (request.did ushr 8) and 0xFF
+            val expectedDidLo = request.did and 0xFF
 
-            val respDidHi = responseBytes[serviceIdx + 1].toInt() and 0xFF
-            val respDidLo = responseBytes[serviceIdx + 2].toInt() and 0xFF
-            val respDid = (respDidHi shl 8) or respDidLo
-            if (respDid != request.did) return current
+            // Locate exact 3-byte positive UDS response header: [0x62, DID_HI, DID_LO]
+            var serviceIdx = -1
+            for (i in 0..(responseBytes.size - 4)) {
+                val b0 = responseBytes[i].toInt() and 0xFF
+                val b1 = responseBytes[i + 1].toInt() and 0xFF
+                val b2 = responseBytes[i + 2].toInt() and 0xFF
+                if (b0 == 0x62 && b1 == expectedDidHi && b2 == expectedDidLo) {
+                    serviceIdx = i
+                    break
+                }
+            }
+            if (serviceIdx < 0) return current
 
+            val respDid = request.did
             val dataOffset = serviceIdx + 3
             val dataLen = responseBytes.size - dataOffset
             if (dataLen <= 0) return current
@@ -595,16 +677,13 @@ class VagUdsTelemetryService(
             val hexRx = responseBytes.sliceArray(serviceIdx until responseBytes.size)
                 .joinToString(" ") { "%02X".format(it) }
             val exchangeTrace = "TX [${request.txHeader}] 22 %02X %02X -> RX [${request.rxHeader}] $hexRx"
-                .format((request.did ushr 8) and 0xFF, request.did and 0xFF)
+                .format(expectedDidHi, expectedDidLo)
 
             val nextCount = current.polledFramesCount + 1L
             return when (respDid) {
                 DID_ENGINE_OIL_TEMP -> {
-                    val oilC = if (dataLen >= 2 && a > 10) {
-                        (((a shl 8) or b) * 0.1f) - 273.15f
-                    } else {
-                        (a - 40).toFloat()
-                    }
+                    // 0xF45C is standard 1-byte UDS/OBD temperature (A - 40°C), immune to trailing CAN padding bytes
+                    val oilC = (a - 40).toFloat()
                     current.copy(
                         oilTempC = ((oilC * 10f).roundToInt() / 10f).coerceIn(-40f, 160f),
                         polledFramesCount = nextCount,
@@ -612,9 +691,22 @@ class VagUdsTelemetryService(
                     )
                 }
 
-                DID_GEARBOX_ATF_TEMP -> {
-                    val atfC = if (dataLen >= 2 && a > 10) {
-                        (((a shl 8) or b) * 0.1f) - 273.15f
+                DID_GEARBOX_ATF_TEMP,
+                DID_GEARBOX_ATF_TEMP_FALLBACK_F446,
+                DID_GEARBOX_ATF_TEMP_FALLBACK_2021 -> {
+                    // 0xF446 is always 1-byte (A - 40°C).
+                    // For 0x101E / 0x2021, check if 2-byte 0.1K value is in realisticKelvinRange (230.0K..430.0K)
+                    // and not CAN DLC padding (0x00, 0x55, 0xAA, 0xFF).
+                    val isLikelyCanPadding = b == 0x00 || b == 0x55 || b == 0xAA || b == 0xFF
+                    val kelvinCandidateC = (((a shl 8) or b) * 0.1f) - 273.15f
+                    val atfC = if (
+                        respDid != DID_GEARBOX_ATF_TEMP_FALLBACK_F446 &&
+                        dataLen >= 2 &&
+                        !isLikelyCanPadding &&
+                        a in 9..16 &&
+                        kelvinCandidateC in -35f..155f
+                    ) {
+                        kelvinCandidateC
                     } else {
                         (a - 40).toFloat()
                     }

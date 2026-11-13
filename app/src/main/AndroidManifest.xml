@@ -16,7 +16,6 @@
     <!-- Foreground Service permissions for Galaxy S26 Ultra (Android 16 / compileSdk 36) -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
@@ -85,7 +84,7 @@
             android:name=".core.usb.BridgeForegroundService"
             android:enabled="true"
             android:exported="false"
-            android:foregroundServiceType="connectedDevice|mediaProjection|microphone" />
+            android:foregroundServiceType="connectedDevice|microphone" />
 
         <!--
             NotificationListenerService granting MediaSessionManager access to active media sessions

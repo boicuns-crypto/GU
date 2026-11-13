@@ -226,7 +226,43 @@ class ExampleUnitTest {
             responseBytes = byteArrayOf(0x62, 0xF4.toByte(), 0x42, 0x37, 0x78)
         )
         assertEquals(14.2f, afterVoltage.voltageV, 0.01f)
+
+        // 5. ELM327 ATH0 with trailing CAN DLC padding (0x55) on 0xF45C still decodes 96.0°C
+        val paddedOil = com.example.feature.telemetry.VagUdsTelemetryService.decodeUdsResponseBytes(
+            current = afterVoltage,
+            request = oilReq,
+            responseBytes = byteArrayOf(0x04, 0x62, 0xF4.toByte(), 0x5C, 136.toByte(), 0x55, 0x55, 0x55)
+        )
+        assertEquals(96f, paddedOil.oilTempC, 0.01f)
+
+        // 6. Negative UDS response 7F 22 31 detection and AQ250 fallback DID 0xF446
+        val negBytes = com.example.feature.telemetry.VagUdsTelemetryService.parseHexResponseToBytes("7F2231")
+        assertTrue(com.example.feature.telemetry.VagUdsTelemetryService.isNegativeUdsResponseOrNoData("7F2231", negBytes))
+
+        val fallbackAtfReq = atfReq.copy(
+            did = com.example.feature.telemetry.VagUdsTelemetryService.DID_GEARBOX_ATF_TEMP_FALLBACK_F446
+        )
+        val afterFallbackAtf = com.example.feature.telemetry.VagUdsTelemetryService.decodeUdsResponseBytes(
+            current = paddedOil,
+            request = fallbackAtfReq,
+            responseBytes = byteArrayOf(0x62, 0xF4.toByte(), 0x46, 125.toByte())
+        )
+        assertEquals(85f, afterFallbackAtf.gearboxTempC, 0.01f)
+    }
+
+    @Test
+    fun videoFrameCodec_supportsNestedMsgVideoDataHeaderToggle() {
+        val h264Nal = byteArrayOf(0x00, 0x00, 0x00, 0x01, 0x65, 0x88.toByte())
+        val nestedFrame = CarLifeFrameCodec.createVideoFrame(
+            nalData = h264Nal,
+            timestampMs = 1234L,
+            nestedVideoMsgHeader = true
+        )
+        assertEquals(CarLifeChannel.VIDEO, nestedFrame.channel)
+        assertEquals(8 + h264Nal.size, nestedFrame.payload.size)
+        val cmd = nestedFrame.parseCommandMessageOrNull()
+        assertNotNull(cmd)
+        assertEquals(CarLifeMsgType.MSG_VIDEO_DATA, cmd!!.serviceType)
+        assertArrayEquals(h264Nal, cmd.body)
     }
 }
-
-
