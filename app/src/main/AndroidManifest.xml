@@ -5,40 +5,33 @@
     <!-- Declare USB Open Accessory hardware support -->
     <uses-feature
         android:name="android.hardware.usb.accessory"
-        android:required="false" />
-    <uses-feature
-        android:name="android.hardware.bluetooth"
-        android:required="false" />
-    <uses-feature
-        android:name="android.hardware.bluetooth_le"
-        android:required="false" />
+        android:required="true" />
 
     <!-- Foreground Service permissions for Galaxy S26 Ultra (Android 16 / compileSdk 36) -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
-    <!-- Bluetooth Classic SPP & BLE permissions for ELM327 / STN / VAG CAN-UDS 0x22 Adapter -->
+    <!-- Разрешения для вывода полноценных приложений на VirtualDisplay ГУ и фонового запуска -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission
-        android:name="android.permission.BLUETOOTH"
-        android:maxSdkVersion="30" />
-    <uses-permission
-        android:name="android.permission.BLUETOOTH_ADMIN"
-        android:maxSdkVersion="30" />
-    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
-    <uses-permission
-        android:name="android.permission.BLUETOOTH_SCAN"
-        android:usesPermissionFlags="neverForLocation"
-        tools:targetApi="s" />
+        android:name="android.permission.QUERY_ALL_PACKAGES"
+        tools:ignore="QueryAllPackagesPermission" />
 
     <!-- Zero battery throttling & CPU WakeLock for uninterrupted 60fps H.264 USB AOA streaming -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
-    <!-- Local TCP socket permission for Wi-Fi OBD-II / ELM327 gateways (192.168.0.10:35000) -->
-    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Разрешаем PackageManager видеть все запускаемые (LAUNCHER) приложения для док-бара на ГУ -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
 
     <application
         android:allowBackup="true"
@@ -51,14 +44,15 @@
         android:theme="@style/Theme.MyApplication">
 
         <!--
-            singleTask activity that intercepts USB_ACCESSORY_ATTACHED when the Jetta VS7 (MQB)
-            Head Unit switches the Galaxy S26 Ultra into AOA mode (VID 0x18D1 / PID 0x2D00..0x2D01).
+            singleTask activity that intercepts USB_ACCESSORY_ATTACHED when the Head Unit
+            switches the smartphone into AOA mode (VID 0x18D1 / PID 0x2D00..0x2D01).
         -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
             android:launchMode="singleTask"
-            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|uiMode"
+            android:resizeableActivity="true"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|uiMode|density"
             android:label="@string/app_name"
             android:theme="@style/Theme.MyApplication">
             <intent-filter>
@@ -84,11 +78,11 @@
             android:name=".core.usb.BridgeForegroundService"
             android:enabled="true"
             android:exported="false"
-            android:foregroundServiceType="connectedDevice|microphone" />
+            android:foregroundServiceType="connectedDevice|mediaProjection|microphone" />
 
         <!--
             NotificationListenerService granting MediaSessionManager access to active media sessions
-            (Yandex Music, Spotify, Poweramp, YouTube Music) for the Cockpit Media Widget.
+            (Yandex Music, Spotify, Poweramp, YouTube Music) for the Dock Media Widget.
         -->
         <service
             android:name=".feature.cockpit.CockpitMediaNotificationListenerService"
@@ -98,6 +92,25 @@
             <intent-filter>
                 <action android:name="android.service.notification.NotificationListenerService" />
             </intent-filter>
+        </service>
+
+        <!--
+            AccessibilityService для проброса касаний (Touch Injection) с тачскрина ГУ
+            внутрь сторонних приложений, запущенных на VirtualDisplay.
+        -->
+        <service
+            android:name=".core.input.CarLifeTouchAccessibilityService"
+            android:enabled="true"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_touch_config" />
         </service>
 
     </application>

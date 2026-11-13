@@ -1,14 +1,20 @@
 package com.example.core.projection
 
+import android.app.Activity
 import android.app.Presentation
 import android.content.Context
+import android.content.Intent
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
+import android.media.projection.MediaProjection
+import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import android.util.DisplayMetrics
 import android.util.Log
@@ -18,6 +24,12 @@ import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.Surface
 import android.view.WindowManager
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
@@ -43,9 +55,9 @@ import androidx.savedstate.SavedStateRegistryOwner
 import androidx.savedstate.setViewTreeSavedStateRegistryOwner
 import com.example.core.carlife.CarLifeHardKeyPacket
 import com.example.core.carlife.CarLifeTouchPacket
-import com.example.feature.cockpit.CockpitScreen
+import com.example.core.input.CarLifeTouchAccessibilityService
+import com.example.feature.cockpit.CarLifeAppLauncherScreen
 import com.example.feature.cockpit.MediaControllerRepository
-import com.example.feature.telemetry.VagUdsTelemetryRepository
 import com.example.ui.theme.AmberSignal
 import com.example.ui.theme.ElectricCyan
 import com.example.ui.theme.MyApplicationTheme
@@ -69,10 +81,44 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 /**
+ * Holds the user-granted [MediaProjection] consent result (`resultCode` + `data` [Intent])
+ * from Step 5 of the Onboarding Checklist so `BridgeForegroundService` can promote its FGS type
+ * to `mediaProjection` and create a full-screen `VirtualDisplay` without hanging at 90%.
+ */
+object MediaProjectionTokenStore {
+    @Volatile
+    var resultCode: Int = Activity.RESULT_CANCELED
+        private set
+
+    @Volatile
+    var resultData: Intent? = null
+        private set
+
+    private val _hasValidToken = MutableStateFlow(false)
+    val hasValidToken: StateFlow<Boolean> = _hasValidToken.asStateFlow()
+
+    fun saveToken(code: Int, data: Intent?) {
+        if (code == Activity.RESULT_OK && data != null) {
+            resultCode = code
+            resultData = Intent(data)
+            _hasValidToken.value = true
+        }
+    }
+
+    fun clearToken() {
+        resultCode = Activity.RESULT_CANCELED
+        resultData = null
+        _hasValidToken.value = false
+    }
+}
+
+/**
  * Live telemetry of the VirtualDisplay + Hardware H.264 MediaCodec + Touch Injection pipeline.
  */
 data class ProjectionPipelineStats(
     val isRunning: Boolean = false,
+    val usingMediaProjection: Boolean = false,
+    val virtualDisplayId: Int = Display.DEFAULT_DISPLAY,
     val width: Int = 1920,
     val height: Int = 1080,
     val fps: Int = 60,
@@ -82,13 +128,15 @@ data class ProjectionPipelineStats(
     val spsPpsConfigured: Boolean = false,
     val injectedTouches: Long = 0L,
     val lastTouchPoint: Pair<Float, Float>? = null,
-    val activeCockpitWidget: String = "VAG Digital Cockpit 3-Zone UI",
+    val activeCockpitWidget: String = "CarLife App Launcher & Dock",
     val statusMessage: String = "Standby — Ready to start VirtualDisplay + H.264 Surface Encoder"
 )
 
 /**
- * Core 2 (`:core:projection`): Self-Contained VirtualDisplay, Hardware H.264 Encoder,
- * `CockpitPresentation` (hosting `CockpitScreen` in Jetpack Compose), and Zero-Privilege Touch Injector.
+ * Core 2 (`:core:projection`): Self-Contained VirtualDisplay (supporting both `MediaProjection`
+ * for full screen/app mirroring and fallback `DisplayManager` virtual display), Hardware H.264
+ * Encoder with immediate SPS/PPS + IDR burst to pass the CarLife 90% loading threshold,
+ * `CockpitPresentation`, and Multi-Touch Injection via `CarLifeTouchAccessibilityService`.
  */
 class CockpitProjectionManager(
     context: Context,
@@ -97,7 +145,12 @@ class CockpitProjectionManager(
 ) {
     private val appContext = context.applicationContext
     private val displayManager = appContext.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
+    private val mediaProjectionManager =
+        appContext.getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+    private val mainHandler = Handler(Looper.getMainLooper())
 
+    private var mediaProjection: MediaProjection? = null
+    private var mediaProjectionCallback: MediaProjection.Callback? = null
     private var mediaCodec: MediaCodec? = null
     private var encoderInputSurface: Surface? = null
     private var virtualDisplay: VirtualDisplay? = null
@@ -106,7 +159,12 @@ class CockpitProjectionManager(
 
     private val projectionMutex = Mutex()
     private val isEncoding = AtomicBoolean(false)
+
+    @Volatile
     private var cachedSpsPpsAnnexB: ByteArray? = null
+
+    @Volatile
+    private var lastKeyFrameAnnexB: ByteArray? = null
 
     private val activeDownTimeUptimeMs = AtomicLong(0L)
 
@@ -125,26 +183,66 @@ class CockpitProjectionManager(
         var codec: MediaCodec? = null
         var inputSurface: Surface? = null
         var vDisplay: VirtualDisplay? = null
+        var activeMp: MediaProjection? = null
+        var usedMediaProjection = false
 
         return@withLock try {
             codec = configureLowLatencyAvcEncoder(width, height, frameRate, bitRate)
             inputSurface = codec.createInputSurface()
             codec.start()
 
-            // Private Presentation VirtualDisplay: sets Display.FLAG_PRIVATE | Display.FLAG_PRESENTATION |
-            // Display.FLAG_OWN_CONTENT_ONLY so Presentation uses TYPE_PRIVATE_PRESENTATION (2030) and
-            // WindowManagerService registers DisplayContent without MediaProjection or SYSTEM_ALERT_WINDOW.
-            vDisplay = displayManager.createVirtualDisplay(
-                VIRTUAL_DISPLAY_NAME,
-                width,
-                height,
-                densityDpi,
-                inputSurface,
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION or
-                    DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY
-            )
+            // 1. Prefer MediaProjection VirtualDisplay when user completed Step 5 (required for full app mirroring)
+            val tokenData = MediaProjectionTokenStore.resultData
+            val tokenCode = MediaProjectionTokenStore.resultCode
+            if (tokenCode == Activity.RESULT_OK && tokenData != null) {
+                runCatching {
+                    val mp = mediaProjectionManager.getMediaProjection(tokenCode, Intent(tokenData))
+                    if (mp != null) {
+                        val callback = object : MediaProjection.Callback() {
+                            override fun onStop() {
+                                Log.w(TAG, "MediaProjection stopped by system")
+                                MediaProjectionTokenStore.clearToken()
+                            }
+                        }
+                        // Android 14–16 (SDK 34–36) strictly requires registering a callback BEFORE createVirtualDisplay
+                        mp.registerCallback(callback, mainHandler)
+                        mediaProjectionCallback = callback
+                        activeMp = mp
 
-            val createdDisplay = vDisplay.display
+                        vDisplay = mp.createVirtualDisplay(
+                            VIRTUAL_DISPLAY_NAME,
+                            width,
+                            height,
+                            densityDpi,
+                            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR or
+                                DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or
+                                DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION,
+                            inputSurface,
+                            null,
+                            mainHandler
+                        )
+                        usedMediaProjection = true
+                    }
+                }.onFailure { e ->
+                    Log.w(TAG, "MediaProjection VirtualDisplay creation failed, falling back to DisplayManager: ${e.message}")
+                    MediaProjectionTokenStore.clearToken()
+                }
+            }
+
+            // 2. Fallback to DisplayManager Presentation VirtualDisplay if MediaProjection wasn't used
+            if (vDisplay == null) {
+                vDisplay = displayManager.createVirtualDisplay(
+                    VIRTUAL_DISPLAY_NAME,
+                    width,
+                    height,
+                    densityDpi,
+                    inputSurface,
+                    DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION or
+                        DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY
+                )
+            }
+
+            val createdDisplay = vDisplay!!.display
             awaitDisplayRegistered(createdDisplay.displayId)
 
             val presentation = showPresentationWithRetry(createdDisplay)
@@ -152,29 +250,37 @@ class CockpitProjectionManager(
             withContext(Dispatchers.Main.immediate) {
                 cockpitPresentation = presentation
             }
+            mediaProjection = activeMp
             mediaCodec = codec
             encoderInputSurface = inputSurface
             virtualDisplay = vDisplay
             isEncoding.set(true)
 
+            val modeLabel = if (usedMediaProjection) "MediaProjection Full Screen" else "Presentation VirtualDisplay"
             _stats.update {
                 it.copy(
                     isRunning = true,
+                    usingMediaProjection = usedMediaProjection,
+                    virtualDisplayId = createdDisplay.displayId,
                     width = width,
                     height = height,
                     fps = frameRate,
                     bitRateMbps = bitRate / 1_000_000,
-                    statusMessage = "VirtualDisplay ($width×$height @ ${frameRate}fps) + H.264 Low-Latency Surface Active"
+                    statusMessage = "$modeLabel #${createdDisplay.displayId} ($width×$height @ ${frameRate}fps) Active"
                 )
             }
 
             encoderDrainJob = externalScope.launch(Dispatchers.IO) {
                 drainHardwareEncoderLoop(codec)
             }
+
+            // Request an immediate IDR sync frame so the Head Unit passes 90% without waiting
+            requestInstantIdrKeyFrame()
             true
         } catch (t: Throwable) {
             Log.e(TAG, "Failed to initialize CockpitProjectionManager", t)
             runCatching { vDisplay?.release() }
+            runCatching { activeMp?.stop() }
             runCatching { codec?.stop() }
             runCatching { codec?.release() }
             runCatching { inputSurface?.release() }
@@ -182,6 +288,8 @@ class CockpitProjectionManager(
             _stats.update {
                 it.copy(
                     isRunning = false,
+                    usingMediaProjection = false,
+                    virtualDisplayId = Display.DEFAULT_DISPLAY,
                     spsPpsConfigured = false,
                     statusMessage = "Projection Init Error: ${t.message}"
                 )
@@ -248,6 +356,11 @@ class CockpitProjectionManager(
         throw lastError ?: WindowManager.InvalidDisplayException("Unable to show Presentation on display ${display.displayId}")
     }
 
+    /**
+     * Triggered when `MSG_CMD_VIDEO_ENCODER_START` arrives from the Head Unit (at the 90% screen).
+     * Immediately re-transmits cached `SPS + PPS` and last `IDR` keyframe if already encoded,
+     * and forces the hardware encoder to emit a fresh sync IDR frame right away.
+     */
     fun requestInstantIdrKeyFrame() {
         val codec = mediaCodec ?: return
         runCatching {
@@ -256,8 +369,27 @@ class CockpitProjectionManager(
             }
             codec.setParameters(params)
         }
+
+        val spsPps = cachedSpsPpsAnnexB
+        val idr = lastKeyFrameAnnexB
+        if (spsPps != null) {
+            val tsMs = System.currentTimeMillis() and 0xFFFF_FFFFL
+            onEncodedVideoNal(spsPps, tsMs, true)
+            if (idr != null) {
+                val merged = ByteArray(spsPps.size + idr.size)
+                System.arraycopy(spsPps, 0, merged, 0, spsPps.size)
+                System.arraycopy(idr, 0, merged, spsPps.size, idr.size)
+                onEncodedVideoNal(merged, tsMs + 1L, true)
+            }
+        }
     }
 
+    /**
+     * Scales touch coordinates from the CarLife Head Unit stream (`huWidth × huHeight`)
+     * into `VirtualDisplay` coordinates (`width × height`) and injects them into both
+     * `CarLifeTouchAccessibilityService` (for third-party apps running on the `VirtualDisplay`)
+     * and the `CockpitPresentation` window.
+     */
     suspend fun injectTouchPacket(packet: CarLifeTouchPacket): Boolean {
         val currentStats = _stats.value
         val targetW = currentStats.width.coerceAtLeast(1)
@@ -269,45 +401,59 @@ class CockpitProjectionManager(
         val scaledY = ((packet.rawY.coerceIn(0, huH).toFloat() / huH.toFloat()) * targetH.toFloat())
 
         return withContext(Dispatchers.Main.immediate) {
-            val decorView = cockpitPresentation?.window?.decorView ?: return@withContext false
-            val nowUptime = SystemClock.uptimeMillis()
+            val vDisplayId = virtualDisplay?.display?.displayId ?: Display.DEFAULT_DISPLAY
 
-            val downTime = when (packet.androidAction) {
-                MotionEvent.ACTION_DOWN -> {
-                    activeDownTimeUptimeMs.set(nowUptime)
-                    nowUptime
-                }
-                else -> {
-                    val existing = activeDownTimeUptimeMs.get()
-                    if (existing > 0L) existing else nowUptime
-                }
-            }
-
-            val dispatched = dispatchSynthesizedMotionEvent(
-                decorView = decorView,
-                downTime = downTime,
-                eventTime = nowUptime,
+            // 1. Dispatch gesture via AccessibilityService onto the target VirtualDisplay (controls 3rd-party apps)
+            val a11yDispatched = CarLifeTouchAccessibilityService.instance?.handleMotionStream(
+                displayId = vDisplayId,
                 action = packet.androidAction,
                 x = scaledX,
-                y = scaledY
-            )
+                y = scaledY,
+                synthesizeClickUp = packet.synthesizeClickUp
+            ) ?: false
 
-            if (packet.synthesizeClickUp) {
-                val upTime = SystemClock.uptimeMillis() + 16L
-                dispatchSynthesizedMotionEvent(
+            // 2. Also dispatch directly to the Launcher Presentation decorView when active
+            val decorView = cockpitPresentation?.window?.decorView
+            var viewDispatched = false
+            if (decorView != null) {
+                val nowUptime = SystemClock.uptimeMillis()
+                val downTime = when (packet.androidAction) {
+                    MotionEvent.ACTION_DOWN -> {
+                        activeDownTimeUptimeMs.set(nowUptime)
+                        nowUptime
+                    }
+                    else -> {
+                        val existing = activeDownTimeUptimeMs.get()
+                        if (existing > 0L) existing else nowUptime
+                    }
+                }
+
+                viewDispatched = dispatchSynthesizedMotionEvent(
                     decorView = decorView,
                     downTime = downTime,
-                    eventTime = upTime,
-                    action = MotionEvent.ACTION_UP,
+                    eventTime = nowUptime,
+                    action = packet.androidAction,
                     x = scaledX,
                     y = scaledY
                 )
+
+                if (packet.synthesizeClickUp) {
+                    val upTime = SystemClock.uptimeMillis() + 16L
+                    dispatchSynthesizedMotionEvent(
+                        decorView = decorView,
+                        downTime = downTime,
+                        eventTime = upTime,
+                        action = MotionEvent.ACTION_UP,
+                        x = scaledX,
+                        y = scaledY
+                    )
+                }
             }
 
-            val zoneHit = when {
-                scaledX < targetW * 0.5f -> "Zone 1: Navigation Map (${scaledX.toInt()}, ${scaledY.toInt()})"
-                scaledY < targetH * 0.54f -> "Zone 2: VAG UDS Gauges (${scaledX.toInt()}, ${scaledY.toInt()})"
-                else -> "Zone 3: Media Player (${scaledX.toInt()}, ${scaledY.toInt()})"
+            val zoneHit = if (scaledX < 250f) {
+                "Dock Bar (${scaledX.toInt()}, ${scaledY.toInt()}) on VD #$vDisplayId"
+            } else {
+                "App Mirroring / Launcher (${scaledX.toInt()}, ${scaledY.toInt()}) on VD #$vDisplayId"
             }
 
             _stats.update {
@@ -318,7 +464,7 @@ class CockpitProjectionManager(
                     statusMessage = "Touch Injected -> $zoneHit"
                 )
             }
-            dispatched
+            viewDispatched || a11yDispatched
         }
     }
 
@@ -329,8 +475,13 @@ class CockpitProjectionManager(
                 KeyEvent.KEYCODE_MEDIA_NEXT -> MediaControllerRepository.skipNext()
                 KeyEvent.KEYCODE_MEDIA_PREVIOUS -> MediaControllerRepository.skipPrevious()
                 KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> MediaControllerRepository.togglePlayPause()
+                KeyEvent.KEYCODE_HOME -> {
+                    runCatching { cockpitPresentation?.show() }
+                }
             }
-            val decorView = cockpitPresentation?.window?.decorView ?: return@withContext false
+            val a11yHandled = CarLifeTouchAccessibilityService.instance
+                ?.handleSystemHardKey(packet.androidKeyCode) ?: false
+            val decorView = cockpitPresentation?.window?.decorView ?: return@withContext a11yHandled
             val now = SystemClock.uptimeMillis()
             val downEvent = KeyEvent(now, now, KeyEvent.ACTION_DOWN, packet.androidKeyCode, 0)
             val upEvent = KeyEvent(now, now + 15L, KeyEvent.ACTION_UP, packet.androidKeyCode, 0)
@@ -338,10 +489,10 @@ class CockpitProjectionManager(
             val upHandled = decorView.dispatchKeyEvent(upEvent)
             _stats.update {
                 it.copy(
-                    statusMessage = "MQB HardKey Injected -> KeyCode=${packet.androidKeyCode}"
+                    statusMessage = "HardKey Injected -> KeyCode=${packet.androidKeyCode}"
                 )
             }
-            downHandled || upHandled
+            downHandled || upHandled || a11yHandled
         }
     }
 
@@ -362,6 +513,15 @@ class CockpitProjectionManager(
         runCatching { virtualDisplay?.release() }
         virtualDisplay = null
 
+        runCatching {
+            mediaProjectionCallback?.let { cb ->
+                mediaProjection?.unregisterCallback(cb)
+            }
+            mediaProjection?.stop()
+        }
+        mediaProjectionCallback = null
+        mediaProjection = null
+
         runCatching { mediaCodec?.stop() }
         runCatching { mediaCodec?.release() }
         mediaCodec = null
@@ -369,11 +529,14 @@ class CockpitProjectionManager(
         runCatching { encoderInputSurface?.release() }
         encoderInputSurface = null
         cachedSpsPpsAnnexB = null
+        lastKeyFrameAnnexB = null
 
         if (updateStatus) {
             _stats.update {
                 it.copy(
                     isRunning = false,
+                    usingMediaProjection = false,
+                    virtualDisplayId = Display.DEFAULT_DISPLAY,
                     spsPpsConfigured = false,
                     statusMessage = "Projection Stopped"
                 )
@@ -410,7 +573,8 @@ class CockpitProjectionManager(
                 setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
             }
             setInteger(MediaFormat.KEY_PRIORITY, 0)
-            setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 1_000_000L / frameRate)
+            // Repeat previous frame every 16.6ms so MediaCodec immediately emits H.264 frames even on static UI
+            setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 1_000_000L / frameRate.coerceAtLeast(1))
         }
 
         val codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
@@ -425,7 +589,7 @@ class CockpitProjectionManager(
                 setInteger(MediaFormat.KEY_BIT_RATE, bitRate)
                 setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
                 setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-                setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 1_000_000L / frameRate)
+                setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 1_000_000L / frameRate.coerceAtLeast(1))
             }
             codec.reset()
             codec.configure(fallbackFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
@@ -489,6 +653,8 @@ class CockpitProjectionManager(
 
                             if (isCodecConfig) {
                                 cachedSpsPpsAnnexB = rawNal
+                            } else if (isKeyFrame) {
+                                lastKeyFrameAnnexB = rawNal
                             }
 
                             val payloadToSend = if (isKeyFrame && !isCodecConfig && cachedSpsPpsAnnexB != null) {
@@ -569,7 +735,7 @@ class CockpitProjectionManager(
 
     companion object {
         private const val TAG = "CockpitProjectionMgr"
-        private const val VIRTUAL_DISPLAY_NAME = "JettaVS7_CarLife_Cockpit"
+        private const val VIRTUAL_DISPLAY_NAME = "CarLife_AppMirroring_Display"
         private const val DEQUEUE_TIMEOUT_US = 10_000L
         // AOSP WindowManager.LayoutParams.TYPE_PRIVATE_PRESENTATION = 2030 / TYPE_PRESENTATION = 2037
         private const val WINDOW_TYPE_PRIVATE_PRESENTATION = 2030
@@ -618,8 +784,7 @@ private class PresentationLifecycleOwner :
 
 /**
  * Android [Presentation] window rendered onto the `VirtualDisplay` (and encoded into H.264 for the
- * Jetta VS7 Head Unit). Renders the full 3-zone [CockpitScreen] and accepts direct `MotionEvent`
- * and `KeyEvent` dispatch on `window.decorView`.
+ * Head Unit). Hosts the [CarLifeAppLauncherScreen] (App Grid + Side Dock + Media Controller).
  */
 class CockpitPresentation(
     outerContext: Context,
@@ -643,13 +808,20 @@ class CockpitPresentation(
         decorView?.setViewTreeViewModelStoreOwner(lifecycleOwner)
         decorView?.setViewTreeSavedStateRegistryOwner(lifecycleOwner)
 
+        val targetDisplayId = display.displayId
         val composeView = ComposeView(context).apply {
             setViewTreeLifecycleOwner(lifecycleOwner)
             setViewTreeViewModelStoreOwner(lifecycleOwner)
             setViewTreeSavedStateRegistryOwner(lifecycleOwner)
             setContent {
                 MyApplicationTheme {
-                    ProjectedVagCockpitContainer(statsFlow = statsFlow)
+                    ProjectedCarLifeLauncherContainer(
+                        virtualDisplayId = targetDisplayId,
+                        statsFlow = statsFlow,
+                        onBringLauncherToFront = {
+                            runCatching { show() }
+                        }
+                    )
                 }
             }
         }
@@ -673,27 +845,50 @@ class CockpitPresentation(
 }
 
 @Composable
-private fun ProjectedVagCockpitContainer(
-    statsFlow: StateFlow<ProjectionPipelineStats>
+private fun ProjectedCarLifeLauncherContainer(
+    virtualDisplayId: Int,
+    statsFlow: StateFlow<ProjectionPipelineStats>,
+    onBringLauncherToFront: () -> Unit
 ) {
     val stats by statsFlow.collectAsState()
-    val telemetry by VagUdsTelemetryRepository.telemetryState.collectAsState()
     val media by MediaControllerRepository.mediaState.collectAsState()
 
+    // Continuous 60fps surface pulse so Hardware H.264 MediaCodec Surface always emits SPS/PPS + IDR frames
+    // immediately after MSG_CMD_VIDEO_ENCODER_START (preventing the Head Unit from stalling at 90%)
+    val infiniteTransition = rememberInfiniteTransition(label = "h264_surface_keepalive")
+    val pulsePhase by infiniteTransition.animateFloat(
+        initialValue = 0.2f,
+        targetValue = 0.9f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 1000, easing = LinearEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "pulse_alpha"
+    )
+
     Box(modifier = Modifier.fillMaxSize()) {
-        CockpitScreen(
-            telemetry = telemetry,
+        CarLifeAppLauncherScreen(
+            virtualDisplayId = virtualDisplayId,
             mediaState = media,
             onPlayPause = { MediaControllerRepository.togglePlayPause() },
             onNextTrack = { MediaControllerRepository.skipNext() },
             onPreviousTrack = { MediaControllerRepository.skipPrevious() },
             onRequestNotificationAccess = {},
-            onTriggerWarmUpSweep = {}
+            onHomePressed = onBringLauncherToFront,
+            onBackPressed = {
+                CarLifeTouchAccessibilityService.instance?.performBackAction()
+            }
         )
 
-        // Visual touch-injection crosshair feedback on the VirtualDisplay
-        stats.lastTouchPoint?.let { (tx, ty) ->
-            Canvas(modifier = Modifier.fillMaxSize()) {
+        // Subtle live indicator + touch crosshair on VirtualDisplay to keep Surface active at 60fps
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            drawCircle(
+                color = ElectricCyan.copy(alpha = pulsePhase * 0.25f),
+                radius = 3.dp.toPx(),
+                center = Offset(size.width - 8.dp.toPx(), 8.dp.toPx())
+            )
+
+            stats.lastTouchPoint?.let { (tx, ty) ->
                 val normX = (tx / stats.width.coerceAtLeast(1).toFloat()) * size.width
                 val normY = (ty / stats.height.coerceAtLeast(1).toFloat()) * size.height
                 val center = Offset(

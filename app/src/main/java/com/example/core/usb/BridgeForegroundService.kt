@@ -1,5 +1,6 @@
 package com.example.core.usb
 
+import android.app.Activity
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -22,6 +23,7 @@ import com.example.R
 import com.example.core.carlife.CarLifeHardKeyPacket
 import com.example.core.carlife.CarLifeTouchPacket
 import com.example.core.projection.CockpitProjectionManager
+import com.example.core.projection.MediaProjectionTokenStore
 import com.example.core.projection.ProjectionPipelineStats
 import com.example.protocol.carlife.CarLifeChannel
 import com.example.protocol.carlife.CarLifeControlSessionState
@@ -285,6 +287,40 @@ class BridgeForegroundService : Service() {
                 }
             }
 
+            ACTION_GRANT_MEDIA_PROJECTION -> {
+                val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED)
+                val resultData: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    intent.getParcelableExtra(EXTRA_RESULT_DATA, Intent::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    intent.getParcelableExtra(EXTRA_RESULT_DATA)
+                }
+                if (resultCode == Activity.RESULT_OK && resultData != null) {
+                    MediaProjectionTokenStore.saveToken(resultCode, resultData)
+                    promoteToForeground(usbTransport.state.value)
+                    val session = controlStateMachine.sessionState.value
+                    val targetW = session.negotiatedVideoWidth.coerceAtLeast(1280)
+                    val targetH = session.negotiatedVideoHeight.coerceAtLeast(720)
+                    val targetFps = session.negotiatedFps.coerceIn(30, 60)
+                    serviceScope.launch {
+                        if (projectionManager.stats.value.isRunning) {
+                            projectionManager.stopProjection()
+                        }
+                        projectionManager.startProjection(
+                            width = targetW,
+                            height = targetH,
+                            frameRate = targetFps
+                        )
+                        projectionManager.requestInstantIdrKeyFrame()
+                    }
+                    BridgeTelemetryBus.updateState {
+                        it.copy(
+                            lastProtocolEvent = "MediaProjection (Entire Screen) granted — H.264 SPS/PPS + IDR active"
+                        )
+                    }
+                }
+            }
+
             ACTION_START_PROJECTION -> {
                 val width = intent.getIntExtra(EXTRA_WIDTH, 1280)
                 val height = intent.getIntExtra(EXTRA_HEIGHT, 720)
@@ -455,9 +491,8 @@ class BridgeForegroundService : Service() {
                                 height = s.negotiatedVideoHeight,
                                 frameRate = s.negotiatedFps
                             )
-                        } else {
-                            projectionManager.requestInstantIdrKeyFrame()
                         }
+                        projectionManager.requestInstantIdrKeyFrame()
                     }
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_PAUSE -> {
                         projectionManager.stopProjection()
@@ -559,18 +594,30 @@ class BridgeForegroundService : Service() {
 
     private fun promoteToForeground(state: UsbTransportState) {
         val notification = buildNotification(state)
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                startForeground(
-                    NOTIFICATION_ID,
-                    notification,
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
-                )
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val hasMpToken = MediaProjectionTokenStore.hasValidToken.value
+            val desiredType = if (hasMpToken) {
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
             } else {
-                startForeground(NOTIFICATION_ID, notification)
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
             }
-        } catch (se: SecurityException) {
-            Log.w(TAG, "connectedDevice FGS type requires active USB permission/attachment: ${se.message}")
+            try {
+                startForeground(NOTIFICATION_ID, notification, desiredType)
+            } catch (se: SecurityException) {
+                Log.w(TAG, "FGS promotion with type=$desiredType failed (${se.message}); falling back to connectedDevice")
+                runCatching {
+                    startForeground(
+                        NOTIFICATION_ID,
+                        notification,
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+                    )
+                }.onFailure {
+                    runCatching { startForeground(NOTIFICATION_ID, notification) }
+                }
+            }
+        } else {
+            runCatching { startForeground(NOTIFICATION_ID, notification) }
         }
     }
 
@@ -662,6 +709,7 @@ class BridgeForegroundService : Service() {
 
         const val ACTION_ATTACH_ACCESSORY = "com.example.core.usb.action.ATTACH_ACCESSORY"
         const val ACTION_SCAN_AND_CONNECT = "com.example.core.usb.action.SCAN_AND_CONNECT"
+        const val ACTION_GRANT_MEDIA_PROJECTION = "com.example.core.usb.action.GRANT_MEDIA_PROJECTION"
         const val ACTION_START_PROJECTION = "com.example.core.usb.action.START_PROJECTION"
         const val ACTION_STOP_PROJECTION = "com.example.core.usb.action.STOP_PROJECTION"
         const val ACTION_INJECT_TEST_TOUCH = "com.example.core.usb.action.INJECT_TEST_TOUCH"
@@ -670,11 +718,27 @@ class BridgeForegroundService : Service() {
         const val ACTION_TOGGLE_VIDEO_HEADER_MODE = "com.example.core.usb.action.TOGGLE_VIDEO_HEADER_MODE"
         const val ACTION_DISCONNECT_STOP = "com.example.core.usb.action.DISCONNECT_STOP"
 
+        const val EXTRA_RESULT_CODE = "extra_result_code"
+        const val EXTRA_RESULT_DATA = "extra_result_data"
         const val EXTRA_WIDTH = "extra_width"
         const val EXTRA_HEIGHT = "extra_height"
         const val EXTRA_FPS = "extra_fps"
         const val EXTRA_TOUCH_X = "extra_touch_x"
         const val EXTRA_TOUCH_Y = "extra_touch_y"
+
+        fun grantMediaProjection(context: Context, resultCode: Int, resultData: Intent) {
+            MediaProjectionTokenStore.saveToken(resultCode, resultData)
+            val intent = Intent(context, BridgeForegroundService::class.java).apply {
+                action = ACTION_GRANT_MEDIA_PROJECTION
+                putExtra(EXTRA_RESULT_CODE, resultCode)
+                putExtra(EXTRA_RESULT_DATA, resultData)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(intent)
+            } else {
+                context.startService(intent)
+            }
+        }
 
         fun startWithAccessory(context: Context, accessory: UsbAccessory?) {
             val intent = Intent(context, BridgeForegroundService::class.java).apply {
