@@ -7,6 +7,9 @@ on:
     branches: [ "main", "master" ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build-apk:
     runs-on: ubuntu-latest
@@ -21,7 +24,98 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Setup Gradle
+      - name: Adapt AI Studio Container Configs to Public Maven (AGP 8.7.3 / SDK 35 / Kotlin 2.0.21)
+        run: |
+          cat > gradle/libs.versions.toml << 'EOF'
+          [versions]
+          agp = "8.7.3"
+          coreKtx = "1.15.0"
+          junit = "4.13.2"
+          junitVersion = "1.2.1"
+          espressoCore = "3.6.1"
+          lifecycleRuntimeKtx = "2.8.7"
+          lifecycleViewmodelCompose = "2.8.7"
+          lifecycleRuntimeCompose = "2.8.7"
+          activityCompose = "1.9.3"
+          kotlin = "2.0.21"
+          composeBom = "2024.09.00"
+          googleDevtoolsKsp = "2.0.21-1.0.28"
+          kotlinxCoroutinesTest = "1.9.0"
+          core = "1.6.1"
+          runner = "1.6.2"
+          kotlinxCoroutinesAndroid = "1.9.0"
+          kotlinxCoroutinesCore = "1.9.0"
+          robolectric = "4.14.1"
+          secretsGradlePlugin = "2.0.1"
+          googleServices = "4.4.2"
+
+          [libraries]
+          androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
+          junit = { group = "junit", name = "junit", version.ref = "junit" }
+          androidx-junit = { group = "androidx.test.ext", name = "junit", version.ref = "junitVersion" }
+          androidx-espresso-core = { group = "androidx.test.espresso", name = "espresso-core", version.ref = "espressoCore" }
+          androidx-lifecycle-runtime-ktx = { group = "androidx.lifecycle", name = "lifecycle-runtime-ktx", version.ref = "lifecycleRuntimeKtx" }
+          androidx-lifecycle-viewmodel-compose = { group = "androidx.lifecycle", name = "lifecycle-viewmodel-compose", version.ref = "lifecycleViewmodelCompose" }
+          androidx-lifecycle-runtime-compose = { group = "androidx.lifecycle", name = "lifecycle-runtime-compose", version.ref = "lifecycleRuntimeCompose" }
+          androidx-activity-compose = { group = "androidx.activity", name = "activity-compose", version.ref = "activityCompose" }
+          androidx-compose-bom = { group = "androidx.compose", name = "compose-bom", version.ref = "composeBom" }
+          androidx-compose-ui = { group = "androidx.compose.ui", name = "ui" }
+          androidx-compose-ui-graphics = { group = "androidx.compose.ui", name = "ui-graphics" }
+          androidx-compose-ui-tooling = { group = "androidx.compose.ui", name = "ui-tooling" }
+          androidx-compose-ui-tooling-preview = { group = "androidx.compose.ui", name = "ui-tooling-preview" }
+          androidx-compose-ui-test-manifest = { group = "androidx.compose.ui", name = "ui-test-manifest" }
+          androidx-compose-ui-test-junit4 = { group = "androidx.compose.ui", name = "ui-test-junit4" }
+          kotlinx-coroutines-test = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-test", version.ref = "kotlinxCoroutinesTest" }
+          androidx-core = { group = "androidx.test", name = "core", version.ref = "core" }
+          androidx-runner = { group = "androidx.test", name = "runner", version.ref = "runner" }
+          androidx-compose-material3 = { group = "androidx.compose.material3", name = "material3" }
+          androidx-compose-material-icons-core = { group = "androidx.compose.material", name = "material-icons-core" }
+          androidx-compose-material-icons-extended = { group = "androidx.compose.material", name = "material-icons-extended" }
+          kotlinx-coroutines-android = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-android", version.ref = "kotlinxCoroutinesAndroid" }
+          kotlinx-coroutines-core = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-core", version.ref = "kotlinxCoroutinesCore" }
+          robolectric = { group = "org.robolectric", name = "robolectric", version.ref = "robolectric" }
+
+          [plugins]
+          android-application = { id = "com.android.application", version.ref = "agp" }
+          kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
+          kotlin-compose = { id = "org.jetbrains.kotlin.plugin.compose", version.ref = "kotlin" }
+          google-devtools-ksp = { id = "com.google.devtools.ksp", version.ref = "googleDevtoolsKsp" }
+          secrets = { id = "com.google.android.libraries.mapsplatform.secrets-gradle-plugin", version.ref = "secretsGradlePlugin" }
+          google-services = { id = "com.google.gms.google-services", version.ref = "googleServices" }
+          EOF
+
+          cat > build.gradle.kts << 'EOF'
+          plugins {
+              alias(libs.plugins.android.application) apply false
+              alias(libs.plugins.kotlin.android) apply false
+              alias(libs.plugins.kotlin.compose) apply false
+              alias(libs.plugins.google.devtools.ksp) apply false
+              alias(libs.plugins.secrets) apply false
+              alias(libs.plugins.google.services) apply false
+          }
+          EOF
+
+          python3 - << 'PYEOF'
+          with open("app/build.gradle.kts", "r") as f:
+              content = f.read()
+          content = content.replace(
+              "alias(libs.plugins.android.application)",
+              "alias(libs.plugins.android.application)\n  alias(libs.plugins.kotlin.android)"
+          )
+          content = content.replace(
+              "compileSdk { version = release(36) { minorApiLevel = 1 } }",
+              "compileSdk = 35"
+          )
+          content = content.replace("targetSdk = 36", "targetSdk = 35")
+          content = content.replace(
+              "compileOptions {\n    sourceCompatibility = JavaVersion.VERSION_11\n    targetCompatibility = JavaVersion.VERSION_11\n  }",
+              "compileOptions {\n    sourceCompatibility = JavaVersion.VERSION_11\n    targetCompatibility = JavaVersion.VERSION_11\n  }\n  kotlinOptions {\n    jvmTarget = \"11\"\n  }"
+          )
+          with open("app/build.gradle.kts", "w") as f:
+              f.write(content)
+          PYEOF
+
+      - name: Setup Gradle 8.11.1
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.11.1'
@@ -33,16 +127,27 @@ jobs:
           fi
 
       - name: Build Signed Debug APK (Samsung S26 Ultra / Jetta VS7 CarLife)
-        run: gradle :app:assembleDebug
+        run: gradle :app:assembleDebug --no-configuration-cache
 
-      - name: Copy APK to /apk directory
+      - name: Rename APK for Release & Artifact
         run: |
-          mkdir -p apk
-          cp app/build/outputs/apk/debug/app-debug.apk apk/CarLifeBridge-debug.apk
+          cp app/build/outputs/apk/debug/app-debug.apk CarLifeBridge-S26Ultra-debug.apk
 
       - name: Upload Ready-to-Install APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: CarLifeBridge-S26Ultra-APK
-          path: apk/CarLifeBridge-debug.apk
+          path: CarLifeBridge-S26Ultra-debug.apk
           if-no-files-found: error
+
+      - name: Publish APK to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+        with:
+          tag_name: v1.0-latest
+          name: "CarLife Bridge v1.0 (Jetta VS7 MQB / Galaxy S26 Ultra)"
+          body: "Ready-to-install signed APK for Samsung Galaxy S26 Ultra + Jetta VS7 (Baidu CarLife USB AOA + VAG UDS 0x22)."
+          files: CarLifeBridge-S26Ultra-debug.apk
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

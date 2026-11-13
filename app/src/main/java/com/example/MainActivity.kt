@@ -40,21 +40,9 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Bluetooth
-import androidx.compose.material.icons.filled.Cable
-import androidx.compose.material.icons.filled.ClearAll
-import androidx.compose.material.icons.filled.DirectionsCar
-import androidx.compose.material.icons.filled.GraphicEq
-import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material.icons.filled.SettingsInputComponent
-import androidx.compose.material.icons.filled.Speed
-import androidx.compose.material.icons.filled.Stop
-import androidx.compose.material.icons.filled.TouchApp
-import androidx.compose.material.icons.filled.Usb
-import androidx.compose.material.icons.filled.Videocam
-import androidx.compose.material.icons.filled.Wifi
+import com.example.ui.theme.CockpitIcons
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -283,7 +271,7 @@ fun CarLifeBridgeApp(
                     modifier = Modifier.testTag("nav_vag_cockpit"),
                     icon = {
                         Icon(
-                            imageVector = Icons.Default.DirectionsCar,
+                            imageVector = CockpitIcons.DirectionsCar,
                             contentDescription = "VAG Digital Cockpit"
                         )
                     },
@@ -295,7 +283,7 @@ fun CarLifeBridgeApp(
                     modifier = Modifier.testTag("nav_usb_transport"),
                     icon = {
                         Icon(
-                            imageVector = Icons.Default.Usb,
+                            imageVector = CockpitIcons.Usb,
                             contentDescription = "USB AOA & H.264 Engine"
                         )
                     },
@@ -307,7 +295,7 @@ fun CarLifeBridgeApp(
                     modifier = Modifier.testTag("nav_codec_inspector"),
                     icon = {
                         Icon(
-                            imageVector = Icons.Default.SettingsInputComponent,
+                            imageVector = CockpitIcons.SettingsInputComponent,
                             contentDescription = "CarLife Protocol Lab"
                         )
                     },
@@ -439,21 +427,21 @@ private fun UdsAdapterControlStrip(
                     SmallModeChip(
                         label = "Demo",
                         active = telemetryState.isDemoMode,
-                        icon = Icons.Default.Speed,
+                        icon = CockpitIcons.Speed,
                         testTag = "uds_mode_demo_btn",
                         onClick = onStartDemo
                     )
                     SmallModeChip(
                         label = "BT SPP",
                         active = !telemetryState.isDemoMode && !telemetryState.adapterName.contains("Wi-Fi"),
-                        icon = Icons.Default.Bluetooth,
+                        icon = CockpitIcons.Bluetooth,
                         testTag = "uds_mode_bt_btn",
                         onClick = onConnectBluetoothObd
                     )
                     SmallModeChip(
                         label = "Wi-Fi",
                         active = !telemetryState.isDemoMode && telemetryState.adapterName.contains("Wi-Fi"),
-                        icon = Icons.Default.Wifi,
+                        icon = CockpitIcons.Wifi,
                         testTag = "uds_mode_wifi_btn",
                         onClick = onConnectWifiObd
                     )
@@ -566,7 +554,7 @@ private fun UsbTransportConsoleScreen(
                     modifier = Modifier.testTag("clear_logs_button")
                 ) {
                     Icon(
-                        imageVector = Icons.Default.ClearAll,
+                        imageVector = CockpitIcons.ClearAll,
                         contentDescription = "Clear packet logs",
                         tint = TextSecondary
                     )
@@ -950,7 +938,7 @@ private fun TransportControlsCard(
                         border = BorderStroke(1.dp, CoralAlert.copy(alpha = 0.6f))
                     ) {
                         Icon(
-                            imageVector = Icons.Default.Stop,
+                            imageVector = CockpitIcons.Stop,
                             contentDescription = "Stop Service",
                             tint = CoralAlert,
                             modifier = Modifier.size(18.dp)
@@ -1200,7 +1188,7 @@ private fun CodecLaboratoryScreen(
                         CodecTestButton(
                             title = "1. Handshake",
                             subtitle = "HU v2.0 + Video Init",
-                            icon = Icons.Default.Memory,
+                            icon = CockpitIcons.Memory,
                             accent = ElectricCyan,
                             testTag = "test_control_frame_btn",
                             modifier = Modifier.weight(1f),
@@ -1223,7 +1211,7 @@ private fun CodecLaboratoryScreen(
                         CodecTestButton(
                             title = "2. Video (12B+TS)",
                             subtitle = "0x0002 H.264 SPS/IDR",
-                            icon = Icons.Default.Videocam,
+                            icon = CockpitIcons.Videocam,
                             accent = TelemetryEmerald,
                             testTag = "test_video_frame_btn",
                             modifier = Modifier.weight(1f),
@@ -1248,7 +1236,7 @@ private fun CodecLaboratoryScreen(
                         CodecTestButton(
                             title = "3. Touch Scale",
                             subtitle = "1280x720 -> 1920x1080",
-                            icon = Icons.Default.TouchApp,
+                            icon = CockpitIcons.TouchApp,
                             accent = AmberSignal,
                             testTag = "test_touch_frame_btn",
                             modifier = Modifier.weight(1f),
@@ -1267,7 +1255,7 @@ private fun CodecLaboratoryScreen(
                         CodecTestButton(
                             title = "4. MQB HardKey",
                             subtitle = "Steering Wheel NEXT",
-                            icon = Icons.Default.GraphicEq,
+                            icon = CockpitIcons.GraphicEq,
                             accent = CyberBlue,
                             testTag = "test_audio_frame_btn",
                             modifier = Modifier.weight(1f),
@@ -1450,7 +1438,7 @@ private fun EmptyPacketLogCard() {
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             Icon(
-                imageVector = Icons.Default.Cable,
+                imageVector = CockpitIcons.Cable,
                 contentDescription = "No packets yet",
                 tint = ElectricCyan,
                 modifier = Modifier.size(32.dp)

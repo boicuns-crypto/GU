@@ -32,15 +32,8 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.TurnRight
-import androidx.compose.material.icons.filled.Album
-import androidx.compose.material.icons.filled.Navigation
-import androidx.compose.material.icons.filled.NotificationsActive
-import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material.icons.filled.SkipNext
-import androidx.compose.material.icons.filled.SkipPrevious
-import androidx.compose.material.icons.filled.Speed
+import com.example.ui.theme.CockpitIcons
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Icon
@@ -270,7 +263,7 @@ private fun NavigationMapZone(
                         contentAlignment = Alignment.Center
                     ) {
                         Icon(
-                            imageVector = Icons.Default.TurnRight,
+                            imageVector = CockpitIcons.TurnRight,
                             contentDescription = "Next Maneuver Turn",
                             tint = ElectricCyan,
                             modifier = Modifier.size(28.dp)
@@ -325,7 +318,7 @@ private fun NavigationMapZone(
                         horizontalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
                         Icon(
-                            imageVector = Icons.Default.Speed,
+                            imageVector = CockpitIcons.Speed,
                             contentDescription = null,
                             tint = ElectricCyan,
                             modifier = Modifier.size(20.dp)
@@ -811,7 +804,7 @@ private fun VagMediaPlayerZone(
                         )
                     } else {
                         Icon(
-                            imageVector = Icons.Default.Album,
+                            imageVector = CockpitIcons.Album,
                             contentDescription = "Album Art Disc",
                             tint = ObsidianBackground,
                             modifier = Modifier.size(32.dp)
@@ -848,7 +841,7 @@ private fun VagMediaPlayerZone(
                                     horizontalArrangement = Arrangement.spacedBy(4.dp)
                                 ) {
                                     Icon(
-                                        imageVector = Icons.Default.NotificationsActive,
+                                        imageVector = CockpitIcons.NotificationsActive,
                                         contentDescription = "Grant Media Session Access",
                                         tint = AmberSignal,
                                         modifier = Modifier.size(12.dp)
@@ -899,7 +892,7 @@ private fun VagMediaPlayerZone(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 AutomotiveMediaButton(
-                    icon = Icons.Default.SkipPrevious,
+                    icon = CockpitIcons.SkipPrevious,
                     contentDescription = "Previous Track",
                     isPrimary = false,
                     testTag = "cockpit_media_prev_btn",
@@ -910,7 +903,7 @@ private fun VagMediaPlayerZone(
                 )
 
                 AutomotiveMediaButton(
-                    icon = if (mediaState.isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                    icon = if (mediaState.isPlaying) CockpitIcons.Pause else Icons.Default.PlayArrow,
                     contentDescription = if (mediaState.isPlaying) "Pause" else "Play",
                     isPrimary = true,
                     testTag = "cockpit_media_play_pause_btn",
@@ -921,7 +914,7 @@ private fun VagMediaPlayerZone(
                 )
 
                 AutomotiveMediaButton(
-                    icon = Icons.Default.SkipNext,
+                    icon = CockpitIcons.SkipNext,
                     contentDescription = "Next Track",
                     isPrimary = false,
                     testTag = "cockpit_media_next_btn",
