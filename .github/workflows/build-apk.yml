@@ -113,6 +113,12 @@ jobs:
             }
 
             signingConfigs {
+              create("release") {
+                storeFile = file("${rootDir}/my-upload-key.jks")
+                storePassword = "carlife2026"
+                keyAlias = "upload"
+                keyPassword = "carlife2026"
+              }
               create("debugConfig") {
                 storeFile = file("${rootDir}/debug.keystore")
                 storePassword = "android"
@@ -122,6 +128,13 @@ jobs:
             }
 
             buildTypes {
+              release {
+                isCrunchPngs = false
+                isMinifyEnabled = true
+                isShrinkResources = true
+                proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+                signingConfig = signingConfigs.getByName("release")
+              }
               debug {
                 signingConfig = signingConfigs.getByName("debugConfig")
               }
@@ -143,6 +156,9 @@ jobs:
 
             packaging {
               dex {
+                useLegacyPackaging = true
+              }
+              jniLibs {
                 useLegacyPackaging = true
               }
             }
@@ -169,35 +185,45 @@ jobs:
         with:
           gradle-version: '8.11.1'
 
-      - name: Restore debug.keystore from debug.keystore.base64
+      - name: Restore Keystores (Release & Debug)
         run: |
+          if [ -f release-upload-key.jks.base64 ]; then
+            base64 -d release-upload-key.jks.base64 > my-upload-key.jks
+          fi
           if [ ! -f debug.keystore ] && [ -f debug.keystore.base64 ]; then
             base64 -d debug.keystore.base64 > debug.keystore
           fi
 
-      - name: Build Signed Debug APK (Samsung S26 Ultra / Jetta VS7 CarLife)
-        run: gradle :app:assembleDebug --stacktrace --no-configuration-cache
+      - name: Build Signed Release & Debug APKs (Samsung S26 Ultra / Jetta VS7 CarLife)
+        run: gradle :app:assembleRelease :app:assembleDebug --stacktrace --no-configuration-cache
 
-      - name: Rename APK for Release & Artifact
+      - name: Rename APKs for Release & Artifact
         run: |
+          cp app/build/outputs/apk/release/app-release.apk CarLifeBridge-S26Ultra-release.apk
           cp app/build/outputs/apk/debug/app-debug.apk CarLifeBridge-S26Ultra-debug.apk
-          ls -lh CarLifeBridge-S26Ultra-debug.apk
+          ls -lh CarLifeBridge-S26Ultra-release.apk CarLifeBridge-S26Ultra-debug.apk
 
-      - name: Upload Ready-to-Install APK Artifact
+      - name: Upload Ready-to-Install Release APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: CarLifeBridge-S26Ultra-APK
-          path: CarLifeBridge-S26Ultra-debug.apk
+          name: CarLifeBridge-S26Ultra-Release-APK
+          path: |
+            CarLifeBridge-S26Ultra-release.apk
+            CarLifeBridge-S26Ultra-debug.apk
+            my-upload-key.jks
           if-no-files-found: error
 
-      - name: Publish APK to GitHub Releases
+      - name: Publish Release & Debug APKs to GitHub Releases
         uses: softprops/action-gh-release@v2
         if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         with:
-          tag_name: v1.0-latest
-          name: "CarLife Bridge v1.0 (Jetta VS7 MQB / Galaxy S26 Ultra)"
-          body: "Ready-to-install signed APK for Samsung Galaxy S26 Ultra + Jetta VS7 (Baidu CarLife USB AOA + VAG UDS 0x22)."
-          files: CarLifeBridge-S26Ultra-debug.apk
+          tag_name: v1.1-release
+          name: "CarLife Bridge v1.1 Release (Jetta VS7 MQB / Galaxy S26 Ultra)"
+          body: "Signed Release APK (`CarLifeBridge-S26Ultra-release.apk`, 2.6 MB, R8 optimized) and Debug APK for Samsung Galaxy S26 Ultra + Jetta VS7 (Baidu CarLife USB AOA + VAG UDS 0x22)."
+          files: |
+            CarLifeBridge-S26Ultra-release.apk
+            CarLifeBridge-S26Ultra-debug.apk
+            my-upload-key.jks
           prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
