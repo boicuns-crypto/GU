@@ -6,6 +6,7 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.hardware.usb.UsbAccessory
 import android.hardware.usb.UsbManager
 import android.media.projection.MediaProjectionManager
@@ -20,8 +21,8 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -33,6 +34,7 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -42,6 +44,7 @@ import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
@@ -49,9 +52,11 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
-import androidx.compose.material.icons.filled.Warning
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -63,6 +68,10 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.NavigationBarItemDefaults
+import androidx.compose.material3.NavigationRail
+import androidx.compose.material3.NavigationRailItem
+import androidx.compose.material3.NavigationRailItemDefaults
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
@@ -70,6 +79,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -80,19 +90,19 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
@@ -130,10 +140,14 @@ import com.example.ui.theme.ObsidianBackground
 import com.example.ui.theme.ObsidianBorder
 import com.example.ui.theme.ObsidianSurface
 import com.example.ui.theme.ObsidianSurfaceHigh
+import com.example.ui.theme.SuccessBadgeBg
+import com.example.ui.theme.SuccessBadgeFg
 import com.example.ui.theme.TelemetryEmerald
 import com.example.ui.theme.TextMuted
 import com.example.ui.theme.TextPrimary
 import com.example.ui.theme.TextSecondary
+import com.example.ui.theme.WarningBadgeBg
+import com.example.ui.theme.WarningBadgeFg
 import java.io.PipedInputStream
 import java.io.PipedOutputStream
 import kotlinx.coroutines.Dispatchers
@@ -243,11 +257,8 @@ class MainActivity : ComponentActivity() {
                 @Suppress("DEPRECATION")
                 intent.getParcelableExtra(UsbManager.EXTRA_ACCESSORY)
             }
-            // Start Foreground Service safely (uses FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE first,
-            // and upgrades to FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION once token is available).
             BridgeForegroundService.startWithAccessory(this, accessory)
 
-            // If user hasn't granted MediaProjection yet, prompt immediately so CarLife passes 90%!
             if (!MediaProjectionTokenStore.hasValidToken.value) {
                 requestScreenCapturePermission()
             }
@@ -291,14 +302,11 @@ private fun evaluateSetupChecklist(
 ): SetupChecklistStatus {
     val pkg = context.packageName
 
-    // Step 1: PowerManager.isIgnoringBatteryOptimizations(packageName)
     val powerManager = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
     val batteryUnrestricted = powerManager?.isIgnoringBatteryOptimizations(pkg) == true
 
-    // Step 2: Settings.canDrawOverlays(context)
     val overlayGranted = Settings.canDrawOverlays(context)
 
-    // Step 3: AccessibilityService in Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
     val expectedComponent = ComponentName(pkg, CarLifeTouchAccessibilityService::class.java.name)
     val enabledServicesRaw = runCatching {
         Settings.Secure.getString(
@@ -311,7 +319,6 @@ private fun evaluateSetupChecklist(
         enabledServicesRaw.contains(CarLifeTouchAccessibilityService::class.java.simpleName, ignoreCase = true)
     val accessibilityEnabled = a11yRealtimeFlag || a11yInSecureSettings
 
-    // Step 4: NotificationManagerCompat.getEnabledListenerPackages(context).contains(packageName)
     val notificationGranted = runCatching {
         NotificationManagerCompat.getEnabledListenerPackages(context).contains(pkg)
     }.getOrDefault(false)
@@ -336,14 +343,25 @@ fun CarLifeBridgeApp(
     onInjectTouch: (Int, Int) -> Unit
 ) {
     val context = LocalContext.current
+    val configuration = LocalConfiguration.current
+    val isLandscape = configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
     val lifecycleOwner = LocalLifecycleOwner.current
+
     val runtimeState by BridgeTelemetryBus.runtimeState.collectAsStateWithLifecycle()
     val mediaState by MediaControllerRepository.mediaState.collectAsStateWithLifecycle()
     val a11yEnabled by CarLifeTouchAccessibilityService.isServiceEnabled.collectAsStateWithLifecycle()
     val hasMediaProjectionToken by MediaProjectionTokenStore.hasValidToken.collectAsStateWithLifecycle()
+    val lastLaunchStatus by CarLifeLauncherRepository.lastLaunchStatus.collectAsState()
 
-    // Default to Tab 0 (Мастер настройки / Setup Checklist) so the user can verify all 6 steps first
+    // 3 Tabs:
+    // 0 = «Лаунчер ГУ» (Grid/Apps)
+    // 1 = «Подключение» (Check/Shield — Setup Checklist)
+    // 2 = «Настройки» (Settings — VD Controls, H.264 Stream Config & Expandable AOA/Protocol Lab)
     var selectedTab by rememberSaveable { mutableIntStateOf(0) }
+
+    var configuredWidth by rememberSaveable { mutableIntStateOf(1280) }
+    var configuredHeight by rememberSaveable { mutableIntStateOf(720) }
+    var configuredBitrateMbps by rememberSaveable { mutableIntStateOf(8) }
 
     var checklistStatus by remember {
         mutableStateOf(
@@ -356,7 +374,6 @@ fun CarLifeBridgeApp(
         )
     }
 
-    // Refresh checklist whenever Lifecycle resumes or reactive flags change
     DisposableEffect(lifecycleOwner, a11yEnabled, hasMediaProjectionToken, runtimeState.transportState) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
@@ -374,7 +391,6 @@ fun CarLifeBridgeApp(
         }
     }
 
-    // Periodic 1s real-time status check so toggles update immediately
     LaunchedEffect(a11yEnabled, hasMediaProjectionToken, runtimeState.transportState) {
         while (isActive) {
             checklistStatus = evaluateSetupChecklist(
@@ -404,133 +420,186 @@ fun CarLifeBridgeApp(
         CarLifeLauncherRepository.loadInstalledApps(context)
     }
 
+    val navBarColors = NavigationBarItemDefaults.colors(
+        selectedIconColor = ElectricCyan,
+        selectedTextColor = ElectricCyan,
+        indicatorColor = ElectricCyan.copy(alpha = 0.16f),
+        unselectedIconColor = TextSecondary,
+        unselectedTextColor = TextSecondary
+    )
+
+    val navRailColors = NavigationRailItemDefaults.colors(
+        selectedIconColor = ElectricCyan,
+        selectedTextColor = ElectricCyan,
+        indicatorColor = ElectricCyan.copy(alpha = 0.16f),
+        unselectedIconColor = TextSecondary,
+        unselectedTextColor = TextSecondary
+    )
+
     Scaffold(
         modifier = Modifier.fillMaxSize(),
         containerColor = ObsidianBackground,
         contentWindowInsets = WindowInsets.safeDrawing,
         bottomBar = {
-            NavigationBar(
-                containerColor = ObsidianSurface,
-                tonalElevation = 8.dp,
-                windowInsets = WindowInsets.navigationBars
-            ) {
-                NavigationBarItem(
-                    selected = selectedTab == 0,
-                    onClick = { selectedTab = 0 },
-                    modifier = Modifier.testTag("nav_setup_checklist"),
-                    icon = {
-                        Icon(
-                            imageVector = if (checklistStatus.allPrerequisitesReady) {
-                                Icons.Default.CheckCircle
-                            } else {
-                                Icons.Default.Warning
-                            },
-                            contentDescription = "Мастер настройки (Чек-лист)"
-                        )
-                    },
-                    label = {
-                        Text(
-                            if (checklistStatus.allPrerequisitesReady) {
-                                "Чек-лист ✅"
-                            } else {
-                                "Настройка (${checklistStatus.completedMandatorySteps}/5)"
-                            }
-                        )
-                    }
-                )
-                NavigationBarItem(
-                    selected = selectedTab == 1,
-                    onClick = { selectedTab = 1 },
-                    modifier = Modifier.testTag("nav_app_launcher"),
-                    icon = {
-                        Icon(
-                            imageVector = CockpitIcons.AppsGrid,
-                            contentDescription = "CarLife App Launcher"
-                        )
-                    },
-                    label = { Text("Лаунчер ГУ") }
-                )
-                NavigationBarItem(
-                    selected = selectedTab == 2,
-                    onClick = { selectedTab = 2 },
-                    modifier = Modifier.testTag("nav_usb_transport"),
-                    icon = {
-                        Icon(
-                            imageVector = CockpitIcons.Usb,
-                            contentDescription = "USB AOA & H.264 Engine"
-                        )
-                    },
-                    label = { Text("AOA & H.264") }
-                )
-                NavigationBarItem(
-                    selected = selectedTab == 3,
-                    onClick = { selectedTab = 3 },
-                    modifier = Modifier.testTag("nav_codec_inspector"),
-                    icon = {
-                        Icon(
-                            imageVector = CockpitIcons.SettingsInputComponent,
-                            contentDescription = "CarLife Protocol Lab"
-                        )
-                    },
-                    label = { Text("Protocol Lab") }
-                )
+            if (!isLandscape) {
+                NavigationBar(
+                    modifier = Modifier
+                        .windowInsetsPadding(WindowInsets.navigationBars)
+                        .height(64.dp),
+                    containerColor = ObsidianSurface,
+                    tonalElevation = 0.dp,
+                    windowInsets = WindowInsets(0, 0, 0, 0)
+                ) {
+                    NavigationBarItem(
+                        selected = selectedTab == 0,
+                        onClick = { selectedTab = 0 },
+                        colors = navBarColors,
+                        modifier = Modifier.testTag("nav_app_launcher"),
+                        icon = {
+                            Icon(
+                                imageVector = CockpitIcons.AppsGrid,
+                                contentDescription = "Лаунчер ГУ",
+                                modifier = Modifier.size(20.dp)
+                            )
+                        },
+                        label = {
+                            Text(
+                                text = "Лаунчер ГУ",
+                                style = MaterialTheme.typography.labelSmall
+                            )
+                        }
+                    )
+                    NavigationBarItem(
+                        selected = selectedTab == 1,
+                        onClick = { selectedTab = 1 },
+                        colors = navBarColors,
+                        modifier = Modifier.testTag("nav_setup_checklist"),
+                        icon = {
+                            Icon(
+                                imageVector = Icons.Default.CheckCircle,
+                                contentDescription = "Подключение",
+                                modifier = Modifier.size(20.dp)
+                            )
+                        },
+                        label = {
+                            Text(
+                                text = "Подключение",
+                                style = MaterialTheme.typography.labelSmall
+                            )
+                        }
+                    )
+                    NavigationBarItem(
+                        selected = selectedTab == 2,
+                        onClick = { selectedTab = 2 },
+                        colors = navBarColors,
+                        modifier = Modifier.testTag("nav_settings"),
+                        icon = {
+                            Icon(
+                                imageVector = Icons.Default.Settings,
+                                contentDescription = "Настройки",
+                                modifier = Modifier.size(20.dp)
+                            )
+                        },
+                        label = {
+                            Text(
+                                text = "Настройки",
+                                style = MaterialTheme.typography.labelSmall
+                            )
+                        }
+                    )
+                }
             }
         }
     ) { innerPadding ->
-        Box(
+        Row(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(innerPadding),
-            contentAlignment = Alignment.TopCenter
+                .padding(innerPadding)
         ) {
-            when (selectedTab) {
-                0 -> OnboardingChecklistScreen(
-                    status = checklistStatus,
-                    runtimeState = runtimeState,
-                    onRequestBatteryUnrestricted = {
-                        requestIgnoreBatteryOptimizations(context)
-                    },
-                    onRequestOverlayPermission = {
-                        openOverlayPermissionSettings(context)
-                    },
-                    onOpenAccessibilitySettings = {
-                        CarLifeTouchAccessibilityService.openAccessibilitySettings(context)
-                    },
-                    onOpenAppDetailsSettings = {
-                        openAppDetailsSettings(context)
-                    },
-                    onOpenNotificationListenerSettings = {
-                        MediaControllerRepository.openNotificationListenerSettings(context)
-                    },
-                    onRequestMediaProjection = onRequestMediaProjection,
-                    onScanAndAttachUsb = onStartOrScanBridge,
-                    onOpenLauncherTab = { selectedTab = 1 }
-                )
-
-                1 -> Column(modifier = Modifier.fillMaxSize()) {
-                    // Top Quick-Setup Strip for Touch Accessibility, Overlay & VirtualDisplay Projection
-                    MirroringQuickControlStrip(
-                        isProjectionRunning = runtimeState.projectionStats.isRunning,
-                        virtualDisplayId = runtimeState.projectionStats.virtualDisplayId,
-                        a11yEnabled = checklistStatus.step3AccessibilityEnabled,
-                        overlayGranted = checklistStatus.step2OverlayGranted,
-                        onToggleProjection = {
-                            if (runtimeState.projectionStats.isRunning) {
-                                onStopProjection()
-                            } else {
-                                onStartProjection(1280, 720, 60)
-                            }
+            if (isLandscape) {
+                NavigationRail(
+                    modifier = Modifier
+                        .width(72.dp)
+                        .fillMaxHeight()
+                        .border(1.dp, ObsidianBorder),
+                    containerColor = ObsidianSurface,
+                    windowInsets = WindowInsets(0, 0, 0, 0)
+                ) {
+                    Spacer(modifier = Modifier.weight(1f))
+                    NavigationRailItem(
+                        selected = selectedTab == 0,
+                        onClick = { selectedTab = 0 },
+                        colors = navRailColors,
+                        modifier = Modifier.testTag("nav_app_launcher"),
+                        icon = {
+                            Icon(
+                                imageVector = CockpitIcons.AppsGrid,
+                                contentDescription = "Лаунчер ГУ",
+                                modifier = Modifier.size(20.dp)
+                            )
                         },
-                        onOpenAccessibilitySettings = {
-                            CarLifeTouchAccessibilityService.openAccessibilitySettings(context)
-                        },
-                        onOpenOverlaySettings = {
-                            openOverlayPermissionSettings(context)
+                        label = {
+                            Text(
+                                text = "Лаунчер",
+                                style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                                maxLines = 1
+                            )
                         }
                     )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    NavigationRailItem(
+                        selected = selectedTab == 1,
+                        onClick = { selectedTab = 1 },
+                        colors = navRailColors,
+                        modifier = Modifier.testTag("nav_setup_checklist"),
+                        icon = {
+                            Icon(
+                                imageVector = Icons.Default.CheckCircle,
+                                contentDescription = "Подключение",
+                                modifier = Modifier.size(20.dp)
+                            )
+                        },
+                        label = {
+                            Text(
+                                text = "Чек-лист",
+                                style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                                maxLines = 1
+                            )
+                        }
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    NavigationRailItem(
+                        selected = selectedTab == 2,
+                        onClick = { selectedTab = 2 },
+                        colors = navRailColors,
+                        modifier = Modifier.testTag("nav_settings"),
+                        icon = {
+                            Icon(
+                                imageVector = Icons.Default.Settings,
+                                contentDescription = "Настройки",
+                                modifier = Modifier.size(20.dp)
+                            )
+                        },
+                        label = {
+                            Text(
+                                text = "Настройки",
+                                style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
+                                maxLines = 1
+                            )
+                        }
+                    )
+                    Spacer(modifier = Modifier.weight(1f))
+                }
+            }
 
-                    // CarLife VirtualDisplay App Launcher & Dock Bar
-                    CarLifeAppLauncherScreen(
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxHeight(),
+                contentAlignment = Alignment.TopCenter
+            ) {
+                when (selectedTab) {
+                    0 -> CarLifeAppLauncherScreen(
                         virtualDisplayId = runtimeState.projectionStats.virtualDisplayId,
                         mediaState = mediaState,
                         onPlayPause = { MediaControllerRepository.togglePlayPause() },
@@ -543,22 +612,69 @@ fun CarLifeBridgeApp(
                         onBackPressed = {
                             CarLifeTouchAccessibilityService.instance?.performBackAction()
                         },
-                        modifier = Modifier.weight(1f)
+                        modifier = Modifier.fillMaxSize()
+                    )
+
+                    1 -> OnboardingChecklistScreen(
+                        status = checklistStatus,
+                        runtimeState = runtimeState,
+                        onRequestBatteryUnrestricted = {
+                            requestIgnoreBatteryOptimizations(context)
+                        },
+                        onRequestOverlayPermission = {
+                            openOverlayPermissionSettings(context)
+                        },
+                        onOpenAccessibilitySettings = {
+                            CarLifeTouchAccessibilityService.openAccessibilitySettings(context)
+                        },
+                        onOpenAppDetailsSettings = {
+                            openAppDetailsSettings(context)
+                        },
+                        onOpenNotificationListenerSettings = {
+                            MediaControllerRepository.openNotificationListenerSettings(context)
+                        },
+                        onRequestMediaProjection = onRequestMediaProjection,
+                        onScanAndAttachUsb = onStartOrScanBridge,
+                        onOpenLauncherTab = { selectedTab = 0 }
+                    )
+
+                    2 -> UnifiedSettingsAndDiagnosticsScreen(
+                        state = runtimeState,
+                        checklistStatus = checklistStatus,
+                        lastLaunchStatus = lastLaunchStatus,
+                        configuredWidth = configuredWidth,
+                        configuredHeight = configuredHeight,
+                        configuredBitrateMbps = configuredBitrateMbps,
+                        onSelectResolution = { w, h ->
+                            configuredWidth = w
+                            configuredHeight = h
+                            if (runtimeState.projectionStats.isRunning) {
+                                onStartProjection(w, h, 60)
+                            }
+                        },
+                        onSelectBitrate = { mbps ->
+                            configuredBitrateMbps = mbps
+                        },
+                        onToggleProjection = {
+                            if (runtimeState.projectionStats.isRunning) {
+                                onStopProjection()
+                            } else {
+                                onStartProjection(configuredWidth, configuredHeight, 60)
+                            }
+                        },
+                        onOpenAccessibilitySettings = {
+                            CarLifeTouchAccessibilityService.openAccessibilitySettings(context)
+                        },
+                        onOpenOverlaySettings = {
+                            openOverlayPermissionSettings(context)
+                        },
+                        onStartOrScanBridge = onStartOrScanBridge,
+                        onStopBridge = onStopBridge,
+                        onStartProjection = onStartProjection,
+                        onStopProjection = onStopProjection,
+                        onInjectTouch = onInjectTouch
                     )
                 }
-
-                2 -> UsbTransportConsoleScreen(
-                    state = runtimeState,
-                    onStartOrScanBridge = onStartOrScanBridge,
-                    onStopBridge = onStopBridge,
-                    onStartProjection = onStartProjection,
-                    onStopProjection = onStopProjection,
-                    onInjectTouch = onInjectTouch
-                )
-
-                3 -> CodecLaboratoryScreen(
-                    state = runtimeState
-                )
             }
         }
     }
@@ -625,23 +741,21 @@ private fun OnboardingChecklistScreen(
             .fillMaxSize()
             .widthIn(max = 680.dp),
         contentPadding = PaddingValues(16.dp),
-        verticalArrangement = Arrangement.spacedBy(14.dp)
+        verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
+        // Заголовочная карточка без пустого пространства сверху
         item {
             Card(
                 modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(18.dp),
+                shape = RoundedCornerShape(16.dp),
                 colors = CardDefaults.cardColors(containerColor = ObsidianSurface),
-                border = BorderStroke(
-                    1.5.dp,
-                    if (status.allPrerequisitesReady) TelemetryEmerald else AmberSignal
-                )
+                border = BorderStroke(1.dp, ObsidianBorder)
             ) {
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -649,44 +763,43 @@ private fun OnboardingChecklistScreen(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(
-                            text = "МАСТЕР НАСТРОЙКИ CARLIFE (БЕЗ ЗАВИСАНИЯ НА 90%)",
-                            style = MaterialTheme.typography.labelLarge,
-                            color = if (status.allPrerequisitesReady) TelemetryEmerald else ElectricCyan
+                            text = "МАСТЕР НАСТРОЙКИ CARLIFE",
+                            style = MaterialTheme.typography.titleMedium.copy(
+                                fontFamily = FontFamily.SansSerif,
+                                fontWeight = FontWeight.SemiBold
+                            ),
+                            color = ElectricCyan
                         )
                         Surface(
-                            color = if (status.allPrerequisitesReady) {
-                                TelemetryEmerald.copy(alpha = 0.18f)
-                            } else {
-                                AmberSignal.copy(alpha = 0.18f)
-                            },
+                            color = if (status.allPrerequisitesReady) SuccessBadgeBg else WarningBadgeBg,
                             shape = RoundedCornerShape(8.dp)
                         ) {
                             Text(
                                 text = "${status.completedMandatorySteps} / 5 выполнено",
                                 style = MaterialTheme.typography.labelSmall,
-                                color = if (status.allPrerequisitesReady) TelemetryEmerald else AmberSignal,
-                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                color = if (status.allPrerequisitesReady) SuccessBadgeFg else WarningBadgeFg,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
                             )
                         }
                     }
 
                     Text(
                         text = if (status.allPrerequisitesReady) {
-                            "Все 5 обязательных разрешений активны ✅ Видеоканал H.264 (SPS/PPS + IDR) готов к мгновенной отдаче — зависание на 90% устранено."
+                            "Все 5 разрешений выданы ✅ Видеопоток H.264 (SPS/PPS + IDR) готов к передаче без зависания на 90%."
                         } else {
-                            "Выполните все шаги ниже перед подключением USB-кабеля к ГУ автомобиля, чтобы загрузка Baidu CarLife не останавливалась на 90%."
+                            "Выполните 5 шагов подготовки перед подключением USB-кабеля к ГУ автомобиля, чтобы CarLife проходил загрузку 90% → 100%."
                         },
                         style = MaterialTheme.typography.bodyMedium,
-                        color = TextPrimary
+                        color = TextSecondary
                     )
 
                     LinearProgressIndicator(
                         progress = { status.completedMandatorySteps / 5f },
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(8.dp)
-                            .clip(RoundedCornerShape(4.dp)),
-                        color = if (status.allPrerequisitesReady) TelemetryEmerald else ElectricCyan,
+                            .height(6.dp)
+                            .clip(RoundedCornerShape(3.dp)),
+                        color = ElectricCyan,
                         trackColor = ObsidianSurfaceHigh
                     )
                 }
@@ -696,8 +809,7 @@ private fun OnboardingChecklistScreen(
         // ШАГ 1: Снятие ограничений батареи
         item {
             ChecklistStepCard(
-                stepNumber = 1,
-                title = "Шаг 1. Снятие ограничений батареи (WakeLock & Unthrottled 60fps)",
+                title = "Шаг 1. Снятие ограничений батареи (WakeLock & 60fps)",
                 isCompleted = status.step1BatteryUnrestricted,
                 description = "Отключите оптимизацию батареи, чтобы система One UI не усыпляла видеопоток при выключенном экране телефона.",
                 primaryButtonText = if (status.step1BatteryUnrestricted) {
@@ -713,7 +825,6 @@ private fun OnboardingChecklistScreen(
         // ШАГ 2: Разрешение «Поверх других окон» (Overlay)
         item {
             ChecklistStepCard(
-                stepNumber = 2,
                 title = "Шаг 2. Разрешение «Поверх других окон» (Overlay)",
                 isCompleted = status.step2OverlayGranted,
                 description = "Разрешите показ поверх других окон — это необходимо для запуска полноценных приложений на экране ГУ из фонового сервиса.",
@@ -730,10 +841,9 @@ private fun OnboardingChecklistScreen(
         // ШАГ 3: Служба специальных возможностей (Accessibility Service)
         item {
             ChecklistStepCard(
-                stepNumber = 3,
                 title = "Шаг 3. Служба специальных возможностей (Тачскрин ГУ)",
                 isCompleted = status.step3AccessibilityEnabled,
-                description = "Откройте «Специальные возможности» -> «Установленные приложения» -> включите службу управления касаниями CarLife. (Если кнопка неактивна на Android 16: зайдите в Настройки -> Приложения -> Наше приложение -> Меню (три точки в углу) -> «Разрешить ограниченные настройки»).",
+                description = "Откройте «Специальные возможности» -> «Установленные приложения» -> включите службу управления касаниями CarLife. (Если кнопка неактивна на Android 16: Настройки -> Приложения -> Наше приложение -> Меню ⋮ -> «Разрешить ограниченные настройки»).",
                 primaryButtonText = if (status.step3AccessibilityEnabled) {
                     "Служба касаний активна"
                 } else {
@@ -749,7 +859,6 @@ private fun OnboardingChecklistScreen(
         // ШАГ 4: Доступ к уведомлениям
         item {
             ChecklistStepCard(
-                stepNumber = 4,
                 title = "Шаг 4. Доступ к уведомлениям (Для виджета музыки на ГУ)",
                 isCompleted = status.step4NotificationAccessGranted,
                 description = "Разрешите чтение уведомлений для отображения обложек треков и управления Яндекс.Музыкой / Spotify с экрана ГУ.",
@@ -769,10 +878,7 @@ private fun OnboardingChecklistScreen(
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(16.dp),
                 colors = CardDefaults.cardColors(containerColor = ObsidianSurface),
-                border = BorderStroke(
-                    width = if (status.step5MediaProjectionGranted) 1.dp else 2.dp,
-                    color = if (status.step5MediaProjectionGranted) TelemetryEmerald else CoralAlert
-                )
+                border = BorderStroke(1.dp, ObsidianBorder)
             ) {
                 Column(
                     modifier = Modifier
@@ -789,7 +895,6 @@ private fun OnboardingChecklistScreen(
                             text = "Шаг 5. Захват экрана (MediaProjection) — КРИТИЧНО ДЛЯ 90%",
                             style = MaterialTheme.typography.titleMedium,
                             color = TextPrimary,
-                            fontWeight = FontWeight.Bold,
                             modifier = Modifier.weight(1f)
                         )
                         Spacer(modifier = Modifier.width(8.dp))
@@ -797,9 +902,9 @@ private fun OnboardingChecklistScreen(
                     }
 
                     Surface(
-                        color = CoralAlert.copy(alpha = 0.14f),
+                        color = ObsidianSurfaceHigh,
                         shape = RoundedCornerShape(12.dp),
-                        border = BorderStroke(1.dp, CoralAlert.copy(alpha = 0.7f))
+                        border = BorderStroke(1.dp, ObsidianBorder)
                     ) {
                         Text(
                             text = buildAnnotatedString {
@@ -807,7 +912,7 @@ private fun OnboardingChecklistScreen(
                                 withStyle(
                                     SpanStyle(
                                         color = CoralAlert,
-                                        fontWeight = FontWeight.ExtraBold
+                                        fontWeight = FontWeight.SemiBold
                                     )
                                 ) {
                                     append(
@@ -827,8 +932,8 @@ private fun OnboardingChecklistScreen(
                             .fillMaxWidth()
                             .testTag("step5_mediaprojection_btn"),
                         colors = ButtonDefaults.buttonColors(
-                            containerColor = if (status.step5MediaProjectionGranted) TelemetryEmerald else CoralAlert,
-                            contentColor = if (status.step5MediaProjectionGranted) Color(0xFF002411) else Color.White
+                            containerColor = if (status.step5MediaProjectionGranted) ObsidianSurfaceHigh else ElectricCyan,
+                            contentColor = if (status.step5MediaProjectionGranted) TextPrimary else Color(0xFF001D24)
                         ),
                         shape = RoundedCornerShape(12.dp)
                     ) {
@@ -840,11 +945,11 @@ private fun OnboardingChecklistScreen(
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
                             text = if (status.step5MediaProjectionGranted) {
-                                "Трансляция «Весь экран» активна ✅ (Перезапустить)"
+                                "Трансляция «Весь экран» активна (Перезапустить)"
                             } else {
                                 "Начать трансляцию (Выбрать «Весь экран»)"
                             },
-                            fontWeight = FontWeight.Bold
+                            fontWeight = FontWeight.SemiBold
                         )
                     }
                 }
@@ -857,17 +962,8 @@ private fun OnboardingChecklistScreen(
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(16.dp),
-                colors = CardDefaults.cardColors(
-                    containerColor = if (step6Active) ObsidianSurface else ObsidianSurface.copy(alpha = 0.55f)
-                ),
-                border = BorderStroke(
-                    1.5.dp,
-                    when {
-                        status.isUsbConnected && step6Active -> TelemetryEmerald
-                        step6Active -> ElectricCyan
-                        else -> ObsidianBorder
-                    }
-                )
+                colors = CardDefaults.cardColors(containerColor = ObsidianSurface),
+                border = BorderStroke(1.dp, ObsidianBorder)
             ) {
                 Column(
                     modifier = Modifier
@@ -884,39 +980,22 @@ private fun OnboardingChecklistScreen(
                             text = "Шаг 6. Подключение USB-кабеля к ГУ автомобиля",
                             style = MaterialTheme.typography.titleMedium,
                             color = if (step6Active) TextPrimary else TextMuted,
-                            fontWeight = FontWeight.Bold,
                             modifier = Modifier.weight(1f)
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Surface(
-                            color = when {
-                                status.isUsbConnected && step6Active -> TelemetryEmerald.copy(alpha = 0.2f)
-                                step6Active -> ElectricCyan.copy(alpha = 0.2f)
-                                else -> ObsidianSurfaceHigh
-                            },
-                            shape = RoundedCornerShape(8.dp),
-                            border = BorderStroke(
-                                1.dp,
-                                when {
-                                    status.isUsbConnected && step6Active -> TelemetryEmerald
-                                    step6Active -> ElectricCyan
-                                    else -> ObsidianBorder
-                                }
-                            )
+                            color = if (step6Active) SuccessBadgeBg else WarningBadgeBg,
+                            shape = RoundedCornerShape(8.dp)
                         ) {
                             Text(
                                 text = when {
                                     status.isUsbConnected && step6Active -> "Подключено ✅"
-                                    step6Active -> "Готово ✅"
-                                    else -> "Ожидает шаги 1–5 ⚠️"
+                                    step6Active -> "Выполнено ✅"
+                                    else -> "Настроить"
                                 },
                                 style = MaterialTheme.typography.labelSmall,
-                                color = when {
-                                    status.isUsbConnected && step6Active -> TelemetryEmerald
-                                    step6Active -> ElectricCyan
-                                    else -> AmberSignal
-                                },
-                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                                color = if (step6Active) SuccessBadgeFg else WarningBadgeFg,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
                             )
                         }
                     }
@@ -944,8 +1023,8 @@ private fun OnboardingChecklistScreen(
                                 .weight(1f)
                                 .testTag("step6_connect_usb_btn"),
                             colors = ButtonDefaults.buttonColors(
-                                containerColor = TelemetryEmerald,
-                                contentColor = Color(0xFF002411)
+                                containerColor = ElectricCyan,
+                                contentColor = Color(0xFF001D24)
                             ),
                             shape = RoundedCornerShape(12.dp)
                         ) {
@@ -957,7 +1036,7 @@ private fun OnboardingChecklistScreen(
                             Spacer(modifier = Modifier.width(6.dp))
                             Text(
                                 text = "Подключить USB AOA",
-                                fontWeight = FontWeight.Bold
+                                fontWeight = FontWeight.SemiBold
                             )
                         }
 
@@ -965,7 +1044,7 @@ private fun OnboardingChecklistScreen(
                             onClick = onOpenLauncherTab,
                             modifier = Modifier.testTag("step6_open_launcher_btn"),
                             shape = RoundedCornerShape(12.dp),
-                            border = BorderStroke(1.dp, ElectricCyan)
+                            border = BorderStroke(1.dp, ObsidianBorder)
                         ) {
                             Text("Лаунчер ГУ", color = ElectricCyan)
                         }
@@ -978,7 +1057,6 @@ private fun OnboardingChecklistScreen(
 
 @Composable
 private fun ChecklistStepCard(
-    stepNumber: Int,
     title: String,
     isCompleted: Boolean,
     description: String,
@@ -992,10 +1070,7 @@ private fun ChecklistStepCard(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(16.dp),
         colors = CardDefaults.cardColors(containerColor = ObsidianSurface),
-        border = BorderStroke(
-            1.dp,
-            if (isCompleted) TelemetryEmerald.copy(alpha = 0.8f) else AmberSignal.copy(alpha = 0.7f)
-        )
+        border = BorderStroke(1.dp, ObsidianBorder)
     ) {
         Column(
             modifier = Modifier
@@ -1012,7 +1087,6 @@ private fun ChecklistStepCard(
                     text = title,
                     style = MaterialTheme.typography.titleMedium,
                     color = TextPrimary,
-                    fontWeight = FontWeight.SemiBold,
                     modifier = Modifier.weight(1f)
                 )
                 Spacer(modifier = Modifier.width(8.dp))
@@ -1026,15 +1100,22 @@ private fun ChecklistStepCard(
             )
 
             if (isCompleted) {
-                OutlinedButton(
-                    onClick = onPrimaryClick,
+                Surface(
                     modifier = Modifier
                         .fillMaxWidth()
+                        .clip(RoundedCornerShape(10.dp))
+                        .clickable(onClick = onPrimaryClick)
                         .testTag(testTag),
+                    color = ObsidianSurfaceHigh,
                     shape = RoundedCornerShape(10.dp),
-                    border = BorderStroke(1.dp, TelemetryEmerald.copy(alpha = 0.5f))
+                    border = BorderStroke(1.dp, ObsidianBorder)
                 ) {
-                    Text(primaryButtonText, color = TelemetryEmerald)
+                    Text(
+                        text = primaryButtonText,
+                        style = MaterialTheme.typography.labelLarge,
+                        color = TextPrimary,
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)
+                    )
                 }
             } else {
                 Button(
@@ -1044,30 +1125,33 @@ private fun ChecklistStepCard(
                         .testTag(testTag),
                     colors = ButtonDefaults.buttonColors(
                         containerColor = ElectricCyan,
-                        contentColor = Color(0xFF002227)
+                        contentColor = Color(0xFF001D24)
                     ),
                     shape = RoundedCornerShape(10.dp)
                 ) {
                     Text(
                         text = primaryButtonText,
-                        fontWeight = FontWeight.Bold
+                        fontWeight = FontWeight.SemiBold
                     )
                 }
             }
 
             if (secondaryButtonText != null && onSecondaryClick != null) {
-                OutlinedButton(
-                    onClick = onSecondaryClick,
+                Surface(
                     modifier = Modifier
                         .fillMaxWidth()
+                        .clip(RoundedCornerShape(10.dp))
+                        .clickable(onClick = onSecondaryClick)
                         .testTag("${testTag}_secondary"),
+                    color = ObsidianSurfaceHigh,
                     shape = RoundedCornerShape(10.dp),
-                    border = BorderStroke(1.dp, AmberSignal.copy(alpha = 0.6f))
+                    border = BorderStroke(1.dp, ObsidianBorder)
                 ) {
                     Text(
                         text = secondaryButtonText,
                         style = MaterialTheme.typography.labelMedium,
-                        color = AmberSignal
+                        color = TextSecondary,
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)
                     )
                 }
             }
@@ -1078,704 +1162,53 @@ private fun ChecklistStepCard(
 @Composable
 private fun StatusBadgePill(isCompleted: Boolean) {
     Surface(
-        color = if (isCompleted) TelemetryEmerald.copy(alpha = 0.18f) else AmberSignal.copy(alpha = 0.18f),
-        shape = RoundedCornerShape(8.dp),
-        border = BorderStroke(1.dp, if (isCompleted) TelemetryEmerald else AmberSignal)
+        color = if (isCompleted) SuccessBadgeBg else WarningBadgeBg,
+        shape = RoundedCornerShape(8.dp)
     ) {
         Text(
-            text = if (isCompleted) "Выполнено ✅" else "Настроить ⚠️",
-            style = MaterialTheme.typography.labelSmall,
-            color = if (isCompleted) TelemetryEmerald else AmberSignal,
-            fontWeight = FontWeight.Bold,
-            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+            text = if (isCompleted) "Выполнено ✅" else "Настроить",
+            style = MaterialTheme.typography.labelSmall.copy(
+                fontFamily = FontFamily.SansSerif,
+                fontWeight = FontWeight.SemiBold
+            ),
+            color = if (isCompleted) SuccessBadgeFg else WarningBadgeFg,
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
         )
     }
 }
 
+/**
+ * Tab 3 («Настройки»):
+ * 1. Управление виртуальным экраном и статусами (`Start VD`, `Touch ON`, `Overlay OK`, лог запущенного пакета).
+ * 2. Настройки H.264 видеопотока (разрешение 1280x720 / 1920x1080, битрейт, 60 FPS).
+ * 3. Сворачиваемый раздел (Expandable Card) «Инженерная диагностика (AOA & Protocol Lab)».
+ */
 @Composable
-private fun MirroringQuickControlStrip(
-    isProjectionRunning: Boolean,
-    virtualDisplayId: Int,
-    a11yEnabled: Boolean,
-    overlayGranted: Boolean,
+private fun UnifiedSettingsAndDiagnosticsScreen(
+    state: BridgeRuntimeState,
+    checklistStatus: SetupChecklistStatus,
+    lastLaunchStatus: String,
+    configuredWidth: Int,
+    configuredHeight: Int,
+    configuredBitrateMbps: Int,
+    onSelectResolution: (Int, Int) -> Unit,
+    onSelectBitrate: (Int) -> Unit,
     onToggleProjection: () -> Unit,
     onOpenAccessibilitySettings: () -> Unit,
-    onOpenOverlaySettings: () -> Unit
-) {
-    Surface(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 10.dp, vertical = 6.dp),
-        color = ObsidianSurface,
-        shape = RoundedCornerShape(14.dp),
-        border = BorderStroke(1.dp, ObsidianBorder)
-    ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 12.dp, vertical = 8.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                modifier = Modifier.weight(1f)
-            ) {
-                Box(
-                    modifier = Modifier
-                        .size(8.dp)
-                        .clip(CircleShape)
-                        .background(if (isProjectionRunning) TelemetryEmerald else ElectricCyan)
-                )
-                Text(
-                    text = if (isProjectionRunning) {
-                        "VirtualDisplay #$virtualDisplayId Active (60fps H.264)"
-                    } else {
-                        "CarLife App Mirroring Ready"
-                    },
-                    style = MaterialTheme.typography.labelSmall,
-                    color = TextPrimary,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-            }
-
-            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                StatusActionChip(
-                    label = if (isProjectionRunning) "VD ON" else "Start VD",
-                    active = isProjectionRunning,
-                    icon = CockpitIcons.Videocam,
-                    testTag = "quick_toggle_vd_btn",
-                    onClick = onToggleProjection
-                )
-                StatusActionChip(
-                    label = if (a11yEnabled) "Touch ON" else "Touch A11y",
-                    active = a11yEnabled,
-                    icon = CockpitIcons.TouchApp,
-                    testTag = "quick_a11y_settings_btn",
-                    onClick = onOpenAccessibilitySettings
-                )
-                StatusActionChip(
-                    label = if (overlayGranted) "Overlay OK" else "Overlay",
-                    active = overlayGranted,
-                    icon = CockpitIcons.AppsGrid,
-                    testTag = "quick_overlay_settings_btn",
-                    onClick = onOpenOverlaySettings
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun StatusActionChip(
-    label: String,
-    active: Boolean,
-    icon: ImageVector,
-    testTag: String,
-    onClick: () -> Unit
-) {
-    Surface(
-        modifier = Modifier
-            .clip(RoundedCornerShape(8.dp))
-            .clickable(onClick = onClick)
-            .testTag(testTag),
-        color = if (active) TelemetryEmerald.copy(alpha = 0.18f) else ObsidianSurfaceHigh,
-        shape = RoundedCornerShape(8.dp),
-        border = BorderStroke(1.dp, if (active) TelemetryEmerald else AmberSignal.copy(alpha = 0.7f))
-    ) {
-        Row(
-            modifier = Modifier.padding(horizontal = 8.dp, vertical = 5.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(4.dp)
-        ) {
-            Icon(
-                imageVector = icon,
-                contentDescription = label,
-                tint = if (active) TelemetryEmerald else AmberSignal,
-                modifier = Modifier.size(13.dp)
-            )
-            Text(
-                text = label,
-                style = MaterialTheme.typography.labelSmall,
-                color = if (active) TelemetryEmerald else AmberSignal
-            )
-        }
-    }
-}
-
-@Composable
-private fun UsbTransportConsoleScreen(
-    state: BridgeRuntimeState,
+    onOpenOverlaySettings: () -> Unit,
     onStartOrScanBridge: () -> Unit,
     onStopBridge: () -> Unit,
     onStartProjection: (Int, Int, Int) -> Unit,
     onStopProjection: () -> Unit,
     onInjectTouch: (Int, Int) -> Unit
 ) {
-    LazyColumn(
-        modifier = Modifier
-            .fillMaxSize()
-            .widthIn(max = 680.dp),
-        contentPadding = PaddingValues(16.dp),
-        verticalArrangement = Arrangement.spacedBy(16.dp)
-    ) {
-        item {
-            HeroBannerCard(state = state)
-        }
-
-        item {
-            ProjectionEngineCard(
-                state = state,
-                onStartProjection = onStartProjection,
-                onStopProjection = onStopProjection,
-                onInjectTouch = onInjectTouch
-            )
-        }
-
-        item {
-            TransportControlsCard(
-                state = state,
-                onStartOrScanBridge = onStartOrScanBridge,
-                onStopBridge = onStopBridge
-            )
-        }
-
-        item {
-            ChannelMultiplexerGrid(channelCounts = state.channelFrameCounts)
-        }
-
-        item {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    text = "LIVE WIRE FRAME LOG (${state.packetLogs.size})",
-                    style = MaterialTheme.typography.labelLarge,
-                    color = ElectricCyan
-                )
-                IconButton(
-                    onClick = { BridgeTelemetryBus.clearLogs() },
-                    modifier = Modifier.testTag("clear_logs_button")
-                ) {
-                    Icon(
-                        imageVector = CockpitIcons.ClearAll,
-                        contentDescription = "Clear packet logs",
-                        tint = TextSecondary
-                    )
-                }
-            }
-        }
-
-        if (state.packetLogs.isEmpty()) {
-            item {
-                EmptyPacketLogCard()
-            }
-        } else {
-            items(state.packetLogs, key = { it.id }) { entry ->
-                PacketLogItemCard(entry = entry)
-            }
-        }
-    }
-}
-
-@Composable
-private fun ProjectionEngineCard(
-    state: BridgeRuntimeState,
-    onStartProjection: (Int, Int, Int) -> Unit,
-    onStopProjection: () -> Unit,
-    onInjectTouch: (Int, Int) -> Unit
-) {
-    val proj = state.projectionStats
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(16.dp),
-        colors = CardDefaults.cardColors(containerColor = ObsidianSurface),
-        border = BorderStroke(1.dp, if (proj.isRunning) TelemetryEmerald else ObsidianBorder)
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    text = "CORE 2: VIRTUAL DISPLAY + H.264 + TOUCH (:core:projection)",
-                    style = MaterialTheme.typography.labelLarge,
-                    color = TelemetryEmerald
-                )
-                Text(
-                    text = if (proj.spsPpsConfigured) "SPS/PPS LOCKED" else "AVC Baseline",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = ElectricCyan
-                )
-            }
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                MetricPill(
-                    label = "H.264 NALS",
-                    value = "${proj.encodedNalFrames}",
-                    subValue = "${proj.encodedBytes / 1024} KiB",
-                    modifier = Modifier.weight(1f)
-                )
-                MetricPill(
-                    label = "TOUCH INJECT",
-                    value = "${proj.injectedTouches}",
-                    subValue = "VD #${proj.virtualDisplayId}",
-                    modifier = Modifier.weight(1f)
-                )
-                MetricPill(
-                    label = "SURFACE",
-                    value = "${proj.width}×${proj.height}",
-                    subValue = "${proj.fps} FPS",
-                    modifier = Modifier.weight(1f)
-                )
-            }
-
-            Text(
-                text = "Last Touch Target: ${proj.activeCockpitWidget}",
-                style = MaterialTheme.typography.titleMedium,
-                color = TextPrimary
-            )
-            Text(
-                text = proj.statusMessage,
-                style = MaterialTheme.typography.bodyMedium,
-                color = TextSecondary
-            )
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                if (!proj.isRunning) {
-                    Button(
-                        onClick = { onStartProjection(1280, 720, 60) },
-                        modifier = Modifier
-                            .weight(1f)
-                            .testTag("start_projection_btn"),
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = TelemetryEmerald,
-                            contentColor = Color(0xFF002411)
-                        ),
-                        shape = RoundedCornerShape(12.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.PlayArrow,
-                            contentDescription = "Start VirtualDisplay",
-                            modifier = Modifier.size(18.dp)
-                        )
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("Start VirtualDisplay + H.264", fontWeight = FontWeight.Bold)
-                    }
-                } else {
-                    FilledTonalButton(
-                        onClick = { onInjectTouch(120, 180) },
-                        modifier = Modifier
-                            .weight(1f)
-                            .testTag("inject_touch_dock_btn"),
-                        shape = RoundedCornerShape(10.dp)
-                    ) {
-                        Text("Touch Dock Zone")
-                    }
-                    FilledTonalButton(
-                        onClick = { onInjectTouch(680, 360) },
-                        modifier = Modifier
-                            .weight(1f)
-                            .testTag("inject_touch_launcher_btn"),
-                        shape = RoundedCornerShape(10.dp)
-                    ) {
-                        Text("Touch App Grid")
-                    }
-                    OutlinedButton(
-                        onClick = onStopProjection,
-                        modifier = Modifier.testTag("stop_projection_btn"),
-                        shape = RoundedCornerShape(10.dp),
-                        border = BorderStroke(1.dp, CoralAlert.copy(alpha = 0.6f))
-                    ) {
-                        Text("Stop", color = CoralAlert)
-                    }
-                }
-            }
-
-            // One-tap Video Framing Header Toggle for Head Unit compatibility
-            val context = LocalContext.current
-            OutlinedButton(
-                onClick = {
-                    val newMode = !CarLifeFrameCodec.useNestedVideoMsgHeader
-                    CarLifeFrameCodec.useNestedVideoMsgHeader = newMode
-                    BridgeTelemetryBus.updateState {
-                        it.copy(
-                            useNestedVideoMsgHeader = newMode,
-                            lastProtocolEvent = if (newMode) {
-                                "Video Framing: Nested MSG_VIDEO_DATA (0x00020001) + 12B Header enabled"
-                            } else {
-                                "Video Framing: Standard 12B Media Header (Raw Annex-B NAL) enabled"
-                            }
-                        )
-                    }
-                    if (state.isServiceRunning) {
-                        val intent = Intent(context, BridgeForegroundService::class.java).apply {
-                            action = BridgeForegroundService.ACTION_TOGGLE_VIDEO_HEADER_MODE
-                        }
-                        context.startService(intent)
-                    }
-                },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .testTag("toggle_video_header_mode_btn"),
-                shape = RoundedCornerShape(10.dp),
-                border = BorderStroke(
-                    width = 1.dp,
-                    color = if (state.useNestedVideoMsgHeader) AmberSignal else ElectricCyan.copy(alpha = 0.5f)
-                )
-            ) {
-                Text(
-                    text = if (state.useNestedVideoMsgHeader) {
-                        "Video Packet Mode: Nested MSG_VIDEO_DATA (0x00020001) [Tap to Switch]"
-                    } else {
-                        "Video Packet Mode: Standard 12B Header + Raw H.264 NAL [Tap to Switch]"
-                    },
-                    style = MaterialTheme.typography.labelMedium,
-                    color = if (state.useNestedVideoMsgHeader) AmberSignal else ElectricCyan
-                )
-            }
-        }
-    }
-}
-
-@Composable
-private fun HeroBannerCard(state: BridgeRuntimeState) {
-    val (statusLabel, statusColor) = when (val ts = state.transportState) {
-        is UsbTransportState.Connected -> "DIRECT-IO AOA LINK ACTIVE • FD #${ts.fdNumber}" to TelemetryEmerald
-        is UsbTransportState.Connecting -> "OPENING FILECHANNEL DIRECT-IO..." to AmberSignal
-        is UsbTransportState.WaitingForPermission -> "AWAITING USB AOA PERMISSION" to AmberSignal
-        is UsbTransportState.Error -> "STANDBY • NO AOA ACCESSORY" to AmberSignal
-        UsbTransportState.Disconnected ->
-            if (state.projectionStats.isRunning) "VIRTUALDISPLAY H.264 PROJECTION ACTIVE" to TelemetryEmerald
-            else if (state.isServiceRunning) "FGS + WAKELOCK ACTIVE • LISTENING" to ElectricCyan
-            else "IDLE • READY FOR BAIDU CARLIFE HEAD UNIT" to TextSecondary
-    }
-
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(20.dp),
-        colors = CardDefaults.cardColors(containerColor = ObsidianSurface),
-        border = BorderStroke(1.dp, ObsidianBorder)
-    ) {
-        Box(modifier = Modifier.fillMaxWidth()) {
-            Image(
-                painter = painterResource(id = R.drawable.img_carlife_hero_1794551034086),
-                contentDescription = "CarLife USB AOA App Mirroring HUD",
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(176.dp),
-                contentScale = ContentScale.Crop
-            )
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(176.dp)
-                    .background(
-                        Brush.verticalGradient(
-                            colors = listOf(
-                                ObsidianBackground.copy(alpha = 0.35f),
-                                ObsidianSurface.copy(alpha = 0.96f)
-                            )
-                        )
-                    )
-            )
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(18.dp)
-            ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .size(10.dp)
-                            .clip(CircleShape)
-                            .background(statusColor)
-                    )
-                    Text(
-                        text = statusLabel,
-                        style = MaterialTheme.typography.labelLarge,
-                        color = statusColor
-                    )
-                }
-
-                Spacer(modifier = Modifier.height(36.dp))
-
-                Text(
-                    text = "CarLife App Mirroring & Launcher",
-                    style = MaterialTheme.typography.headlineLarge,
-                    color = TextPrimary
-                )
-                Spacer(modifier = Modifier.height(4.dp))
-                Text(
-                    text = "60fps H.264 VirtualDisplay • Full Android Apps + Multi-Touch Injection",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = TextSecondary
-                )
-                Spacer(modifier = Modifier.height(12.dp))
-                Surface(
-                    color = ObsidianBackground.copy(alpha = 0.78f),
-                    shape = RoundedCornerShape(10.dp),
-                    border = BorderStroke(1.dp, ObsidianBorder)
-                ) {
-                    Text(
-                        text = state.lastProtocolEvent,
-                        style = MaterialTheme.typography.labelSmall,
-                        color = ElectricCyan,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 12.dp, vertical = 8.dp),
-                        maxLines = 2,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun TransportControlsCard(
-    state: BridgeRuntimeState,
-    onStartOrScanBridge: () -> Unit,
-    onStopBridge: () -> Unit
-) {
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(16.dp),
-        colors = CardDefaults.cardColors(containerColor = ObsidianSurface),
-        border = BorderStroke(1.dp, ObsidianBorder)
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    text = "CORE 1: CARLIFE USB AOA ENGINE (:core:carlife)",
-                    style = MaterialTheme.typography.labelLarge,
-                    color = TextSecondary
-                )
-                Text(
-                    text = if (state.wakeLockHeld) "WakeLock: HELD" else "DirectBufferPool",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = TelemetryEmerald
-                )
-            }
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                MetricPill(
-                    label = "RX FRAMES",
-                    value = "${state.rxFrames}",
-                    subValue = "${state.rxBytes} B",
-                    modifier = Modifier.weight(1f)
-                )
-                MetricPill(
-                    label = "TX FRAMES",
-                    value = "${state.txFrames}",
-                    subValue = "${state.txBytes} B",
-                    modifier = Modifier.weight(1f)
-                )
-                MetricPill(
-                    label = "HANDSHAKE",
-                    value = state.controlSession.phase.name.take(8),
-                    subValue = "${state.controlSession.negotiatedFps} FPS",
-                    modifier = Modifier.weight(1f)
-                )
-            }
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                Button(
-                    onClick = onStartOrScanBridge,
-                    modifier = Modifier
-                        .weight(1f)
-                        .testTag("scan_connect_usb_button"),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = ElectricCyan,
-                        contentColor = Color(0xFF002227)
-                    ),
-                    shape = RoundedCornerShape(12.dp)
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.Refresh,
-                        contentDescription = "Scan USB AOA",
-                        modifier = Modifier.size(18.dp)
-                    )
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text(
-                        text = "Scan & Attach USB AOA",
-                        fontWeight = FontWeight.Bold
-                    )
-                }
-
-                if (state.isServiceRunning) {
-                    OutlinedButton(
-                        onClick = onStopBridge,
-                        modifier = Modifier.testTag("stop_bridge_button"),
-                        shape = RoundedCornerShape(12.dp),
-                        border = BorderStroke(1.dp, CoralAlert.copy(alpha = 0.6f))
-                    ) {
-                        Icon(
-                            imageVector = CockpitIcons.Stop,
-                            contentDescription = "Stop Service",
-                            tint = CoralAlert,
-                            modifier = Modifier.size(18.dp)
-                        )
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text("Stop", color = CoralAlert)
-                    }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun MetricPill(
-    label: String,
-    value: String,
-    subValue: String,
-    modifier: Modifier = Modifier
-) {
-    Column(
-        modifier = modifier
-            .clip(RoundedCornerShape(12.dp))
-            .background(ObsidianSurfaceHigh)
-            .border(1.dp, ObsidianBorder, RoundedCornerShape(12.dp))
-            .padding(10.dp)
-    ) {
-        Text(
-            text = label,
-            style = MaterialTheme.typography.labelSmall,
-            color = TextMuted
-        )
-        Spacer(modifier = Modifier.height(2.dp))
-        Text(
-            text = value,
-            style = MaterialTheme.typography.titleLarge,
-            color = TextPrimary
-        )
-        Text(
-            text = subValue,
-            style = MaterialTheme.typography.labelSmall,
-            color = ElectricCyan
-        )
-    }
-}
-
-@Composable
-private fun ChannelMultiplexerGrid(
-    channelCounts: Map<CarLifeChannel, Long>
-) {
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(16.dp),
-        colors = CardDefaults.cardColors(containerColor = ObsidianSurface),
-        border = BorderStroke(1.dp, ObsidianBorder)
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
-        ) {
-            Text(
-                text = "CARLIFE MULTIPLEXER CHANNELS (0x0001 .. 0x0006)",
-                style = MaterialTheme.typography.labelLarge,
-                color = TextSecondary
-            )
-
-            val pairs = CarLifeChannel.entries.chunked(2)
-            for (rowChannels in pairs) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    for (channel in rowChannels) {
-                        val count = channelCounts[channel] ?: 0L
-                        val badgeColor = if (channel.hasTimestampHeader) TelemetryEmerald else ElectricCyan
-                        Column(
-                            modifier = Modifier
-                                .weight(1f)
-                                .clip(RoundedCornerShape(12.dp))
-                                .background(ObsidianSurfaceHigh)
-                                .border(1.dp, ObsidianBorder, RoundedCornerShape(12.dp))
-                                .padding(10.dp)
-                        ) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text(
-                                    text = "0x%04X".format(channel.id),
-                                    style = MaterialTheme.typography.labelLarge,
-                                    color = badgeColor
-                                )
-                                Text(
-                                    text = "${channel.headerSizeBytes}B HDR",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = TextMuted
-                                )
-                            }
-                            Spacer(modifier = Modifier.height(4.dp))
-                            Text(
-                                text = channel.label,
-                                style = MaterialTheme.typography.titleMedium,
-                                color = TextPrimary
-                            )
-                            Text(
-                                text = "$count packets",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = if (count > 0) badgeColor else TextSecondary
-                            )
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun CodecLaboratoryScreen(
-    state: BridgeRuntimeState
-) {
+    val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val localStateMachine = remember { CarLifeControlStateMachine() }
+    var diagnosticsExpanded by rememberSaveable { mutableStateOf(false) }
     var lastDecodedBreakdown by remember {
         mutableStateOf(
-            "Select a test vector below to run a real binary stream round-trip through CarLifeFrameCodec, CarLifeControlStateMachine, or CarLifeTouchDecoder."
+            "Выберите тестовый вектор ниже для проверки бинарного кадра через CarLifeFrameCodec и декодер тачскрина."
         )
     }
 
@@ -1865,6 +1298,7 @@ private fun CodecLaboratoryScreen(
         contentPadding = PaddingValues(16.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
+        // 1. Блок управления виртуальным экраном и статусами (Start VD, Touch ON, Overlay OK + лог запуска)
         item {
             Card(
                 modifier = Modifier.fillMaxWidth(),
@@ -1878,14 +1312,124 @@ private fun CodecLaboratoryScreen(
                         .padding(16.dp),
                     verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "Виртуальный экран ГУ (VirtualDisplay)",
+                            style = MaterialTheme.typography.titleMedium,
+                            color = TextPrimary
+                        )
+                        Surface(
+                            color = if (state.projectionStats.isRunning) SuccessBadgeBg else ObsidianSurfaceHigh,
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Text(
+                                text = if (state.projectionStats.isRunning) {
+                                    "VD #${state.projectionStats.virtualDisplayId} АКТИВЕН"
+                                } else {
+                                    "ОЖИДАНИЕ"
+                                },
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (state.projectionStats.isRunning) SuccessBadgeFg else TextSecondary,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                            )
+                        }
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        StatusActionChip(
+                            label = if (state.projectionStats.isRunning) "VD ON" else "Start VD",
+                            active = state.projectionStats.isRunning,
+                            icon = CockpitIcons.Videocam,
+                            testTag = "quick_toggle_vd_btn",
+                            onClick = onToggleProjection,
+                            modifier = Modifier.weight(1f)
+                        )
+                        StatusActionChip(
+                            label = if (checklistStatus.step3AccessibilityEnabled) "Touch ON" else "Touch A11y",
+                            active = checklistStatus.step3AccessibilityEnabled,
+                            icon = CockpitIcons.TouchApp,
+                            testTag = "quick_a11y_settings_btn",
+                            onClick = onOpenAccessibilitySettings,
+                            modifier = Modifier.weight(1f)
+                        )
+                        StatusActionChip(
+                            label = if (checklistStatus.step2OverlayGranted) "Overlay OK" else "Overlay",
+                            active = checklistStatus.step2OverlayGranted,
+                            icon = CockpitIcons.AppsGrid,
+                            testTag = "quick_overlay_settings_btn",
+                            onClick = onOpenOverlaySettings,
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+
+                    Surface(
+                        color = ObsidianBackground,
+                        shape = RoundedCornerShape(10.dp),
+                        border = BorderStroke(1.dp, ObsidianBorder)
+                    ) {
+                        Text(
+                            text = lastLaunchStatus,
+                            style = MaterialTheme.typography.labelMedium,
+                            color = TextSecondary,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 12.dp, vertical = 8.dp)
+                        )
+                    }
+                }
+            }
+        }
+
+        // 2. Настройки H.264 видеопотока (разрешение 1280x720 / 1920x1080, битрейт, 60 FPS)
+        item {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(containerColor = ObsidianSurface),
+                border = BorderStroke(1.dp, ObsidianBorder)
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "Параметры видеопотока H.264",
+                            style = MaterialTheme.typography.titleMedium,
+                            color = TextPrimary
+                        )
+                        Surface(
+                            color = ObsidianSurfaceHigh,
+                            shape = RoundedCornerShape(8.dp),
+                            border = BorderStroke(1.dp, ObsidianBorder)
+                        ) {
+                            Text(
+                                text = "60 FPS • Low-Latency",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = ElectricCyan,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                            )
+                        }
+                    }
+
                     Text(
-                        text = "BAIDU CARLIFE USB AOA PROTOCOL LAB",
-                        style = MaterialTheme.typography.labelLarge,
-                        color = ElectricCyan
-                    )
-                    Text(
-                        text = "Test byte-level Protobuf & binary headers across Control (0x0001), Video (0x0002), Audio (0x0003), and Touch/Hardkey (0x0006) channels.",
-                        style = MaterialTheme.typography.bodyMedium,
+                        text = "Разрешение экрана ГУ",
+                        style = MaterialTheme.typography.labelMedium,
                         color = TextSecondary
                     )
 
@@ -1893,108 +1437,750 @@ private fun CodecLaboratoryScreen(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        CodecTestButton(
-                            title = "1. Handshake",
-                            subtitle = "HU v2.0 + Video Init",
-                            icon = CockpitIcons.Memory,
-                            accent = ElectricCyan,
-                            testTag = "test_control_frame_btn",
-                            modifier = Modifier.weight(1f),
-                            onClick = {
-                                val versionFrame = CarLifeFrameCodec.createCommandFrame(
-                                    channel = CarLifeChannel.CONTROL,
-                                    serviceType = CarLifeMsgType.MSG_CMD_HU_PROTOCOL_VERSION,
-                                    commandBody = CarlifeProtocolVersionProto(2, 0).encode()
-                                )
-                                val videoInitFrame = CarLifeFrameCodec.createCommandFrame(
-                                    channel = CarLifeChannel.CONTROL,
-                                    serviceType = CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT,
-                                    commandBody = CarlifeVideoEncoderInfoProto(1920, 1080, 60).encode()
-                                )
-                                runLoopbackCodecTest(versionFrame, "Control 0x0001: MSG_CMD_HU_PROTOCOL_VERSION (v2.0)")
-                                runLoopbackCodecTest(videoInitFrame, "Control 0x0001: MSG_CMD_VIDEO_ENCODER_INIT (1920x1080@60)")
-                            }
+                        SelectableOptionButton(
+                            label = "1280 × 720 (HD)",
+                            selected = configuredWidth == 1280,
+                            testTag = "res_720p_btn",
+                            onClick = { onSelectResolution(1280, 720) },
+                            modifier = Modifier.weight(1f)
                         )
-
-                        CodecTestButton(
-                            title = "2. Video (12B+TS)",
-                            subtitle = "0x0002 H.264 SPS/IDR",
-                            icon = CockpitIcons.Videocam,
-                            accent = TelemetryEmerald,
-                            testTag = "test_video_frame_btn",
-                            modifier = Modifier.weight(1f),
-                            onClick = {
-                                val h264SpsPps = byteArrayOf(
-                                    0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x2A,
-                                    0x00, 0x00, 0x00, 0x01, 0x68, 0xCE.toByte(), 0x3C, 0x80.toByte()
-                                )
-                                val frame = CarLifeFrameCodec.createVideoFrame(
-                                    nalData = h264SpsPps,
-                                    timestampMs = System.currentTimeMillis() and 0xFFFF_FFFFL
-                                )
-                                runLoopbackCodecTest(frame, "Video 0x0002: H.264 SPS/PPS NAL @ 60fps")
-                            }
+                        SelectableOptionButton(
+                            label = "1920 × 1080 (FHD)",
+                            selected = configuredWidth == 1920,
+                            testTag = "res_1080p_btn",
+                            onClick = { onSelectResolution(1920, 1080) },
+                            modifier = Modifier.weight(1f)
                         )
                     }
+
+                    Text(
+                        text = "Битрейт аппаратного кодека (CBR)",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = TextSecondary
+                    )
 
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        CodecTestButton(
-                            title = "3. Touch Scale",
-                            subtitle = "1280x720 -> 1920x1080",
-                            icon = CockpitIcons.TouchApp,
-                            accent = AmberSignal,
-                            testTag = "test_touch_frame_btn",
-                            modifier = Modifier.weight(1f),
-                            onClick = {
-                                val frame = CarLifeTouchDecoder.createTouchActionFrame(
-                                    action = 0,
-                                    x = 640,
-                                    y = 360,
-                                    huWidth = 1280,
-                                    huHeight = 720
-                                )
-                                runLoopbackCodecTest(frame, "Touch 0x0006: MSG_TOUCH_ACTION (640,360 on 1280x720)")
-                            }
+                        SelectableOptionButton(
+                            label = "6 Мбит/с",
+                            selected = configuredBitrateMbps == 6,
+                            testTag = "bitrate_6m_btn",
+                            onClick = { onSelectBitrate(6) },
+                            modifier = Modifier.weight(1f)
                         )
-
-                        CodecTestButton(
-                            title = "4. HardKey",
-                            subtitle = "Steering Wheel NEXT",
-                            icon = CockpitIcons.GraphicEq,
-                            accent = CyberBlue,
-                            testTag = "test_audio_frame_btn",
-                            modifier = Modifier.weight(1f),
-                            onClick = {
-                                val frame = CarLifeTouchDecoder.createHardKeyFrame(CarLifeHardKey.SEEK_ADD)
-                                runLoopbackCodecTest(frame, "Touch 0x0006: MSG_TOUCH_CAR_HARD_KEY_CODE (SEEK_ADD)")
-                            }
+                        SelectableOptionButton(
+                            label = "8 Мбит/с",
+                            selected = configuredBitrateMbps == 8,
+                            testTag = "bitrate_8m_btn",
+                            onClick = { onSelectBitrate(8) },
+                            modifier = Modifier.weight(1f)
+                        )
+                        SelectableOptionButton(
+                            label = "12 Мбит/с",
+                            selected = configuredBitrateMbps == 12,
+                            testTag = "bitrate_12m_btn",
+                            onClick = { onSelectBitrate(12) },
+                            modifier = Modifier.weight(1f)
                         )
                     }
 
                     Surface(
-                        color = ObsidianBackground,
-                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(10.dp))
+                            .clickable {
+                                val newMode = !CarLifeFrameCodec.useNestedVideoMsgHeader
+                                CarLifeFrameCodec.useNestedVideoMsgHeader = newMode
+                                BridgeTelemetryBus.updateState {
+                                    it.copy(
+                                        useNestedVideoMsgHeader = newMode,
+                                        lastProtocolEvent = if (newMode) {
+                                            "Video Framing: Nested MSG_VIDEO_DATA (0x00020001) + 12B Header"
+                                        } else {
+                                            "Video Framing: Standard 12B Media Header (Raw Annex-B NAL)"
+                                        }
+                                    )
+                                }
+                                if (state.isServiceRunning) {
+                                    val intent = Intent(context, BridgeForegroundService::class.java).apply {
+                                        action = BridgeForegroundService.ACTION_TOGGLE_VIDEO_HEADER_MODE
+                                    }
+                                    context.startService(intent)
+                                }
+                            }
+                            .testTag("toggle_video_header_mode_btn"),
+                        color = ObsidianSurfaceHigh,
+                        shape = RoundedCornerShape(10.dp),
                         border = BorderStroke(1.dp, ObsidianBorder)
                     ) {
-                        Text(
-                            text = lastDecodedBreakdown,
-                            style = MaterialTheme.typography.labelSmall,
-                            fontFamily = JetBrainsMonoFamily,
-                            color = TextPrimary,
+                        Row(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .padding(12.dp)
-                        )
+                                .padding(horizontal = 12.dp, vertical = 10.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "Формат пакета канала 0x0002",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = TextSecondary
+                            )
+                            Text(
+                                text = if (state.useNestedVideoMsgHeader) {
+                                    "Nested MSG_VIDEO_DATA"
+                                } else {
+                                    "Standard 12B Annex-B"
+                                },
+                                style = MaterialTheme.typography.labelMedium,
+                                color = ElectricCyan
+                            )
+                        }
                     }
                 }
             }
         }
 
-        items(state.packetLogs, key = { it.id }) { entry ->
-            PacketLogItemCard(entry = entry)
+        // 3. Сворачиваемый раздел (Expandable Card) «Инженерная диагностика (AOA & Protocol Lab)»
+        item {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(containerColor = ObsidianSurface),
+                border = BorderStroke(1.dp, ObsidianBorder)
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(10.dp))
+                            .clickable { diagnosticsExpanded = !diagnosticsExpanded }
+                            .padding(vertical = 4.dp)
+                            .testTag("toggle_engineering_diagnostics_btn"),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Инженерная диагностика (AOA & Protocol Lab)",
+                                style = MaterialTheme.typography.titleMedium,
+                                color = TextPrimary
+                            )
+                            Text(
+                                text = "Статистика USB AOA, счетчики каналов 0x0001..0x0006 и генератор тестовых пакетов",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = TextSecondary
+                            )
+                        }
+                        Icon(
+                            imageVector = if (diagnosticsExpanded) {
+                                Icons.Default.KeyboardArrowUp
+                            } else {
+                                Icons.Default.KeyboardArrowDown
+                            },
+                            contentDescription = "Развернуть инженерную диагностику",
+                            tint = ElectricCyan
+                        )
+                    }
+
+                    AnimatedVisibility(visible = diagnosticsExpanded) {
+                        Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                            ProjectionEngineCard(
+                                state = state,
+                                onStartProjection = onStartProjection,
+                                onStopProjection = onStopProjection,
+                                onInjectTouch = onInjectTouch
+                            )
+
+                            TransportControlsCard(
+                                state = state,
+                                onStartOrScanBridge = onStartOrScanBridge,
+                                onStopBridge = onStopBridge
+                            )
+
+                            ChannelMultiplexerGrid(channelCounts = state.channelFrameCounts)
+
+                            // Protocol Lab test vectors
+                            Surface(
+                                color = ObsidianSurfaceHigh,
+                                shape = RoundedCornerShape(14.dp),
+                                border = BorderStroke(1.dp, ObsidianBorder)
+                            ) {
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(12.dp),
+                                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                                ) {
+                                    Text(
+                                        text = "Тестовые векторы протокола Baidu CarLife",
+                                        style = MaterialTheme.typography.titleSmall,
+                                        color = ElectricCyan
+                                    )
+
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                    ) {
+                                        CodecTestButton(
+                                            title = "1. Handshake",
+                                            subtitle = "HU v2.0 + Video Init",
+                                            icon = CockpitIcons.Memory,
+                                            accent = ElectricCyan,
+                                            testTag = "test_control_frame_btn",
+                                            modifier = Modifier.weight(1f),
+                                            onClick = {
+                                                val versionFrame = CarLifeFrameCodec.createCommandFrame(
+                                                    channel = CarLifeChannel.CONTROL,
+                                                    serviceType = CarLifeMsgType.MSG_CMD_HU_PROTOCOL_VERSION,
+                                                    commandBody = CarlifeProtocolVersionProto(2, 0).encode()
+                                                )
+                                                val videoInitFrame = CarLifeFrameCodec.createCommandFrame(
+                                                    channel = CarLifeChannel.CONTROL,
+                                                    serviceType = CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT,
+                                                    commandBody = CarlifeVideoEncoderInfoProto(1920, 1080, 60).encode()
+                                                )
+                                                runLoopbackCodecTest(versionFrame, "Control 0x0001: MSG_CMD_HU_PROTOCOL_VERSION (v2.0)")
+                                                runLoopbackCodecTest(videoInitFrame, "Control 0x0001: MSG_CMD_VIDEO_ENCODER_INIT (1920x1080@60)")
+                                            }
+                                        )
+
+                                        CodecTestButton(
+                                            title = "2. Video (12B+TS)",
+                                            subtitle = "0x0002 H.264 SPS/IDR",
+                                            icon = CockpitIcons.Videocam,
+                                            accent = TelemetryEmerald,
+                                            testTag = "test_video_frame_btn",
+                                            modifier = Modifier.weight(1f),
+                                            onClick = {
+                                                val h264SpsPps = byteArrayOf(
+                                                    0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x2A,
+                                                    0x00, 0x00, 0x00, 0x01, 0x68, 0xCE.toByte(), 0x3C, 0x80.toByte()
+                                                )
+                                                val frame = CarLifeFrameCodec.createVideoFrame(
+                                                    nalData = h264SpsPps,
+                                                    timestampMs = System.currentTimeMillis() and 0xFFFF_FFFFL
+                                                )
+                                                runLoopbackCodecTest(frame, "Video 0x0002: H.264 SPS/PPS NAL @ 60fps")
+                                            }
+                                        )
+                                    }
+
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                    ) {
+                                        CodecTestButton(
+                                            title = "3. Touch Scale",
+                                            subtitle = "1280x720 -> 1920x1080",
+                                            icon = CockpitIcons.TouchApp,
+                                            accent = AmberSignal,
+                                            testTag = "test_touch_frame_btn",
+                                            modifier = Modifier.weight(1f),
+                                            onClick = {
+                                                val frame = CarLifeTouchDecoder.createTouchActionFrame(
+                                                    action = 0,
+                                                    x = 640,
+                                                    y = 360,
+                                                    huWidth = 1280,
+                                                    huHeight = 720
+                                                )
+                                                runLoopbackCodecTest(frame, "Touch 0x0006: MSG_TOUCH_ACTION (640,360 on 1280x720)")
+                                            }
+                                        )
+
+                                        CodecTestButton(
+                                            title = "4. HardKey",
+                                            subtitle = "Steering Wheel NEXT",
+                                            icon = CockpitIcons.GraphicEq,
+                                            accent = CyberBlue,
+                                            testTag = "test_audio_frame_btn",
+                                            modifier = Modifier.weight(1f),
+                                            onClick = {
+                                                val frame = CarLifeTouchDecoder.createHardKeyFrame(CarLifeHardKey.SEEK_ADD)
+                                                runLoopbackCodecTest(frame, "Touch 0x0006: MSG_TOUCH_CAR_HARD_KEY_CODE (SEEK_ADD)")
+                                            }
+                                        )
+                                    }
+
+                                    Surface(
+                                        color = ObsidianBackground,
+                                        shape = RoundedCornerShape(10.dp),
+                                        border = BorderStroke(1.dp, ObsidianBorder)
+                                    ) {
+                                        Text(
+                                            text = lastDecodedBreakdown,
+                                            style = MaterialTheme.typography.labelSmall,
+                                            fontFamily = JetBrainsMonoFamily,
+                                            color = TextPrimary,
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .padding(10.dp)
+                                        )
+                                    }
+                                }
+                            }
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "Журнал бинарных пакетов (${state.packetLogs.size})",
+                                    style = MaterialTheme.typography.labelLarge,
+                                    color = ElectricCyan
+                                )
+                                IconButton(
+                                    onClick = { BridgeTelemetryBus.clearLogs() },
+                                    modifier = Modifier.testTag("clear_logs_button")
+                                ) {
+                                    Icon(
+                                        imageVector = CockpitIcons.ClearAll,
+                                        contentDescription = "Очистить логи",
+                                        tint = TextSecondary
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (diagnosticsExpanded) {
+            if (state.packetLogs.isEmpty()) {
+                item {
+                    EmptyPacketLogCard()
+                }
+            } else {
+                items(state.packetLogs, key = { it.id }) { entry ->
+                    PacketLogItemCard(entry = entry)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SelectableOptionButton(
+    label: String,
+    selected: Boolean,
+    testTag: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        modifier = modifier
+            .height(44.dp)
+            .clip(RoundedCornerShape(10.dp))
+            .clickable(onClick = onClick)
+            .testTag(testTag),
+        color = if (selected) ElectricCyan.copy(alpha = 0.18f) else ObsidianSurfaceHigh,
+        shape = RoundedCornerShape(10.dp),
+        border = BorderStroke(1.dp, if (selected) ElectricCyan else ObsidianBorder)
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(horizontal = 10.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelMedium.copy(
+                    fontFamily = FontFamily.SansSerif,
+                    fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium
+                ),
+                color = if (selected) ElectricCyan else TextPrimary,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+    }
+}
+
+@Composable
+private fun StatusActionChip(
+    label: String,
+    active: Boolean,
+    icon: ImageVector,
+    testTag: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        modifier = modifier
+            .height(44.dp)
+            .clip(RoundedCornerShape(10.dp))
+            .clickable(onClick = onClick)
+            .testTag(testTag),
+        color = if (active) SuccessBadgeBg else WarningBadgeBg,
+        shape = RoundedCornerShape(10.dp)
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(horizontal = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.Center
+        ) {
+            Icon(
+                imageVector = icon,
+                contentDescription = label,
+                tint = if (active) SuccessBadgeFg else WarningBadgeFg,
+                modifier = Modifier.size(16.dp)
+            )
+            Spacer(modifier = Modifier.width(6.dp))
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelMedium.copy(
+                    fontFamily = FontFamily.SansSerif,
+                    fontWeight = FontWeight.SemiBold
+                ),
+                color = if (active) SuccessBadgeFg else WarningBadgeFg,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+    }
+}
+
+@Composable
+private fun ProjectionEngineCard(
+    state: BridgeRuntimeState,
+    onStartProjection: (Int, Int, Int) -> Unit,
+    onStopProjection: () -> Unit,
+    onInjectTouch: (Int, Int) -> Unit
+) {
+    val proj = state.projectionStats
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(14.dp),
+        color = ObsidianSurfaceHigh,
+        border = BorderStroke(1.dp, ObsidianBorder)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "Конвейер VirtualDisplay + H.264",
+                    style = MaterialTheme.typography.titleSmall,
+                    color = TextPrimary
+                )
+                Text(
+                    text = if (proj.spsPpsConfigured) "SPS/PPS LOCKED" else "AVC Baseline",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = ElectricCyan
+                )
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                MetricPill(
+                    label = "H.264 NALS",
+                    value = "${proj.encodedNalFrames}",
+                    subValue = "${proj.encodedBytes / 1024} KiB",
+                    modifier = Modifier.weight(1f)
+                )
+                MetricPill(
+                    label = "TOUCH INJECT",
+                    value = "${proj.injectedTouches}",
+                    subValue = "VD #${proj.virtualDisplayId}",
+                    modifier = Modifier.weight(1f)
+                )
+                MetricPill(
+                    label = "SURFACE",
+                    value = "${proj.width}×${proj.height}",
+                    subValue = "${proj.fps} FPS",
+                    modifier = Modifier.weight(1f)
+                )
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                if (!proj.isRunning) {
+                    Button(
+                        onClick = { onStartProjection(1280, 720, 60) },
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("start_projection_btn"),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = ElectricCyan,
+                            contentColor = Color(0xFF001D24)
+                        ),
+                        shape = RoundedCornerShape(10.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.PlayArrow,
+                            contentDescription = "Start VirtualDisplay",
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Запустить VirtualDisplay + H.264", fontWeight = FontWeight.SemiBold)
+                    }
+                } else {
+                    FilledTonalButton(
+                        onClick = { onInjectTouch(120, 180) },
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("inject_touch_dock_btn"),
+                        shape = RoundedCornerShape(10.dp)
+                    ) {
+                        Text("Тест тача (Док)")
+                    }
+                    FilledTonalButton(
+                        onClick = { onInjectTouch(680, 360) },
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("inject_touch_launcher_btn"),
+                        shape = RoundedCornerShape(10.dp)
+                    ) {
+                        Text("Тест тача (Сетка)")
+                    }
+                    OutlinedButton(
+                        onClick = onStopProjection,
+                        modifier = Modifier.testTag("stop_projection_btn"),
+                        shape = RoundedCornerShape(10.dp),
+                        border = BorderStroke(1.dp, ObsidianBorder)
+                    ) {
+                        Text("Стоп", color = CoralAlert)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun TransportControlsCard(
+    state: BridgeRuntimeState,
+    onStartOrScanBridge: () -> Unit,
+    onStopBridge: () -> Unit
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(14.dp),
+        color = ObsidianSurfaceHigh,
+        border = BorderStroke(1.dp, ObsidianBorder)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "Транспорт USB AOA",
+                    style = MaterialTheme.typography.titleSmall,
+                    color = TextPrimary
+                )
+                Text(
+                    text = if (state.wakeLockHeld) "WakeLock: ACTIVE" else "DirectBufferPool",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = TelemetryEmerald
+                )
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                MetricPill(
+                    label = "RX КАДРЫ",
+                    value = "${state.rxFrames}",
+                    subValue = "${state.rxBytes} B",
+                    modifier = Modifier.weight(1f)
+                )
+                MetricPill(
+                    label = "TX КАДРЫ",
+                    value = "${state.txFrames}",
+                    subValue = "${state.txBytes} B",
+                    modifier = Modifier.weight(1f)
+                )
+                MetricPill(
+                    label = "СТАТУС",
+                    value = state.controlSession.phase.name.take(8),
+                    subValue = "${state.controlSession.negotiatedFps} FPS",
+                    modifier = Modifier.weight(1f)
+                )
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Button(
+                    onClick = onStartOrScanBridge,
+                    modifier = Modifier
+                        .weight(1f)
+                        .testTag("scan_connect_usb_button"),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = ElectricCyan,
+                        contentColor = Color(0xFF001D24)
+                    ),
+                    shape = RoundedCornerShape(10.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Refresh,
+                        contentDescription = "Scan USB AOA",
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = "Scan & Attach USB AOA",
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+
+                if (state.isServiceRunning) {
+                    OutlinedButton(
+                        onClick = onStopBridge,
+                        modifier = Modifier.testTag("stop_bridge_button"),
+                        shape = RoundedCornerShape(10.dp),
+                        border = BorderStroke(1.dp, ObsidianBorder)
+                    ) {
+                        Icon(
+                            imageVector = CockpitIcons.Stop,
+                            contentDescription = "Stop Service",
+                            tint = CoralAlert,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Стоп", color = CoralAlert)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun MetricPill(
+    label: String,
+    value: String,
+    subValue: String,
+    modifier: Modifier = Modifier
+) {
+    Column(
+        modifier = modifier
+            .clip(RoundedCornerShape(10.dp))
+            .background(ObsidianSurface)
+            .border(1.dp, ObsidianBorder, RoundedCornerShape(10.dp))
+            .padding(10.dp)
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelSmall,
+            color = TextMuted
+        )
+        Spacer(modifier = Modifier.height(2.dp))
+        Text(
+            text = value,
+            style = MaterialTheme.typography.titleMedium,
+            color = TextPrimary
+        )
+        Text(
+            text = subValue,
+            style = MaterialTheme.typography.labelSmall,
+            color = ElectricCyan
+        )
+    }
+}
+
+@Composable
+private fun ChannelMultiplexerGrid(
+    channelCounts: Map<CarLifeChannel, Long>
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(14.dp),
+        color = ObsidianSurfaceHigh,
+        border = BorderStroke(1.dp, ObsidianBorder)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Text(
+                text = "Каналы мультиплексора CarLife (0x0001 .. 0x0006)",
+                style = MaterialTheme.typography.titleSmall,
+                color = TextPrimary
+            )
+
+            val pairs = CarLifeChannel.entries.chunked(2)
+            for (rowChannels in pairs) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    for (channel in rowChannels) {
+                        val count = channelCounts[channel] ?: 0L
+                        val badgeColor = if (channel.hasTimestampHeader) TelemetryEmerald else ElectricCyan
+                        Column(
+                            modifier = Modifier
+                                .weight(1f)
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(ObsidianSurface)
+                                .border(1.dp, ObsidianBorder, RoundedCornerShape(10.dp))
+                                .padding(10.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "0x%04X".format(channel.id),
+                                    style = MaterialTheme.typography.labelMedium,
+                                    color = badgeColor
+                                )
+                                Text(
+                                    text = "${channel.headerSizeBytes}B HDR",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = TextMuted
+                                )
+                            }
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Text(
+                                text = channel.label,
+                                style = MaterialTheme.typography.titleSmall,
+                                color = TextPrimary
+                            )
+                            Text(
+                                text = "$count пакетов",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (count > 0) badgeColor else TextSecondary
+                            )
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -2011,28 +2197,28 @@ private fun CodecTestButton(
 ) {
     Surface(
         modifier = modifier
-            .clip(RoundedCornerShape(12.dp))
+            .clip(RoundedCornerShape(10.dp))
             .clickable(onClick = onClick)
             .testTag(testTag),
-        color = ObsidianSurfaceHigh,
-        shape = RoundedCornerShape(12.dp),
-        border = BorderStroke(1.dp, accent.copy(alpha = 0.45f))
+        color = ObsidianSurface,
+        shape = RoundedCornerShape(10.dp),
+        border = BorderStroke(1.dp, ObsidianBorder)
     ) {
         Row(
-            modifier = Modifier.padding(12.dp),
+            modifier = Modifier.padding(10.dp),
             verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(10.dp)
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             Icon(
                 imageVector = icon,
                 contentDescription = title,
                 tint = accent,
-                modifier = Modifier.size(22.dp)
+                modifier = Modifier.size(20.dp)
             )
             Column {
                 Text(
                     text = title,
-                    style = MaterialTheme.typography.titleMedium,
+                    style = MaterialTheme.typography.titleSmall,
                     color = TextPrimary
                 )
                 Text(
@@ -2141,23 +2327,23 @@ private fun EmptyPacketLogCard() {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(24.dp),
+                .padding(20.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(8.dp)
+            verticalArrangement = Arrangement.spacedBy(6.dp)
         ) {
             Icon(
                 imageVector = CockpitIcons.Cable,
                 contentDescription = "No packets yet",
                 tint = ElectricCyan,
-                modifier = Modifier.size(32.dp)
+                modifier = Modifier.size(28.dp)
             )
             Text(
-                text = "No CarLife Frames Captured Yet",
-                style = MaterialTheme.typography.titleMedium,
+                text = "Нет захваченных кадров CarLife",
+                style = MaterialTheme.typography.titleSmall,
                 color = TextPrimary
             )
             Text(
-                text = "Start the VirtualDisplay + H.264 Encoder above or open the 'Protocol Lab' tab to test real binary frames.",
+                text = "Нажмите на любой тестовый вектор выше для проверки бинарного протокола.",
                 style = MaterialTheme.typography.bodyMedium,
                 color = TextSecondary
             )

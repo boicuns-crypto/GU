@@ -55,6 +55,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -66,26 +67,25 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.core.input.CarLifeTouchAccessibilityService
-import com.example.ui.theme.AmberSignal
 import com.example.ui.theme.CockpitIcons
-import com.example.ui.theme.CoralAlert
-import com.example.ui.theme.CyberBlue
 import com.example.ui.theme.ElectricCyan
-import com.example.ui.theme.JetBrainsMonoFamily
 import com.example.ui.theme.ObsidianBackground
 import com.example.ui.theme.ObsidianBorder
 import com.example.ui.theme.ObsidianSurface
 import com.example.ui.theme.ObsidianSurfaceHigh
-import com.example.ui.theme.TelemetryEmerald
-import com.example.ui.theme.TextMuted
+import com.example.ui.theme.SuccessBadgeBg
+import com.example.ui.theme.SuccessBadgeFg
 import com.example.ui.theme.TextPrimary
 import com.example.ui.theme.TextSecondary
+import com.example.ui.theme.WarningBadgeBg
+import com.example.ui.theme.WarningBadgeFg
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -94,6 +94,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 /**
@@ -133,7 +134,7 @@ object CarLifeLauncherRepository {
     val installedApps: StateFlow<List<InstalledAppInfo>> = _installedApps.asStateFlow()
 
     private val _lastLaunchStatus = MutableStateFlow(
-        "Выберите приложение для запуска на экране ГУ (VirtualDisplay)"
+        "Ожидание запуска приложения на VirtualDisplay ГУ"
     )
     val lastLaunchStatus: StateFlow<String> = _lastLaunchStatus.asStateFlow()
 
@@ -247,10 +248,10 @@ object CarLifeLauncherRepository {
  * Full-screen CarLife App Mirroring Launcher rendered onto the `VirtualDisplay` (and previewable on phone).
  *
  * Layout:
- * - **Left Side Dock Bar**: Clock, VirtualDisplay ID badge, «Домой / Все приложения» button,
- *   «Назад» button, and compact Media Player widget (`CockpitMediaNotificationListenerService`).
- * - **Main Content Area**: Filterable grid of all installed smartphone applications (`CATEGORY_LAUNCHER`)
- *   that launch onto `virtualDisplayId` via `ActivityOptions.makeBasic().setLaunchDisplayId(virtualDisplayId)`.
+ * - **Left Column (240.dp)**: Clock, «Домой» and «Назад» buttons, and compact Media Player widget
+ *   (`padding = 12.dp`) so transport controls fit completely without vertical clipping.
+ * - **Right Column**: `LazyVerticalGrid(columns = GridCells.Adaptive(minSize = 96.dp))` with `100.dp` tile
+ *   height, `48.dp` icon, and `12.sp` single-line app label.
  */
 @Composable
 fun CarLifeAppLauncherScreen(
@@ -265,8 +266,8 @@ fun CarLifeAppLauncherScreen(
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     val apps by CarLifeLauncherRepository.installedApps.collectAsState()
-    val lastLaunchStatus by CarLifeLauncherRepository.lastLaunchStatus.collectAsState()
     val a11yEnabled by CarLifeTouchAccessibilityService.isServiceEnabled.collectAsState()
 
     var selectedFilter by remember { mutableIntStateOf(0) } // 0 = All, 1 = Priority/Nav & Media
@@ -291,14 +292,14 @@ fun CarLifeAppLauncherScreen(
                 .fillMaxSize()
                 .padding(10.dp)
         ) {
-            val isWideScreen = maxWidth >= 560.dp
+            val isWideScreen = maxWidth >= 520.dp
 
             if (isWideScreen) {
                 Row(
                     modifier = Modifier.fillMaxSize(),
-                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
-                    // Left Side Dock Bar (Home, Back, Clock, Compact Media Widget)
+                    // Left Column (240.dp fixed width, padding = 12.dp): Clock + Home/Back + Media Player
                     CarLifeSideDockBar(
                         virtualDisplayId = virtualDisplayId,
                         a11yEnabled = a11yEnabled,
@@ -313,20 +314,20 @@ fun CarLifeAppLauncherScreen(
                         onPreviousTrack = onPreviousTrack,
                         onRequestNotificationAccess = onRequestNotificationAccess,
                         modifier = Modifier
-                            .width(248.dp)
+                            .width(240.dp)
                             .fillMaxHeight()
                     )
 
-                    // Right Main Area: Installed Apps Grid
+                    // Right Column: Installed Apps Grid
                     InstalledAppsGridPanel(
                         apps = filteredApps,
                         totalAppCount = apps.size,
-                        virtualDisplayId = virtualDisplayId,
                         selectedFilter = selectedFilter,
-                        lastLaunchStatus = lastLaunchStatus,
                         onSelectFilter = { selectedFilter = it },
                         onRefreshApps = {
-                            // Reload on demand
+                            scope.launch {
+                                CarLifeLauncherRepository.loadInstalledApps(context)
+                            }
                         },
                         onLaunchApp = { app ->
                             CarLifeLauncherRepository.launchAppOnVirtualDisplay(
@@ -341,7 +342,7 @@ fun CarLifeAppLauncherScreen(
                     )
                 }
             } else {
-                // Compact vertical layout when previewed in portrait mode on smartphone screen
+                // Compact vertical layout for narrow portrait preview
                 Column(
                     modifier = Modifier.fillMaxSize(),
                     verticalArrangement = Arrangement.spacedBy(10.dp)
@@ -364,11 +365,13 @@ fun CarLifeAppLauncherScreen(
                     InstalledAppsGridPanel(
                         apps = filteredApps,
                         totalAppCount = apps.size,
-                        virtualDisplayId = virtualDisplayId,
                         selectedFilter = selectedFilter,
-                        lastLaunchStatus = lastLaunchStatus,
                         onSelectFilter = { selectedFilter = it },
-                        onRefreshApps = {},
+                        onRefreshApps = {
+                            scope.launch {
+                                CarLifeLauncherRepository.loadInstalledApps(context)
+                            }
+                        },
                         onLaunchApp = { app ->
                             CarLifeLauncherRepository.launchAppOnVirtualDisplay(
                                 context = context,
@@ -410,7 +413,7 @@ private fun CarLifeSideDockBar(
 
     Card(
         modifier = modifier,
-        shape = RoundedCornerShape(20.dp),
+        shape = RoundedCornerShape(16.dp),
         colors = CardDefaults.cardColors(containerColor = ObsidianSurface),
         border = BorderStroke(1.dp, ObsidianBorder)
     ) {
@@ -420,7 +423,7 @@ private fun CarLifeSideDockBar(
                 .padding(12.dp),
             verticalArrangement = Arrangement.SpaceBetween
         ) {
-            // Top Clock + VirtualDisplay status header
+            // Top section: Clock, Status Badge, and Home / Back buttons
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -430,58 +433,49 @@ private fun CarLifeSideDockBar(
                     Text(
                         text = currentTime,
                         style = MaterialTheme.typography.headlineMedium.copy(
-                            fontFamily = JetBrainsMonoFamily,
-                            fontWeight = FontWeight.Bold
+                            fontFamily = FontFamily.SansSerif,
+                            fontWeight = FontWeight.SemiBold
                         ),
                         color = TextPrimary
                     )
                     Surface(
                         color = if (virtualDisplayId != Display.DEFAULT_DISPLAY) {
-                            TelemetryEmerald.copy(alpha = 0.16f)
+                            SuccessBadgeBg
                         } else {
-                            ElectricCyan.copy(alpha = 0.16f)
+                            ObsidianSurfaceHigh
                         },
                         shape = RoundedCornerShape(8.dp),
-                        border = BorderStroke(
-                            1.dp,
-                            if (virtualDisplayId != Display.DEFAULT_DISPLAY) TelemetryEmerald else ElectricCyan
-                        )
+                        border = BorderStroke(1.dp, ObsidianBorder)
                     ) {
-                        Text(
-                            text = if (virtualDisplayId != Display.DEFAULT_DISPLAY) {
-                                "VD #$virtualDisplayId"
-                            } else {
-                                "PREVIEW"
-                            },
-                            style = MaterialTheme.typography.labelSmall,
-                            fontFamily = JetBrainsMonoFamily,
-                            color = if (virtualDisplayId != Display.DEFAULT_DISPLAY) TelemetryEmerald else ElectricCyan,
-                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
-                        )
+                        Row(
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(5.dp)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(6.dp)
+                                    .clip(CircleShape)
+                                    .background(if (a11yEnabled) SuccessBadgeFg else WarningBadgeFg)
+                            )
+                            Text(
+                                text = if (virtualDisplayId != Display.DEFAULT_DISPLAY) {
+                                    "VD #$virtualDisplayId"
+                                } else {
+                                    "КОКПИТ"
+                                },
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (virtualDisplayId != Display.DEFAULT_DISPLAY) {
+                                    SuccessBadgeFg
+                                } else {
+                                    ElectricCyan
+                                }
+                            )
+                        }
                     }
                 }
 
-                // Touch Accessibility Service indicator pill
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .size(8.dp)
-                            .clip(CircleShape)
-                            .background(if (a11yEnabled) TelemetryEmerald else AmberSignal)
-                    )
-                    Text(
-                        text = if (a11yEnabled) "Touch Injection: ACTIVE" else "Touch A11y: OFF",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = if (a11yEnabled) TelemetryEmerald else AmberSignal,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                }
-
-                // Dock Navigation Buttons: Home / All Apps & Back
+                // Dock Navigation Buttons: Home & Back
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -497,7 +491,7 @@ private fun CarLifeSideDockBar(
                     DockNavigationButton(
                         label = "Назад",
                         icon = CockpitIcons.ArrowBack,
-                        accent = CyberBlue,
+                        accent = TextPrimary,
                         testTag = "dock_back_button",
                         onClick = onBackClick,
                         modifier = Modifier.weight(1f)
@@ -505,7 +499,7 @@ private fun CarLifeSideDockBar(
                 }
             }
 
-            // Bottom Compact Media Player Widget (CockpitMediaNotificationListenerService)
+            // Bottom Compact Media Player Widget
             DockCompactMediaPlayer(
                 mediaState = mediaState,
                 onPlayPause = onPlayPause,
@@ -531,7 +525,7 @@ private fun CompactTopDockBar(
 ) {
     Card(
         modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(18.dp),
+        shape = RoundedCornerShape(16.dp),
         colors = CardDefaults.cardColors(containerColor = ObsidianSurface),
         border = BorderStroke(1.dp, ObsidianBorder)
     ) {
@@ -539,7 +533,7 @@ private fun CompactTopDockBar(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
+            verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -547,7 +541,7 @@ private fun CompactTopDockBar(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 DockNavigationButton(
-                    label = "Домой / Все",
+                    label = "Домой",
                     icon = CockpitIcons.Home,
                     accent = ElectricCyan,
                     testTag = "dock_home_button",
@@ -557,35 +551,27 @@ private fun CompactTopDockBar(
                 DockNavigationButton(
                     label = "Назад",
                     icon = CockpitIcons.ArrowBack,
-                    accent = CyberBlue,
+                    accent = TextPrimary,
                     testTag = "dock_back_button",
                     onClick = onBackClick,
                     modifier = Modifier.weight(1f)
                 )
                 Surface(
-                    color = ObsidianSurfaceHigh,
-                    shape = RoundedCornerShape(12.dp),
-                    border = BorderStroke(
-                        1.dp,
-                        if (a11yEnabled) TelemetryEmerald else AmberSignal
-                    )
+                    color = if (a11yEnabled) SuccessBadgeBg else WarningBadgeBg,
+                    shape = RoundedCornerShape(10.dp)
                 ) {
-                    Column(
-                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally
-                    ) {
-                        Text(
-                            text = if (virtualDisplayId != Display.DEFAULT_DISPLAY) "VD #$virtualDisplayId" else "VD READY",
-                            style = MaterialTheme.typography.labelSmall,
-                            fontFamily = JetBrainsMonoFamily,
-                            color = ElectricCyan
-                        )
-                        Text(
-                            text = if (a11yEnabled) "A11y ON" else "A11y OFF",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = if (a11yEnabled) TelemetryEmerald else AmberSignal
-                        )
-                    }
+                    Text(
+                        text = if (virtualDisplayId != Display.DEFAULT_DISPLAY) {
+                            "VD #$virtualDisplayId"
+                        } else if (a11yEnabled) {
+                            "Touch ON"
+                        } else {
+                            "Touch OFF"
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                        color = if (a11yEnabled) SuccessBadgeFg else WarningBadgeFg,
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp)
+                    )
                 }
             }
 
@@ -611,18 +597,18 @@ private fun DockNavigationButton(
 ) {
     Surface(
         modifier = modifier
-            .height(54.dp)
-            .clip(RoundedCornerShape(14.dp))
+            .height(48.dp)
+            .clip(RoundedCornerShape(12.dp))
             .clickable(onClick = onClick)
             .testTag(testTag),
         color = ObsidianSurfaceHigh,
-        shape = RoundedCornerShape(14.dp),
-        border = BorderStroke(1.dp, accent.copy(alpha = 0.5f))
+        shape = RoundedCornerShape(12.dp),
+        border = BorderStroke(1.dp, ObsidianBorder)
     ) {
         Row(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(horizontal = 10.dp),
+                .padding(horizontal = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.Center
         ) {
@@ -630,12 +616,15 @@ private fun DockNavigationButton(
                 imageVector = icon,
                 contentDescription = label,
                 tint = accent,
-                modifier = Modifier.size(20.dp)
+                modifier = Modifier.size(18.dp)
             )
             Spacer(modifier = Modifier.width(6.dp))
             Text(
                 text = label,
-                style = MaterialTheme.typography.labelLarge,
+                style = MaterialTheme.typography.labelLarge.copy(
+                    fontFamily = FontFamily.SansSerif,
+                    fontWeight = FontWeight.Medium
+                ),
                 color = TextPrimary,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
@@ -655,31 +644,31 @@ private fun DockCompactMediaPlayer(
     Surface(
         modifier = Modifier.fillMaxWidth(),
         color = ObsidianSurfaceHigh,
-        shape = RoundedCornerShape(16.dp),
+        shape = RoundedCornerShape(14.dp),
         border = BorderStroke(1.dp, ObsidianBorder)
     ) {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(10.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp)
+            verticalArrangement = Arrangement.spacedBy(6.dp)
         ) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 // Album Art Thumbnail
                 Box(
                     modifier = Modifier
-                        .size(48.dp)
-                        .clip(RoundedCornerShape(10.dp))
+                        .size(40.dp)
+                        .clip(RoundedCornerShape(8.dp))
                         .background(
                             Brush.linearGradient(
-                                colors = listOf(Color(0xFF162238), Color(0xFF0B111E))
+                                colors = listOf(Color(0xFF1E2636), Color(0xFF0B0E14))
                             )
                         )
-                        .border(1.dp, ObsidianBorder, RoundedCornerShape(10.dp)),
+                        .border(1.dp, ObsidianBorder, RoundedCornerShape(8.dp)),
                     contentAlignment = Alignment.Center
                 ) {
                     val bmp = mediaState.albumArtBitmap
@@ -695,7 +684,7 @@ private fun DockCompactMediaPlayer(
                             imageVector = CockpitIcons.Album,
                             contentDescription = "Media",
                             tint = ElectricCyan,
-                            modifier = Modifier.size(24.dp)
+                            modifier = Modifier.size(20.dp)
                         )
                     }
                 }
@@ -710,7 +699,10 @@ private fun DockCompactMediaPlayer(
                     )
                     Text(
                         text = mediaState.trackTitle,
-                        style = MaterialTheme.typography.titleSmall,
+                        style = MaterialTheme.typography.titleSmall.copy(
+                            fontFamily = FontFamily.SansSerif,
+                            fontWeight = FontWeight.SemiBold
+                        ),
                         color = TextPrimary,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
@@ -732,16 +724,15 @@ private fun DockCompactMediaPlayer(
                         .clip(RoundedCornerShape(8.dp))
                         .clickable(onClick = onRequestNotificationAccess)
                         .testTag("grant_media_notif_btn"),
-                    color = AmberSignal.copy(alpha = 0.14f),
-                    shape = RoundedCornerShape(8.dp),
-                    border = BorderStroke(1.dp, AmberSignal)
+                    color = WarningBadgeBg,
+                    shape = RoundedCornerShape(8.dp)
                 ) {
                     Text(
-                        text = "Дать доступ к медиа-сессиям",
+                        text = "Доступ к уведомлениям плеера",
                         style = MaterialTheme.typography.labelSmall,
-                        color = AmberSignal,
+                        color = WarningBadgeFg,
                         textAlign = TextAlign.Center,
-                        modifier = Modifier.padding(vertical = 6.dp, horizontal = 8.dp)
+                        modifier = Modifier.padding(vertical = 5.dp, horizontal = 6.dp)
                     )
                 }
             }
@@ -750,13 +741,13 @@ private fun DockCompactMediaPlayer(
                 progress = { mediaState.progressFraction },
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(4.dp)
+                    .height(3.dp)
                     .clip(RoundedCornerShape(2.dp)),
                 color = ElectricCyan,
                 trackColor = ObsidianBackground
             )
 
-            // Large touch media transport buttons
+            // Media transport buttons sized so they never clip at the bottom of the dock
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceEvenly,
@@ -773,14 +764,15 @@ private fun DockCompactMediaPlayer(
                     Icon(
                         imageVector = CockpitIcons.SkipPrevious,
                         contentDescription = "Previous Track",
-                        tint = TextPrimary
+                        tint = TextPrimary,
+                        modifier = Modifier.size(20.dp)
                     )
                 }
 
                 IconButton(
                     onClick = onPlayPause,
                     modifier = Modifier
-                        .size(52.dp)
+                        .size(48.dp)
                         .clip(CircleShape)
                         .background(ElectricCyan)
                         .testTag("media_play_pause_button")
@@ -788,8 +780,8 @@ private fun DockCompactMediaPlayer(
                     Icon(
                         imageVector = if (mediaState.isPlaying) CockpitIcons.Pause else Icons.Default.PlayArrow,
                         contentDescription = "Play or Pause",
-                        tint = Color(0xFF002227),
-                        modifier = Modifier.size(26.dp)
+                        tint = Color(0xFF001D24),
+                        modifier = Modifier.size(24.dp)
                     )
                 }
 
@@ -804,7 +796,8 @@ private fun DockCompactMediaPlayer(
                     Icon(
                         imageVector = CockpitIcons.SkipNext,
                         contentDescription = "Next Track",
-                        tint = TextPrimary
+                        tint = TextPrimary,
+                        modifier = Modifier.size(20.dp)
                     )
                 }
             }
@@ -816,25 +809,22 @@ private fun DockCompactMediaPlayer(
 private fun InstalledAppsGridPanel(
     apps: List<InstalledAppInfo>,
     totalAppCount: Int,
-    virtualDisplayId: Int,
     selectedFilter: Int,
-    lastLaunchStatus: String,
     onSelectFilter: (Int) -> Unit,
     onRefreshApps: () -> Unit,
     onLaunchApp: (InstalledAppInfo) -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val context = LocalContext.current
     Card(
         modifier = modifier,
-        shape = RoundedCornerShape(20.dp),
+        shape = RoundedCornerShape(16.dp),
         colors = CardDefaults.cardColors(containerColor = ObsidianSurface),
         border = BorderStroke(1.dp, ObsidianBorder)
     ) {
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(14.dp),
+                .padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
             // Header bar with filter chips and refresh
@@ -848,13 +838,13 @@ private fun InstalledAppsGridPanel(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     FilterTabChip(
-                        label = "Все приложения ($totalAppCount)",
+                        label = "Все ($totalAppCount)",
                         selected = selectedFilter == 0,
                         testTag = "filter_all_apps_chip",
                         onClick = { onSelectFilter(0) }
                     )
                     FilterTabChip(
-                        label = "В дорогу / Медиа",
+                        label = "Навигация и Медиа",
                         selected = selectedFilter == 1,
                         testTag = "filter_auto_apps_chip",
                         onClick = { onSelectFilter(1) }
@@ -862,38 +852,18 @@ private fun InstalledAppsGridPanel(
                 }
 
                 IconButton(
-                    onClick = {
-                        onRefreshApps()
-                    },
+                    onClick = onRefreshApps,
                     modifier = Modifier
-                        .size(48.dp)
+                        .size(40.dp)
                         .testTag("refresh_apps_button")
                 ) {
                     Icon(
                         imageVector = Icons.Default.Refresh,
                         contentDescription = "Обновить список приложений",
-                        tint = ElectricCyan
+                        tint = ElectricCyan,
+                        modifier = Modifier.size(20.dp)
                     )
                 }
-            }
-
-            // Status bar showing target VirtualDisplay ID and last launched app
-            Surface(
-                color = ObsidianBackground,
-                shape = RoundedCornerShape(10.dp),
-                border = BorderStroke(1.dp, ObsidianBorder)
-            ) {
-                Text(
-                    text = lastLaunchStatus,
-                    style = MaterialTheme.typography.labelSmall,
-                    fontFamily = JetBrainsMonoFamily,
-                    color = TelemetryEmerald,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 12.dp, vertical = 7.dp)
-                )
             }
 
             if (apps.isEmpty()) {
@@ -911,10 +881,10 @@ private fun InstalledAppsGridPanel(
                             imageVector = CockpitIcons.AppsGrid,
                             contentDescription = "Loading apps",
                             tint = ElectricCyan,
-                            modifier = Modifier.size(36.dp)
+                            modifier = Modifier.size(32.dp)
                         )
                         Text(
-                            text = "Загрузка установленных приложений смартфона...",
+                            text = "Загрузка приложений смартфона...",
                             style = MaterialTheme.typography.bodyMedium,
                             color = TextSecondary
                         )
@@ -922,14 +892,14 @@ private fun InstalledAppsGridPanel(
                 }
             } else {
                 LazyVerticalGrid(
-                    columns = GridCells.Adaptive(minSize = 110.dp),
+                    columns = GridCells.Adaptive(minSize = 96.dp),
                     modifier = Modifier
                         .fillMaxWidth()
                         .weight(1f)
                         .testTag("installed_apps_grid"),
-                    contentPadding = PaddingValues(4.dp),
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                    contentPadding = PaddingValues(2.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     items(
                         items = apps,
@@ -955,18 +925,21 @@ private fun FilterTabChip(
 ) {
     Surface(
         modifier = Modifier
-            .clip(RoundedCornerShape(12.dp))
+            .clip(RoundedCornerShape(10.dp))
             .clickable(onClick = onClick)
             .testTag(testTag),
         color = if (selected) ElectricCyan.copy(alpha = 0.18f) else ObsidianSurfaceHigh,
-        shape = RoundedCornerShape(12.dp),
+        shape = RoundedCornerShape(10.dp),
         border = BorderStroke(1.dp, if (selected) ElectricCyan else ObsidianBorder)
     ) {
         Text(
             text = label,
-            style = MaterialTheme.typography.labelLarge,
+            style = MaterialTheme.typography.labelMedium.copy(
+                fontFamily = FontFamily.SansSerif,
+                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium
+            ),
             color = if (selected) ElectricCyan else TextSecondary,
-            modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
         )
     }
 }
@@ -979,7 +952,7 @@ private fun AppLauncherTile(
     Surface(
         modifier = Modifier
             .fillMaxWidth()
-            .height(116.dp)
+            .height(100.dp)
             .clip(RoundedCornerShape(16.dp))
             .clickable(onClick = onClick)
             .testTag("app_tile_${app.packageName}"),
@@ -987,51 +960,57 @@ private fun AppLauncherTile(
         shape = RoundedCornerShape(16.dp),
         border = BorderStroke(
             width = 1.dp,
-            color = if (app.isAutomotivePriority) ElectricCyan.copy(alpha = 0.45f) else ObsidianBorder
+            color = ObsidianBorder
         )
     ) {
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(10.dp),
+                .padding(horizontal = 6.dp, vertical = 8.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center
         ) {
-            Box(
-                modifier = Modifier
-                    .size(54.dp)
-                    .clip(RoundedCornerShape(14.dp))
-                    .background(ObsidianSurface),
-                contentAlignment = Alignment.Center
-            ) {
-                if (app.iconBitmap != null) {
-                    Image(
-                        bitmap = app.iconBitmap,
-                        contentDescription = app.label,
-                        modifier = Modifier
-                            .size(46.dp)
-                            .clip(RoundedCornerShape(10.dp)),
-                        contentScale = ContentScale.Fit
-                    )
-                } else {
+            if (app.iconBitmap != null) {
+                Image(
+                    bitmap = app.iconBitmap,
+                    contentDescription = app.label,
+                    modifier = Modifier
+                        .size(48.dp)
+                        .clip(RoundedCornerShape(12.dp)),
+                    contentScale = ContentScale.Fit
+                )
+            } else {
+                Box(
+                    modifier = Modifier
+                        .size(48.dp)
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(ObsidianSurface),
+                    contentAlignment = Alignment.Center
+                ) {
                     Icon(
                         imageVector = CockpitIcons.AppsGrid,
                         contentDescription = app.label,
                         tint = ElectricCyan,
-                        modifier = Modifier.size(28.dp)
+                        modifier = Modifier.size(26.dp)
                     )
                 }
             }
 
-            Spacer(modifier = Modifier.height(8.dp))
+            Spacer(modifier = Modifier.height(6.dp))
 
             Text(
                 text = app.label,
-                style = MaterialTheme.typography.labelLarge.copy(fontSize = 13.sp),
+                style = MaterialTheme.typography.labelMedium.copy(
+                    fontFamily = FontFamily.SansSerif,
+                    fontWeight = FontWeight.Medium,
+                    fontSize = 12.sp,
+                    lineHeight = 14.sp
+                ),
                 color = TextPrimary,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis,
-                textAlign = TextAlign.Center
+                textAlign = TextAlign.Center,
+                modifier = Modifier.fillMaxWidth()
             )
         }
     }

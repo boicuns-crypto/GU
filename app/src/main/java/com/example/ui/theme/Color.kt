@@ -2,17 +2,24 @@ package com.example.ui.theme
 
 import androidx.compose.ui.graphics.Color
 
-val ObsidianBackground = Color(0xFF070B14)
-val ObsidianSurface = Color(0xFF0E1525)
-val ObsidianSurfaceHigh = Color(0xFF162038)
-val ObsidianBorder = Color(0xFF233253)
+// VAG Carbon & Ice Cyan Automotive Palette
+val ObsidianBackground = Color(0xFF0B0E14)
+val ObsidianSurface = Color(0xFF151A24)
+val ObsidianSurfaceHigh = Color(0xFF1E2636)
+val ObsidianBorder = Color(0xFF222938)
 
-val ElectricCyan = Color(0xFF00E5FF)
-val CyberBlue = Color(0xFF2979FF)
-val TelemetryEmerald = Color(0xFF00E676)
-val AmberSignal = Color(0xFFFFAB00)
-val CoralAlert = Color(0xFFFF5252)
+val ElectricCyan = Color(0xFF00B4D8)
+val CyberBlue = Color(0xFF0096C7)
+val TelemetryEmerald = Color(0xFF10B981)
+val AmberSignal = Color(0xFFF59E0B)
+val CoralAlert = Color(0xFFEF4444)
 
-val TextPrimary = Color(0xFFF0F6FC)
+val SuccessBadgeBg = Color(0xFF064E3B)
+val SuccessBadgeFg = Color(0xFF10B981)
+
+val WarningBadgeBg = Color(0xFF451A03)
+val WarningBadgeFg = Color(0xFFF59E0B)
+
+val TextPrimary = Color(0xFFF1F5F9)
 val TextSecondary = Color(0xFF94A3B8)
 val TextMuted = Color(0xFF64748B)
