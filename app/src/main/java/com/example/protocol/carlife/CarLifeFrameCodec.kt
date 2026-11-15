@@ -45,39 +45,43 @@ enum class CarLifeChannel(
  * and Touch (`0x0006`) channel payloads (Jetta VS7 / MQB Head Unit specification).
  */
 object CarLifeMsgType {
-    // Control Channel (0x0001) — Handshake, Device Info, Video Negotiation & Lifecycle
-    const val MSG_CMD_HU_PROTOCOL_VERSION = 0x00018001
-    const val MSG_CMD_HU_PROTOCOL_VERSION_ALT = 0x00010001
-    const val MSG_CMD_PROTOCOL_VERSION_MATCH_STATUS = 0x00010002
-    const val MSG_CMD_PROTOCOL_VERSION_MATCH_STATUS_ALT = 0x00018002
-    const val MSG_CMD_HU_INFO = 0x00018003
-    const val MSG_CMD_HU_INFO_ALT = 0x00010003
-    const val MSG_CMD_MD_INFO = 0x00010004
-    const val MSG_CMD_MD_INFO_ALT = 0x00018004
-    const val MSG_CMD_HU_BT_OOB_INFO = 0x00018005
-    const val MSG_CMD_HU_BT_OOB_INFO_ALT = 0x00010005
-    const val MSG_CMD_MD_BT_OOB_INFO = 0x00010006
-    const val MSG_CMD_MD_BT_OOB_INFO_ALT = 0x00018006
-    const val MSG_CMD_VIDEO_ENCODER_INIT = 0x00018007
-    const val MSG_CMD_VIDEO_ENCODER_INIT_ALT = 0x00010007
-    const val MSG_CMD_VIDEO_ENCODER_INIT_DONE = 0x00010008
-    const val MSG_CMD_VIDEO_ENCODER_INIT_DONE_ALT = 0x00018008
-    const val MSG_CMD_VIDEO_ENCODER_START = 0x00018009
-    const val MSG_CMD_VIDEO_ENCODER_START_ALT = 0x00010009
-    const val MSG_CMD_VIDEO_ENCODER_START_DONE = 0x0001000A
-    const val MSG_CMD_VIDEO_ENCODER_START_DONE_ALT = 0x0001800A
-    const val MSG_CMD_VIDEO_ENCODER_PAUSE = 0x0001800A
-    const val MSG_CMD_VIDEO_ENCODER_RESET = 0x0001800B
-    const val MSG_CMD_VIDEO_ENCODER_RESET_ALT = 0x0001000B
-    const val MSG_CMD_VIDEO_ENCODER_FRAME_RATE_CHANGE = 0x0001800C
-    const val MSG_CMD_VIDEO_ENCODER_FRAME_RATE_CHANGE_ALT = 0x0001000C
-    const val MSG_CMD_VIDEO_ENCODER_FRAME_RATE_CHANGE_DONE = 0x0001000D
-    const val MSG_CMD_PAUSE_MEDIA = 0x0001800E
-    const val MSG_CMD_CAR_VELOCITY = 0x0001800F
-    const val MSG_CMD_CAR_GPS = 0x00018010
-    const val MSG_CMD_CAR_GYROSCOPE = 0x00018011
-    const val MSG_CMD_CAR_ACCELERATION = 0x00018012
-    const val MSG_CMD_CAR_OIL = 0x00018013
+    // Control Channel (0x0001) — Official Baidu CarLife Direction Bit Mapping:
+    // HU -> MD (Head Unit to Phone): 0x000100xx (bit 15 = 0)
+    // MD -> HU (Phone to Head Unit): 0x000180xx (bit 15 = 1)
+    const val MSG_CMD_HU_PROTOCOL_VERSION = 0x00010001
+    const val MSG_CMD_HU_PROTOCOL_VERSION_ALT = 0x00018001
+    const val MSG_CMD_PROTOCOL_VERSION_MATCH_STATUS = 0x00018002
+    const val MSG_CMD_PROTOCOL_VERSION_MATCH_STATUS_ALT = 0x00010002
+    const val MSG_CMD_HU_INFO = 0x00010003
+    const val MSG_CMD_HU_INFO_ALT = 0x00018003
+    const val MSG_CMD_MD_INFO = 0x00018004
+    const val MSG_CMD_MD_INFO_ALT = 0x00010004
+    const val MSG_CMD_HU_BT_OOB_INFO = 0x00010005
+    const val MSG_CMD_HU_BT_OOB_INFO_ALT = 0x00018005
+    const val MSG_CMD_MD_BT_OOB_INFO = 0x00018006
+    const val MSG_CMD_MD_BT_OOB_INFO_ALT = 0x00010006
+    const val MSG_CMD_VIDEO_ENCODER_INIT = 0x00010007
+    const val MSG_CMD_VIDEO_ENCODER_INIT_ALT = 0x00018007
+    const val MSG_CMD_VIDEO_ENCODER_INIT_DONE = 0x00018008
+    const val MSG_CMD_VIDEO_ENCODER_INIT_DONE_ALT = 0x00010008
+    const val MSG_CMD_VIDEO_ENCODER_START = 0x00010009
+    const val MSG_CMD_VIDEO_ENCODER_START_ALT = 0x00018009
+    const val MSG_CMD_VIDEO_ENCODER_START_DONE = 0x0001800A
+    const val MSG_CMD_VIDEO_ENCODER_START_DONE_ALT = 0x0001000A
+    const val MSG_CMD_VIDEO_ENCODER_PAUSE = 0x0001000A
+    const val MSG_CMD_VIDEO_ENCODER_PAUSE_ALT = 0x0001800A
+    const val MSG_CMD_VIDEO_ENCODER_RESET = 0x0001000B
+    const val MSG_CMD_VIDEO_ENCODER_RESET_ALT = 0x0001800B
+    const val MSG_CMD_VIDEO_ENCODER_FRAME_RATE_CHANGE = 0x0001000C
+    const val MSG_CMD_VIDEO_ENCODER_FRAME_RATE_CHANGE_ALT = 0x0001800C
+    const val MSG_CMD_VIDEO_ENCODER_FRAME_RATE_CHANGE_DONE = 0x0001800D
+    const val MSG_CMD_VIDEO_ENCODER_FRAME_RATE_CHANGE_DONE_ALT = 0x0001000D
+    const val MSG_CMD_PAUSE_MEDIA = 0x0001000E
+    const val MSG_CMD_CAR_VELOCITY = 0x0001000F
+    const val MSG_CMD_CAR_GPS = 0x00010010
+    const val MSG_CMD_CAR_GYROSCOPE = 0x00010011
+    const val MSG_CMD_CAR_ACCELERATION = 0x00010012
+    const val MSG_CMD_CAR_OIL = 0x00010013
     const val MSG_CMD_LAUNCH_MODE_NORMAL = 0x00018014
     const val MSG_CMD_LAUNCH_MODE_PHONE = 0x00018015
     const val MSG_CMD_LAUNCH_MODE_MAP = 0x00018016
@@ -279,15 +283,37 @@ data class CarLifeFrame(
         }
 
         // Case 2: payload.size >= 8 (wire frame >= 16 bytes)
+        // Official Baidu CarLife 8-byte Inner Command Header:
+        // - payload[0..1] (wire bytes[8..9]):   msgLen (UInt16 Big-Endian, e.g. 00 04, 00 02, 00 F2)
+        // - payload[2..3] (wire bytes[10..11]): reserved (UInt16 Big-Endian, 00 00)
+        // - payload[4..7] (wire bytes[12..15]): serviceType (Int32 Big-Endian, e.g. 0x00010001, 0x00018002)
+        // - payload[8..N] (wire bytes[16..N]):  Protobuf body (msgLen bytes)
+        val u16MsgLen = buf.getShort(0).toInt() and 0xFFFF
+        val u16Reserved = buf.getShort(2).toInt() and 0xFFFF
         val word1 = buf.getInt(4) // wire bytes[12..15]
         val word2 = if (payload.size >= 12) buf.getInt(8) else 0 // wire bytes[16..19]
 
-        val word0IsService = CarLifeMsgType.isCarLifeServiceId(word0)
+        val word0IsService = CarLifeMsgType.isCarLifeServiceId(word0) && u16MsgLen == 0x0001
         val word1IsService = CarLifeMsgType.isCarLifeServiceId(word1)
         val word2IsService = payload.size >= 12 && CarLifeMsgType.isCarLifeServiceId(word2)
 
         return when {
-            // Subcase 2A: bytes[8..11] (word0) is already 0x0001xxxx / 0x0006xxxx serviceId
+            // Subcase 2A (Standard CarLife Inner Header): bytes[8..9]=u16MsgLen, bytes[10..11]=00 00, bytes[12..15]=serviceId
+            word1IsService -> {
+                val avail = payload.size - 8
+                val safeLen = when {
+                    u16Reserved == 0 && u16MsgLen in 0..avail -> u16MsgLen
+                    word0 in 0..avail -> word0
+                    else -> avail
+                }
+                val body = if (safeLen > 0) payload.copyOfRange(8, 8 + safeLen) else ByteArray(0)
+                CarLifeCommandMessage(
+                    serviceType = word1,
+                    body = body
+                )
+            }
+
+            // Subcase 2B: bytes[8..11] (word0) is already 0x0001xxxx / 0x0006xxxx serviceId
             word0IsService && !word1IsService -> {
                 val body = if (word1 in 0..(payload.size - 8) && (word1 == payload.size - 8 || word1 == 0)) {
                     if (word1 > 0) payload.copyOfRange(8, 8 + word1) else payload.copyOfRange(8, payload.size)
@@ -300,21 +326,15 @@ data class CarLifeFrame(
                 )
             }
 
-            // Subcase 2B: Standard format -> bytes[8..11] is innerProtoLen, bytes[12..15] (word1) is serviceId
-            word1IsService -> {
-                val avail = payload.size - 8
-                val safeLen = if (word0 in 0..avail) word0 else avail
-                val body = if (safeLen > 0) payload.copyOfRange(8, 8 + safeLen) else ByteArray(0)
-                CarLifeCommandMessage(
-                    serviceType = word1,
-                    body = body
-                )
-            }
-
             // Subcase 2C: 12-byte payload where bytes[8..11] is 4B timestamp, bytes[12..15] is innerLen, bytes[16..19] (word2) is serviceId
             word2IsService -> {
                 val avail = payload.size - 12
-                val safeLen = if (word1 in 0..avail) word1 else avail
+                val innerU16Len = buf.getShort(4).toInt() and 0xFFFF
+                val safeLen = when {
+                    innerU16Len in 0..avail -> innerU16Len
+                    word1 in 0..avail -> word1
+                    else -> avail
+                }
                 val body = if (safeLen > 0) payload.copyOfRange(12, 12 + safeLen) else ByteArray(0)
                 CarLifeCommandMessage(
                     serviceType = word2,
@@ -326,7 +346,7 @@ data class CarLifeFrame(
             else -> {
                 val chosenService = if (word1 != 0) word1 else word0
                 val avail = payload.size - 8
-                val safeLen = if (word0 in 0..avail) word0 else avail
+                val safeLen = if (u16MsgLen in 0..avail) u16MsgLen else avail
                 val body = if (safeLen > 0) payload.copyOfRange(8, 8 + safeLen) else ByteArray(0)
                 CarLifeCommandMessage(
                     serviceType = chosenService,
@@ -633,6 +653,18 @@ object CarLifeFrameCodec {
         output.flush()
     }
 
+    /**
+     * Packs a Control (`0x0001`) or Touch (`0x0006`) frame using the exact Baidu CarLife wire layout:
+     * - Outer Channel Header (8 bytes):
+     *   - `[0..3]` = `channel.id` (Big-Endian Int32, e.g. `0x00000001`)
+     *   - `[4..7]` = `8 + commandBody.size` (Big-Endian Int32 total channel payload length)
+     * - Inner Command Header (8 bytes):
+     *   - `[8..9]`   = `(commandBody.size).toShort()` (STRICT 2-BYTE Big-Endian UInt16 Protobuf length, e.g. `00 02`, `00 F2`)
+     *   - `[10..11]` = `0x0000.toShort()` (STRICT 2-BYTE Reserved `00 00`)
+     *   - `[12..15]` = `serviceType` (4-BYTE Big-Endian Int32 Service ID, e.g. `0x00018002`)
+     * - Protobuf Payload (`commandBody.size` bytes):
+     *   - `[16..N]`  = `commandBody`
+     */
     fun createCommandFrame(
         channel: CarLifeChannel = CarLifeChannel.CONTROL,
         serviceType: Int,
@@ -643,7 +675,8 @@ object CarLifeFrameCodec {
         }
         val innerPayload = ByteBuffer.allocate(8 + commandBody.size)
             .order(ByteOrder.BIG_ENDIAN)
-            .putInt(commandBody.size)
+            .putShort(commandBody.size.toShort())
+            .putShort(0.toShort())
             .putInt(serviceType)
             .put(commandBody)
             .array()

@@ -196,26 +196,20 @@ class CarLifeControlStateMachine(
         )
         val encodedNegotiated = negotiatedProto.encode()
 
-        // 1. Standard MD -> HU MSG_CMD_VIDEO_ENCODER_INIT_DONE (0x00010008)
+        // 1. Official MD -> HU MSG_CMD_VIDEO_ENCODER_INIT_DONE (0x00018008) with [00 08][00 00][00 01 80 08]
         val initDoneFrame = CarLifeFrameCodec.createCommandFrame(
             channel = CarLifeChannel.CONTROL,
             serviceType = CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT_DONE,
             commandBody = encodedNegotiated
         )
-        // 2. Alternate MSG_CMD_VIDEO_ENCODER_INIT_DONE (0x00018008) for firmwares expecting 0x00018008
-        val initDoneAltFrame = CarLifeFrameCodec.createCommandFrame(
-            channel = CarLifeChannel.CONTROL,
-            serviceType = CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT_DONE_ALT,
-            commandBody = encodedNegotiated
-        )
-        // 3. MSG_CMD_FOREGROUND (0x00018025, inner len = 0) to notify HU that video source is active
+        // 2. MSG_CMD_FOREGROUND (0x00018025, msgLen = 0) to notify HU that video source is active
         val foregroundFrame = CarLifeFrameCodec.createCommandFrame(
             channel = CarLifeChannel.CONTROL,
             serviceType = CarLifeMsgType.MSG_CMD_FOREGROUND,
             commandBody = ByteArray(0)
         )
 
-        val summary = "Video Init: ${negotiatedProto.width}x${negotiatedProto.height}@${negotiatedProto.frameRate}fps -> TX INIT_DONE + FOREGROUND + Immediate H.264 Stream"
+        val summary = "Video Init: ${negotiatedProto.width}x${negotiatedProto.height}@${negotiatedProto.frameRate}fps -> TX INIT_DONE (0x00018008) + FOREGROUND + H.264 Stream"
         _sessionState.update {
             it.copy(
                 phase = CarLifeSessionPhase.VIDEO_STREAMING,
@@ -228,7 +222,7 @@ class CarLifeControlStateMachine(
         }
         return ControlTransitionResult(
             updatedState = _sessionState.value,
-            outboundFrames = listOf(initDoneFrame, initDoneAltFrame, foregroundFrame),
+            outboundFrames = listOf(initDoneFrame, foregroundFrame),
             summary = summary
         )
     }
@@ -236,10 +230,10 @@ class CarLifeControlStateMachine(
     private fun handleBtOobInfo(): ControlTransitionResult {
         val btReply = CarLifeFrameCodec.createCommandFrame(
             channel = CarLifeChannel.CONTROL,
-            serviceType = CarLifeMsgType.MSG_CMD_MD_BT_OOB_INFO,
+            serviceType = CarLifeMsgType.MSG_CMD_MD_BT_OOB_INFO, // 0x00018006
             commandBody = ByteArray(0)
         )
-        val summary = "RX MSG_CMD_HU_BT_OOB_INFO -> TX MSG_CMD_MD_BT_OOB_INFO (0x00010006)"
+        val summary = "RX MSG_CMD_HU_BT_OOB_INFO -> TX MSG_CMD_MD_BT_OOB_INFO (0x00018006)"
         _sessionState.update {
             it.copy(lastControlAction = summary)
         }
@@ -251,15 +245,15 @@ class CarLifeControlStateMachine(
     }
 
     private fun handleVideoEncoderStart(wireBytes: Int = 12): ControlTransitionResult {
-        // Send 0x0001800A (MSG_CMD_VIDEO_ENCODER_START_DONE) immediately, plus 0x0001000A
-        val startDonePrimary = CarLifeFrameCodec.createCommandFrame(
+        // Send 0x0001800A (MSG_CMD_VIDEO_ENCODER_START_DONE) + 0x00018025 (MSG_CMD_FOREGROUND)
+        val startDoneFrame = CarLifeFrameCodec.createCommandFrame(
             channel = CarLifeChannel.CONTROL,
-            serviceType = CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_DONE_ALT, // 0x0001800A
+            serviceType = CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_DONE, // 0x0001800A
             commandBody = ByteArray(0)
         )
-        val startDoneSecondary = CarLifeFrameCodec.createCommandFrame(
+        val foregroundFrame = CarLifeFrameCodec.createCommandFrame(
             channel = CarLifeChannel.CONTROL,
-            serviceType = CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_DONE, // 0x0001000A
+            serviceType = CarLifeMsgType.MSG_CMD_FOREGROUND, // 0x00018025
             commandBody = ByteArray(0)
         )
         val summary = "RX MSG_CMD_VIDEO_ENCODER_START (${wireBytes}B) -> TX START_DONE (0x0001800A) + SPS/PPS + IDR"
@@ -271,7 +265,7 @@ class CarLifeControlStateMachine(
         }
         return ControlTransitionResult(
             updatedState = _sessionState.value,
-            outboundFrames = listOf(startDonePrimary, startDoneSecondary),
+            outboundFrames = listOf(startDoneFrame, foregroundFrame),
             summary = summary
         )
     }
