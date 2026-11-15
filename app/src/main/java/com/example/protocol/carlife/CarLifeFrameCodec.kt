@@ -53,6 +53,7 @@ object CarLifeMsgType {
     const val MSG_CMD_PROTOCOL_VERSION_MATCH_STATUS = 0x00018002
     const val MSG_CMD_PROTOCOL_VERSION_MATCH_STATUS_ALT = 0x00010002
     const val MSG_CMD_HU_INFO = 0x00010003
+    const val MSG_CMD_MD_INFO_03 = 0x00018003
     const val MSG_CMD_HU_INFO_ALT = 0x00018003
     const val MSG_CMD_MD_INFO = 0x00018004
     const val MSG_CMD_MD_INFO_ALT = 0x00010004
@@ -102,9 +103,11 @@ object CarLifeMsgType {
     const val MSG_CMD_FOREGROUND_ALT = 0x00010025
     const val MSG_CMD_MODULE_CONTROL = 0x00018025
 
-    // Video Channel (0x0002) — H.264 NAL Stream & Heartbeat
-    const val MSG_VIDEO_DATA = 0x00020001
-    const val MSG_VIDEO_HEARTBEAT = 0x00020002
+    // Video Channel (0x0002) — H.264 NAL Stream & Heartbeat (MD -> HU bit 15 = 1: 0x00028001)
+    const val MSG_VIDEO_DATA = 0x00028001
+    const val MSG_VIDEO_DATA_ALT = 0x00020001
+    const val MSG_VIDEO_HEARTBEAT = 0x00028002
+    const val MSG_VIDEO_HEARTBEAT_ALT = 0x00020002
 
     // Audio Channels (0x0003..0x0005)
     const val MSG_MEDIA_INIT = 0x00030001
@@ -135,8 +138,8 @@ object CarLifeMsgType {
         MSG_CMD_HU_PROTOCOL_VERSION_ALT -> "MSG_CMD_HU_PROTOCOL_VERSION"
         MSG_CMD_PROTOCOL_VERSION_MATCH_STATUS,
         MSG_CMD_PROTOCOL_VERSION_MATCH_STATUS_ALT -> "MSG_CMD_PROTOCOL_VERSION_MATCH_STATUS"
-        MSG_CMD_HU_INFO,
-        MSG_CMD_HU_INFO_ALT -> "MSG_CMD_HU_INFO"
+        MSG_CMD_HU_INFO -> "MSG_CMD_HU_INFO"
+        MSG_CMD_MD_INFO_03,
         MSG_CMD_MD_INFO,
         MSG_CMD_MD_INFO_ALT -> "MSG_CMD_MD_INFO"
         MSG_CMD_HU_BT_OOB_INFO,
@@ -166,8 +169,10 @@ object CarLifeMsgType {
         MSG_CMD_GO_TO_FOREGROUND -> "MSG_CMD_GO_TO_FOREGROUND"
         MSG_CMD_MODULE_STATUS -> "MSG_CMD_MODULE_STATUS"
         MSG_CMD_STATISTIC_INFO -> "MSG_CMD_STATISTIC_INFO"
-        MSG_VIDEO_DATA -> "MSG_VIDEO_DATA"
-        MSG_VIDEO_HEARTBEAT -> "MSG_VIDEO_HEARTBEAT"
+        MSG_VIDEO_DATA,
+        MSG_VIDEO_DATA_ALT -> "MSG_VIDEO_DATA"
+        MSG_VIDEO_HEARTBEAT,
+        MSG_VIDEO_HEARTBEAT_ALT -> "MSG_VIDEO_HEARTBEAT"
         MSG_TOUCH_ACTION -> "MSG_TOUCH_ACTION"
         MSG_TOUCH_ACTION_DOWN -> "MSG_TOUCH_ACTION_DOWN"
         MSG_TOUCH_ACTION_UP -> "MSG_TOUCH_ACTION_UP"
@@ -227,10 +232,11 @@ data class CarLifeHeader(
     val channel: CarLifeChannel,
     val rawChannelId: Int = channel.id,
     val payloadLength: Int,
-    val timestamp: Long = 0L
+    val timestamp: Long = 0L,
+    val includeOuterTimestamp: Boolean = channel.hasTimestampHeader
 ) {
     val headerSizeBytes: Int
-        get() = channel.headerSizeBytes
+        get() = if (includeOuterTimestamp) CarLifeFrameCodec.MEDIA_HEADER_SIZE else CarLifeFrameCodec.STANDARD_HEADER_SIZE
 }
 
 /**
@@ -247,18 +253,20 @@ data class CarLifeFrame(
         get() = header.headerSizeBytes + payload.size
 
     /**
-     * Extracts the Control (`0x0001`) or Touch (`0x0006`) command from any Jetta VS7 / MQB frame format:
+     * Extracts the Control (`0x0001`), Touch (`0x0006`), or AOA 20B Video (`0x0002`) inner message:
      * 1. **12-byte wire frame (`payload.size == 4`)**:
      *    `bytes[8..11]` (`payload[0..3]`) is directly `serviceType` (`protoPayload = ByteArray(0)`).
      * 2. **16+ byte wire frame (`payload.size >= 8`)**:
-     *    Checks `word0 = bytes[8..11]` (`payload[0..3]`), `word1 = bytes[12..15]` (`payload[4..7]`),
-     *    and (when `payload.size >= 12`) `word2 = bytes[16..19]` (`payload[8..11]`):
-     *    - If `word0` starts with `0x0001xxxx` (or `0x0006xxxx`), `serviceType = word0`.
-     *    - Else if `word1` starts with `0x0001xxxx` (standard `[innerProtoLen: 4B][serviceId: 4B]`),
-     *      `serviceType = word1` and `innerProtoLen = word0` (clamped to `payload.size - 8`).
-     *    - Else if `payload.size >= 12` and `word2` starts with `0x0001xxxx` (12B media-style header
-     *      with 4B timestamp + 4B innerProtoLen + 4B serviceId), `serviceType = word2`.
-     *    - Never returns `null` for any Control frame with `payload.size >= 4`.
+     *    - Official Baidu CarLife 8-byte Inner Command Header:
+     *      - `payload[0..1]` (`wire bytes[8..9]`): `protoLen` (`UInt16` Big-Endian, e.g. `00 04`, `00 02`)
+     *      - `payload[2..3]` (`wire bytes[10..11]`): `reserved` (`UInt16` Big-Endian, `00 00`)
+     *      - `payload[4..7]` (`wire bytes[12..15]`): `serviceId` (`Int32` Big-Endian, e.g. `0x00010001`, `0x00018002`)
+     *      - `payload[8..N]` (`wire bytes[16..N]`): `protoBytes` (`protoLen` bytes)
+     *    - AOA 20B Video Message (`channel == VIDEO`, `payload.size >= 12`):
+     *      - `payload[0..3]`: `h264Data.size`
+     *      - `payload[4..7]`: `timestampMs`
+     *      - `payload[8..11]`: `0x00028001` (`MSG_VIDEO_DATA`)
+     *      - `payload[12..N]`: `h264Data`
      */
     fun parseCommandMessageOrNull(): CarLifeCommandMessage? {
         if (payload.isEmpty()) return null
@@ -282,16 +290,23 @@ data class CarLifeFrame(
             )
         }
 
-        // Case 2: payload.size >= 8 (wire frame >= 16 bytes)
-        // Official Baidu CarLife 8-byte Inner Command Header:
-        // - payload[0..1] (wire bytes[8..9]):   msgLen (UInt16 Big-Endian, e.g. 00 04, 00 02, 00 F2)
-        // - payload[2..3] (wire bytes[10..11]): reserved (UInt16 Big-Endian, 00 00)
-        // - payload[4..7] (wire bytes[12..15]): serviceType (Int32 Big-Endian, e.g. 0x00010001, 0x00018002)
-        // - payload[8..N] (wire bytes[16..N]):  Protobuf body (msgLen bytes)
         val u16MsgLen = buf.getShort(0).toInt() and 0xFFFF
         val u16Reserved = buf.getShort(2).toInt() and 0xFFFF
         val word1 = buf.getInt(4) // wire bytes[12..15]
         val word2 = if (payload.size >= 12) buf.getInt(8) else 0 // wire bytes[16..19]
+
+        // Special check for AOA 20B Video Packet: [nalSize:4B][timestampMs:4B][0x00028001:4B][h264Data]
+        if (channel == CarLifeChannel.VIDEO && payload.size >= 12 &&
+            (word2 == CarLifeMsgType.MSG_VIDEO_DATA || word2 == CarLifeMsgType.MSG_VIDEO_DATA_ALT)
+        ) {
+            val avail = payload.size - 12
+            val safeLen = if (word0 in 0..avail) word0 else avail
+            val body = if (safeLen > 0) payload.copyOfRange(12, 12 + safeLen) else ByteArray(0)
+            return CarLifeCommandMessage(
+                serviceType = word2,
+                body = body
+            )
+        }
 
         val word0IsService = CarLifeMsgType.isCarLifeServiceId(word0) && u16MsgLen == 0x0001
         val word1IsService = CarLifeMsgType.isCarLifeServiceId(word1)
@@ -326,7 +341,7 @@ data class CarLifeFrame(
                 )
             }
 
-            // Subcase 2C: 12-byte payload where bytes[8..11] is 4B timestamp, bytes[12..15] is innerLen, bytes[16..19] (word2) is serviceId
+            // Subcase 2C: 12-byte inner header where bytes[16..19] (word2) is serviceId
             word2IsService -> {
                 val avail = payload.size - 12
                 val innerU16Len = buf.getShort(4).toInt() and 0xFFFF
@@ -415,7 +430,7 @@ object CarLifeFrameCodec {
         val buffer = ByteBuffer.allocate(size).order(ByteOrder.BIG_ENDIAN)
         buffer.putInt(header.rawChannelId)
         buffer.putInt(header.payloadLength)
-        if (header.channel.hasTimestampHeader) {
+        if (header.includeOuterTimestamp) {
             buffer.putInt((header.timestamp and 0x7FFF_FFFFL).toInt())
         }
         return buffer.array()
@@ -425,7 +440,7 @@ object CarLifeFrameCodec {
         target.order(ByteOrder.BIG_ENDIAN)
         target.putInt(header.rawChannelId)
         target.putInt(header.payloadLength)
-        if (header.channel.hasTimestampHeader) {
+        if (header.includeOuterTimestamp) {
             target.putInt((header.timestamp and 0x7FFF_FFFFL).toInt())
         }
     }
@@ -506,6 +521,29 @@ object CarLifeFrameCodec {
 
     @Throws(CarLifeProtocolException::class)
     fun decodeFrame(rawBytes: ByteArray, offset: Int = 0): CarLifeFrame {
+        val base = decodeBaseHeader(rawBytes, offset)
+        val availableAfter8 = rawBytes.size - offset - STANDARD_HEADER_SIZE
+        // Detect AOA 20B Video frame: 8B outer header + (12 + h264Size) payload where bytes[16..19] == MSG_VIDEO_DATA
+        if (base.channel == CarLifeChannel.VIDEO &&
+            base.payloadLength >= 12 &&
+            availableAfter8 == base.payloadLength
+        ) {
+            val innerBuf = ByteBuffer.wrap(rawBytes, offset + STANDARD_HEADER_SIZE, 12).order(ByteOrder.BIG_ENDIAN)
+            val nalSize = innerBuf.int
+            val tsMs = innerBuf.int.toLong() and 0xFFFF_FFFFL
+            val serviceId = innerBuf.int
+            if (nalSize == base.payloadLength - 12 &&
+                (serviceId == CarLifeMsgType.MSG_VIDEO_DATA || serviceId == CarLifeMsgType.MSG_VIDEO_DATA_ALT)
+            ) {
+                val payload = ByteArray(base.payloadLength)
+                System.arraycopy(rawBytes, offset + STANDARD_HEADER_SIZE, payload, 0, base.payloadLength)
+                return CarLifeFrame(
+                    header = base.copy(timestamp = tsMs, includeOuterTimestamp = false),
+                    payload = payload
+                )
+            }
+        }
+
         val header = decodeHeader(rawBytes, offset)
         val headerSize = header.headerSizeBytes
         val availablePayload = rawBytes.size - offset - headerSize
@@ -612,14 +650,43 @@ object CarLifeFrameCodec {
         readFully(input, baseHeaderScratch, 0, STANDARD_HEADER_SIZE)
         val baseHeader = decodeBaseHeader(baseHeaderScratch, 0)
 
-        val fullHeader = if (baseHeader.channel.hasTimestampHeader) {
-            readFully(input, timestampScratch, 0, 4)
-            val ts = parseMediaTimestamp(timestampScratch, 0)
-            baseHeader.copy(timestamp = ts)
-        } else {
-            baseHeader
+        if (!baseHeader.channel.hasTimestampHeader) {
+            val payload = if (baseHeader.payloadLength > 0) {
+                ByteArray(baseHeader.payloadLength).also { buf ->
+                    readFully(input, buf, 0, baseHeader.payloadLength)
+                }
+            } else {
+                ByteArray(0)
+            }
+            return CarLifeFrame(header = baseHeader, payload = payload)
         }
 
+        // For VIDEO / AUDIO channels: read first 4 bytes after the 8-byte base header.
+        // In AOA 20B Video mode: bytes[8..11] = nalData.size (equals baseHeader.payloadLength - 12),
+        // bytes[12..15] = timestampMs, bytes[16..19] = MSG_VIDEO_DATA (0x00028001).
+        // In Legacy 12B Video / Audio mode: bytes[8..11] = timestampMs, followed by payloadLength bytes.
+        readFully(input, timestampScratch, 0, 4)
+        val wordAt8 = ByteBuffer.wrap(timestampScratch, 0, 4).order(ByteOrder.BIG_ENDIAN).int
+
+        if (baseHeader.channel == CarLifeChannel.VIDEO &&
+            baseHeader.payloadLength >= 12 &&
+            wordAt8 == baseHeader.payloadLength - 12
+        ) {
+            val fullPayload = ByteArray(baseHeader.payloadLength)
+            System.arraycopy(timestampScratch, 0, fullPayload, 0, 4)
+            readFully(input, fullPayload, 4, baseHeader.payloadLength - 4)
+            val ts = parseMediaTimestamp(fullPayload, 4)
+            val serviceId = ByteBuffer.wrap(fullPayload, 8, 4).order(ByteOrder.BIG_ENDIAN).int
+            if (serviceId == CarLifeMsgType.MSG_VIDEO_DATA || serviceId == CarLifeMsgType.MSG_VIDEO_DATA_ALT) {
+                return CarLifeFrame(
+                    header = baseHeader.copy(timestamp = ts, includeOuterTimestamp = false),
+                    payload = fullPayload
+                )
+            }
+        }
+
+        val ts = parseMediaTimestamp(timestampScratch, 0)
+        val fullHeader = baseHeader.copy(timestamp = ts, includeOuterTimestamp = true)
         val payload = if (fullHeader.payloadLength > 0) {
             ByteArray(fullHeader.payloadLength).also { buf ->
                 readFully(input, buf, 0, fullHeader.payloadLength)
@@ -654,6 +721,49 @@ object CarLifeFrameCodec {
     }
 
     /**
+     * Task 1 reference builder: Builds a complete USB AOA Control (`0x0001`) binary packet:
+     * - `Bytes [0..3]`: `0x00000001` (Channel ID = 1)
+     * - `Bytes [4..7]`: `8 + protoBytes.size` (AOA Payload Length)
+     * - `Bytes [8..9]`: `protoBytes.size.toShort()` (Protobuf length, STRICT 2 BYTES!)
+     * - `Bytes [10..11]`: `0x0000.toShort()` (Reserved, STRICT 2 BYTES `00 00`!)
+     * - `Bytes [12..15]`: `serviceId` (Service ID, e.g. `0x00018002`)
+     * - `Bytes [16..N]`: `protoBytes`
+     */
+    fun buildAoACmdPacket(serviceId: Int, protoBytes: ByteArray = ByteArray(0)): ByteArray {
+        val innerLen = 8 + protoBytes.size
+        return ByteBuffer.allocate(8 + innerLen).order(ByteOrder.BIG_ENDIAN).apply {
+            putInt(0x00000001)                  // Bytes [0..3]: Channel ID = 1 (CMD)
+            putInt(innerLen)                    // Bytes [4..7]: AOA Payload Length (8 + proto.size)
+            putShort(protoBytes.size.toShort()) // Bytes [8..9]: Protobuf length (STRICT 2 BYTES!)
+            putShort(0x0000.toShort())          // Bytes [10..11]: Reserved (STRICT 2 BYTES 00 00!)
+            putInt(serviceId)                   // Bytes [12..15]: Service ID (e.g. 0x00018002)
+            put(protoBytes)                     // Bytes [16..N]: Protobuf payload
+        }.array()
+    }
+
+    /**
+     * Task 2 reference builder: Builds a complete USB AOA Video (`0x0002`) binary packet with
+     * the 8-byte AOA transport header + 12-byte `CarlifeVideoMessage` header (`MSG_VIDEO_DATA = 0x00028001`):
+     * - `Bytes [0..3]`: `0x00000002` (Channel ID = 2)
+     * - `Bytes [4..7]`: `12 + h264Data.size` (AOA Payload Length)
+     * - `Bytes [8..11]`: `h264Data.size` (Size of H.264 NAL data)
+     * - `Bytes [12..15]`: `timestampMs` (Timestamp in ms)
+     * - `Bytes [16..19]`: `0x00028001` (`MSG_VIDEO_DATA`)
+     * - `Bytes [20..N]`: `h264Data` (Raw H.264 Annex-B `00 00 00 01 ...`)
+     */
+    fun buildAoAVideoPacket(h264Data: ByteArray, timestampMs: Int): ByteArray {
+        val innerLen = 12 + h264Data.size
+        return ByteBuffer.allocate(8 + innerLen).order(ByteOrder.BIG_ENDIAN).apply {
+            putInt(0x00000002)          // Bytes [0..3]: Channel ID = 2 (VIDEO)
+            putInt(innerLen)            // Bytes [4..7]: AOA Payload Length (12 + h264Data.size)
+            putInt(h264Data.size)       // Bytes [8..11]: Size of H.264 NAL data
+            putInt(timestampMs)         // Bytes [12..15]: Timestamp in ms
+            putInt(0x00028001)          // Bytes [16..19]: Service ID = MSG_VIDEO_DATA (0x00028001)
+            put(h264Data)               // Bytes [20..N]: Raw H.264 Annex-B (00 00 00 01 ...)
+        }.array()
+    }
+
+    /**
      * Packs a Control (`0x0001`) or Touch (`0x0006`) frame using the exact Baidu CarLife wire layout:
      * - Outer Channel Header (8 bytes):
      *   - `[0..3]` = `channel.id` (Big-Endian Int32, e.g. `0x00000001`)
@@ -676,7 +786,7 @@ object CarLifeFrameCodec {
         val innerPayload = ByteBuffer.allocate(8 + commandBody.size)
             .order(ByteOrder.BIG_ENDIAN)
             .putShort(commandBody.size.toShort())
-            .putShort(0.toShort())
+            .putShort(0x0000.toShort())
             .putInt(serviceType)
             .put(commandBody)
             .array()
@@ -686,7 +796,8 @@ object CarLifeFrameCodec {
                 channel = channel,
                 rawChannelId = channel.id,
                 payloadLength = innerPayload.size,
-                timestamp = 0L
+                timestamp = 0L,
+                includeOuterTimestamp = false
             ),
             payload = innerPayload
         )
@@ -694,37 +805,53 @@ object CarLifeFrameCodec {
 
     /**
      * Runtime toggle for Baidu CarLife Video Channel (`0x0002`) payload framing:
-     * - `false` (default): Raw H.264 Annex-B NAL payload immediately follows the 12-byte media header.
-     * - `true`: Prepends an 8-byte inner message header `[NAL_Length(4B)][MSG_VIDEO_DATA = 0x00020001(4B)]`
-     *   inside the `0x0002` payload (required by certain MIB/MQB CarLife head unit firmwares).
+     * - `true` (default — **AOA 20B (8B AOA + 12B 0x00028001)**):
+     *   Outer 8-byte AOA header `[0x00000002][12 + h264Data.size]` + Inner 12-byte `CarlifeVideoMessage`
+     *   header `[h264Data.size (4B)][timestampMs (4B)][MSG_VIDEO_DATA = 0x00028001 (4B)]` + `h264Data`.
+     * - `false` (**Legacy 12B**):
+     *   12-byte media header `[0x00000002][h264Data.size][timestampMs]` + `h264Data`.
      */
     @Volatile
-    var useNestedVideoMsgHeader: Boolean = false
+    var useNestedVideoMsgHeader: Boolean = true
 
     fun createVideoFrame(
         nalData: ByteArray,
         timestampMs: Long = (android.os.SystemClock.uptimeMillis().takeIf { it > 0L } ?: System.currentTimeMillis()) and 0x7FFF_FFFFL,
         nestedVideoMsgHeader: Boolean = useNestedVideoMsgHeader
     ): CarLifeFrame {
-        val framePayload = if (nestedVideoMsgHeader) {
-            ByteBuffer.allocate(8 + nalData.size)
+        val safeTs = timestampMs and 0x7FFF_FFFFL
+        return if (nestedVideoMsgHeader) {
+            // AOA 20B (8B AOA outer header + 12B CarlifeVideoMessage inner header with 0x00028001)
+            val innerVideoMsg = ByteBuffer.allocate(12 + nalData.size)
                 .order(ByteOrder.BIG_ENDIAN)
-                .putInt(nalData.size)
-                .putInt(CarLifeMsgType.MSG_VIDEO_DATA)
-                .put(nalData)
+                .putInt(nalData.size)                      // Bytes [8..11]: Size of H.264 NAL data
+                .putInt(safeTs.toInt())                    // Bytes [12..15]: Timestamp in ms
+                .putInt(CarLifeMsgType.MSG_VIDEO_DATA)     // Bytes [16..19]: 0x00028001 (MSG_VIDEO_DATA)
+                .put(nalData)                              // Bytes [20..N]: Raw H.264 Annex-B (00 00 00 01 ...)
                 .array()
+            CarLifeFrame(
+                header = CarLifeHeader(
+                    channel = CarLifeChannel.VIDEO,
+                    rawChannelId = CarLifeChannel.VIDEO.id, // Bytes [0..3]: 0x00000002
+                    payloadLength = innerVideoMsg.size,     // Bytes [4..7]: 12 + nalData.size
+                    timestamp = safeTs,
+                    includeOuterTimestamp = false           // 8B outer header + 12B inner header = 20B total header
+                ),
+                payload = innerVideoMsg
+            )
         } else {
-            nalData
+            // Legacy 12B: [0x00000002: 4B][nalData.size: 4B][timestampMs: 4B][nalData]
+            CarLifeFrame(
+                header = CarLifeHeader(
+                    channel = CarLifeChannel.VIDEO,
+                    rawChannelId = CarLifeChannel.VIDEO.id,
+                    payloadLength = nalData.size,
+                    timestamp = safeTs,
+                    includeOuterTimestamp = true
+                ),
+                payload = nalData
+            )
         }
-        return CarLifeFrame(
-            header = CarLifeHeader(
-                channel = CarLifeChannel.VIDEO,
-                rawChannelId = CarLifeChannel.VIDEO.id, // 0x00000002 Big-Endian
-                payloadLength = framePayload.size,      // Payload length ONLY (excluding 12B header)
-                timestamp = timestampMs and 0x7FFF_FFFFL // 4B Big-Endian uptimeMillis
-            ),
-            payload = framePayload
-        )
     }
 
     fun createAudioFrame(

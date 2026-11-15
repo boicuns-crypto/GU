@@ -26,7 +26,24 @@ import org.junit.Test
 class ExampleUnitTest {
 
     @Test
-    fun controlFrame_uses8ByteHeader_andRoundTripsCommand() {
+    fun controlFrame_uses8ByteOuterAnd2ByteInnerLenHeader_andRoundTripsCommand() {
+        val rawMatchPacket = CarLifeFrameCodec.buildAoACmdPacket(
+            serviceId = CarLifeMsgType.MSG_CMD_PROTOCOL_VERSION_MATCH_STATUS,
+            protoBytes = byteArrayOf(0x08, 0x01)
+        )
+        // Verify exact 18-byte layout: [00 00 00 01][00 00 00 0A][00 02][00 00][00 01 80 02][08 01]
+        assertArrayEquals(
+            byteArrayOf(
+                0x00, 0x00, 0x00, 0x01,
+                0x00, 0x00, 0x00, 0x0A,
+                0x00, 0x02,
+                0x00, 0x00,
+                0x00, 0x01, 0x80.toByte(), 0x02,
+                0x08, 0x01
+            ),
+            rawMatchPacket
+        )
+
         val protoPayload = CarlifeProtocolVersionProto(majorVersion = 2, minorVersion = 0).encode()
         val frame = CarLifeFrameCodec.createCommandFrame(
             channel = CarLifeChannel.CONTROL,
@@ -51,29 +68,50 @@ class ExampleUnitTest {
     }
 
     @Test
-    fun videoAndAudioFrames_use12ByteHeaderWithTimestamp() {
+    fun videoAndAudioFrames_supportBothAoA20BAndLegacy12BFraming() {
         val h264Nal = byteArrayOf(0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x2A)
         val timestamp = 0x12345678L
-        val videoFrame = CarLifeFrameCodec.createVideoFrame(
-            nalData = h264Nal,
-            timestampMs = timestamp
-        )
 
-        val encodedHeader = CarLifeFrameCodec.encodeHeader(videoFrame.header)
+        // 1. Default AOA 20B (8B AOA + 12B 0x00028001)
+        val aoa20Frame = CarLifeFrameCodec.createVideoFrame(
+            nalData = h264Nal,
+            timestampMs = timestamp,
+            nestedVideoMsgHeader = true
+        )
+        val expectedAoA20Bytes = CarLifeFrameCodec.buildAoAVideoPacket(h264Nal, timestamp.toInt())
+        assertArrayEquals(expectedAoA20Bytes, CarLifeFrameCodec.encodeFrame(aoa20Frame))
+
+        val outAoA = ByteArrayOutputStream()
+        CarLifeFrameCodec.writeFrame(outAoA, aoa20Frame)
+        val decodedAoA = CarLifeFrameCodec.readNextFrame(ByteArrayInputStream(outAoA.toByteArray()))
+        assertEquals(CarLifeChannel.VIDEO, decodedAoA.channel)
+        assertEquals(timestamp, decodedAoA.header.timestamp)
+        val parsedVideoMsg = decodedAoA.parseCommandMessageOrNull()
+        assertNotNull(parsedVideoMsg)
+        assertEquals(CarLifeMsgType.MSG_VIDEO_DATA, parsedVideoMsg!!.serviceType)
+        assertArrayEquals(h264Nal, parsedVideoMsg.body)
+
+        // 2. Legacy 12B
+        val legacyFrame = CarLifeFrameCodec.createVideoFrame(
+            nalData = h264Nal,
+            timestampMs = timestamp,
+            nestedVideoMsgHeader = false
+        )
+        val encodedHeader = CarLifeFrameCodec.encodeHeader(legacyFrame.header)
         assertEquals(12, encodedHeader.size)
 
-        val out = ByteArrayOutputStream()
-        CarLifeFrameCodec.writeFrame(out, videoFrame)
+        val outLegacy = ByteArrayOutputStream()
+        CarLifeFrameCodec.writeFrame(outLegacy, legacyFrame)
 
-        val decoded = CarLifeFrameCodec.readNextFrame(ByteArrayInputStream(out.toByteArray()))
-        assertEquals(CarLifeChannel.VIDEO, decoded.channel)
-        assertEquals(timestamp, decoded.header.timestamp)
-        assertArrayEquals(h264Nal, decoded.payload)
+        val decodedLegacy = CarLifeFrameCodec.readNextFrame(ByteArrayInputStream(outLegacy.toByteArray()))
+        assertEquals(CarLifeChannel.VIDEO, decodedLegacy.channel)
+        assertEquals(timestamp, decodedLegacy.header.timestamp)
+        assertArrayEquals(h264Nal, decodedLegacy.payload)
     }
 
     @Test
     fun controlStateMachine_negotiatesVersionAndVideoWithJettaVs7() {
-        val sm = CarLifeControlStateMachine(force60FpsOnMqb = true)
+        val sm = CarLifeControlStateMachine(force60FpsOnMqb = false)
 
         val versionFrame = CarLifeFrameCodec.createCommandFrame(
             channel = CarLifeChannel.CONTROL,
@@ -82,7 +120,7 @@ class ExampleUnitTest {
         )
         val step1 = sm.onControlFrame(versionFrame)
         assertEquals(CarLifeSessionPhase.VERSION_MATCHED, step1.updatedState.phase)
-        assertEquals(2, step1.outboundFrames.size)
+        assertEquals(3, step1.outboundFrames.size)
 
         val videoInitFrame = CarLifeFrameCodec.createCommandFrame(
             channel = CarLifeChannel.CONTROL,
@@ -90,10 +128,11 @@ class ExampleUnitTest {
             commandBody = CarlifeVideoEncoderInfoProto(width = 1280, height = 720, frameRate = 30).encode()
         )
         val step2 = sm.onControlFrame(videoInitFrame)
-        assertEquals(CarLifeSessionPhase.VIDEO_INITIALIZED, step2.updatedState.phase)
+        assertEquals(CarLifeSessionPhase.VIDEO_STREAMING, step2.updatedState.phase)
         assertEquals(1280, step2.updatedState.negotiatedVideoWidth)
         assertEquals(720, step2.updatedState.negotiatedVideoHeight)
-        assertEquals(60, step2.updatedState.negotiatedFps)
+        assertEquals(30, step2.updatedState.negotiatedFps)
+        assertEquals(4, step2.outboundFrames.size)
     }
 
     @Test
@@ -170,7 +209,7 @@ class ExampleUnitTest {
             nestedVideoMsgHeader = true
         )
         assertEquals(CarLifeChannel.VIDEO, nestedFrame.channel)
-        assertEquals(8 + h264Nal.size, nestedFrame.payload.size)
+        assertEquals(12 + h264Nal.size, nestedFrame.payload.size)
         val cmd = nestedFrame.parseCommandMessageOrNull()
         assertNotNull(cmd)
         assertEquals(CarLifeMsgType.MSG_VIDEO_DATA, cmd!!.serviceType)

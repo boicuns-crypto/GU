@@ -224,17 +224,24 @@ data class CarLifeRawPacket(
         }
 
     /**
-     * Parses the 8-byte inner command header (`[InnerLen: 4B][MsgType: 4B][Body: N bytes]`)
+     * Parses the 8-byte inner command header (`[InnerLen: 2B][Reserved: 2B (00 00)][MsgType: 4B][Body: N bytes]`)
      * used on `CHANNEL_CONTROL (1)` and `CHANNEL_TOUCH (6)`.
      */
     fun extractInnerCommandOrNull(): Pair<Int, ByteArray>? {
         if (payload.size < CarLifeProtocolConstants.INNER_CMD_HEADER_SIZE) return null
         val buf = ByteBuffer.wrap(payload).order(ByteOrder.BIG_ENDIAN)
-        val bodyLength = buf.int
-        val messageType = buf.int
-        if (bodyLength < 0 || bodyLength > payload.size - 8) return null
+        val u16Len = buf.getShort(0).toInt() and 0xFFFF
+        val u16Reserved = buf.getShort(2).toInt() and 0xFFFF
+        val word0 = buf.getInt(0)
+        val messageType = buf.getInt(4)
+        val avail = payload.size - 8
+        val bodyLength = when {
+            u16Reserved == 0 && u16Len in 0..avail -> u16Len
+            word0 in 0..avail -> word0
+            else -> return null
+        }
         val body = if (bodyLength > 0) {
-            ByteArray(bodyLength).also { buf.get(it) }
+            payload.copyOfRange(8, 8 + bodyLength)
         } else {
             ByteArray(0)
         }
@@ -266,7 +273,7 @@ object CarLifePacketBuilder {
 
     /**
      * Wraps a Control (`0x0001`) or Touch (`0x0006`) command into a `CarLifeRawPacket`
-     * with an 8-byte outer AOA header and an 8-byte inner `[BodyLen: 4B][MsgType: 4B]` header.
+     * with an 8-byte outer AOA header and an 8-byte inner `[BodyLen: 2B][Reserved: 2B][MsgType: 4B]` header.
      */
     fun buildCommandPacket(
         channelId: Int = CarLifeProtocolConstants.CHANNEL_CONTROL,
@@ -275,7 +282,8 @@ object CarLifePacketBuilder {
     ): CarLifeRawPacket {
         val innerPayload = ByteBuffer.allocate(8 + protobufBody.size)
             .order(ByteOrder.BIG_ENDIAN)
-            .putInt(protobufBody.size)
+            .putShort(protobufBody.size.toShort())
+            .putShort(0x0000.toShort())
             .putInt(messageType)
             .put(protobufBody)
             .array()

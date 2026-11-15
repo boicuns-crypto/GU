@@ -131,21 +131,28 @@ class CarLifeControlStateMachine(
 
     private fun handleProtocolVersion(body: ByteArray): ControlTransitionResult {
         val versionProto = CarlifeProtocolVersionProto.decode(body)
+        // protoBytes = [08 01] (field 1 varint = 1 MATCH_SUCCESS)
         val matchReplyProto = CarlifeProtocolVersionMatchStatusProto(
             matchStatus = CarlifeProtocolVersionMatchStatusProto.MATCH_SUCCESS
         )
         val replyFrame = CarLifeFrameCodec.createCommandFrame(
             channel = CarLifeChannel.CONTROL,
-            serviceType = CarLifeMsgType.MSG_CMD_PROTOCOL_VERSION_MATCH_STATUS,
+            serviceType = CarLifeMsgType.MSG_CMD_PROTOCOL_VERSION_MATCH_STATUS, // 0x00018002
             commandBody = matchReplyProto.encode()
         )
-        val mdInfoFrame = CarLifeFrameCodec.createCommandFrame(
+        val encodedMdInfo = mobileDeviceInfo.encode()
+        val mdInfo03Frame = CarLifeFrameCodec.createCommandFrame(
             channel = CarLifeChannel.CONTROL,
-            serviceType = CarLifeMsgType.MSG_CMD_MD_INFO,
-            commandBody = mobileDeviceInfo.encode()
+            serviceType = CarLifeMsgType.MSG_CMD_MD_INFO_03, // 0x00018003
+            commandBody = encodedMdInfo
+        )
+        val mdInfo04Frame = CarLifeFrameCodec.createCommandFrame(
+            channel = CarLifeChannel.CONTROL,
+            serviceType = CarLifeMsgType.MSG_CMD_MD_INFO, // 0x00018004
+            commandBody = encodedMdInfo
         )
 
-        val summary = "HU Protocol v${versionProto.majorVersion}.${versionProto.minorVersion} -> TX MATCH_STATUS(1) + MD_INFO(S26 Ultra)"
+        val summary = "HU Protocol v${versionProto.majorVersion}.${versionProto.minorVersion} -> TX MATCH_STATUS (0x00018002 [08 01]) + MD_INFO"
         _sessionState.update {
             it.copy(
                 phase = CarLifeSessionPhase.VERSION_MATCHED,
@@ -156,17 +163,23 @@ class CarLifeControlStateMachine(
         }
         return ControlTransitionResult(
             updatedState = _sessionState.value,
-            outboundFrames = listOf(replyFrame, mdInfoFrame),
+            outboundFrames = listOf(replyFrame, mdInfo03Frame, mdInfo04Frame),
             summary = summary
         )
     }
 
     private fun handleHuInfo(body: ByteArray): ControlTransitionResult {
         val huInfo = CarlifeDeviceInfoProto.decode(body)
-        val mdInfoFrame = CarLifeFrameCodec.createCommandFrame(
+        val encodedMdInfo = mobileDeviceInfo.encode()
+        val mdInfo03Frame = CarLifeFrameCodec.createCommandFrame(
             channel = CarLifeChannel.CONTROL,
-            serviceType = CarLifeMsgType.MSG_CMD_MD_INFO,
-            commandBody = mobileDeviceInfo.encode()
+            serviceType = CarLifeMsgType.MSG_CMD_MD_INFO_03, // 0x00018003
+            commandBody = encodedMdInfo
+        )
+        val mdInfo04Frame = CarLifeFrameCodec.createCommandFrame(
+            channel = CarLifeChannel.CONTROL,
+            serviceType = CarLifeMsgType.MSG_CMD_MD_INFO, // 0x00018004
+            commandBody = encodedMdInfo
         )
         val summary = "RX HU_INFO (${huInfo.manufacturer} ${huInfo.model}, OS=${huInfo.os}) -> TX MD_INFO (${mobileDeviceInfo.model})"
         _sessionState.update {
@@ -178,17 +191,18 @@ class CarLifeControlStateMachine(
         }
         return ControlTransitionResult(
             updatedState = _sessionState.value,
-            outboundFrames = listOf(mdInfoFrame),
+            outboundFrames = listOf(mdInfo03Frame, mdInfo04Frame),
             summary = summary
         )
     }
 
     private fun handleVideoEncoderInit(body: ByteArray): ControlTransitionResult {
         val requested = CarlifeVideoEncoderInfoProto.decode(body)
-        val negotiatedWidth = if (requested.width in 480..3840) requested.width else 1280
-        val negotiatedHeight = if (requested.height in 272..2160) requested.height else 720
-        val negotiatedFps = if (force60FpsOnMqb) 60 else if (requested.frameRate in 15..60) requested.frameRate else 30
+        val negotiatedWidth = if (force60FpsOnMqb && requested.width in 480..3840) requested.width else 1280
+        val negotiatedHeight = if (force60FpsOnMqb && requested.height in 272..2160) requested.height else 720
+        val negotiatedFps = if (force60FpsOnMqb) 60 else 30
 
+        // Protobuf: width=1280 (08 80 0A), height=720 (10 D0 05), frameRate=30 (18 1E)
         val negotiatedProto = CarlifeVideoEncoderInfoProto(
             width = negotiatedWidth,
             height = negotiatedHeight,
@@ -196,20 +210,32 @@ class CarLifeControlStateMachine(
         )
         val encodedNegotiated = negotiatedProto.encode()
 
-        // 1. Official MD -> HU MSG_CMD_VIDEO_ENCODER_INIT_DONE (0x00018008) with [00 08][00 00][00 01 80 08]
+        // 1. MSG_CMD_VIDEO_ENCODER_INIT_DONE (0x00018008) with [00 08][00 00][00 01 80 08][08 80 0A 10 D0 05 18 1E]
         val initDoneFrame = CarLifeFrameCodec.createCommandFrame(
             channel = CarLifeChannel.CONTROL,
-            serviceType = CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT_DONE,
+            serviceType = CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT_DONE, // 0x00018008
             commandBody = encodedNegotiated
         )
-        // 2. MSG_CMD_FOREGROUND (0x00018025, msgLen = 0) to notify HU that video source is active
+        // 2. MSG_CMD_VIDEO_ENCODER_START_DONE (0x0001800A)
+        val startDoneFrame = CarLifeFrameCodec.createCommandFrame(
+            channel = CarLifeChannel.CONTROL,
+            serviceType = CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_DONE, // 0x0001800A
+            commandBody = ByteArray(0)
+        )
+        // 3. MSG_CMD_FOREGROUND (0x00018025)
         val foregroundFrame = CarLifeFrameCodec.createCommandFrame(
             channel = CarLifeChannel.CONTROL,
-            serviceType = CarLifeMsgType.MSG_CMD_FOREGROUND,
+            serviceType = CarLifeMsgType.MSG_CMD_FOREGROUND, // 0x00018025
+            commandBody = ByteArray(0)
+        )
+        // 4. MSG_CMD_SCREEN_ON (0x00018018)
+        val screenOnFrame = CarLifeFrameCodec.createCommandFrame(
+            channel = CarLifeChannel.CONTROL,
+            serviceType = CarLifeMsgType.MSG_CMD_SCREEN_ON, // 0x00018018
             commandBody = ByteArray(0)
         )
 
-        val summary = "Video Init: ${negotiatedProto.width}x${negotiatedProto.height}@${negotiatedProto.frameRate}fps -> TX INIT_DONE (0x00018008) + FOREGROUND + H.264 Stream"
+        val summary = "Video Init: ${negotiatedProto.width}x${negotiatedProto.height}@${negotiatedProto.frameRate}fps -> TX INIT_DONE + START_DONE + FOREGROUND + SCREEN_ON"
         _sessionState.update {
             it.copy(
                 phase = CarLifeSessionPhase.VIDEO_STREAMING,
@@ -217,12 +243,13 @@ class CarLifeControlStateMachine(
                 negotiatedVideoHeight = negotiatedProto.height,
                 negotiatedFps = negotiatedProto.frameRate,
                 isHuForeground = true,
+                isHuScreenOn = true,
                 lastControlAction = summary
             )
         }
         return ControlTransitionResult(
             updatedState = _sessionState.value,
-            outboundFrames = listOf(initDoneFrame, foregroundFrame),
+            outboundFrames = listOf(initDoneFrame, startDoneFrame, foregroundFrame, screenOnFrame),
             summary = summary
         )
     }
@@ -245,7 +272,7 @@ class CarLifeControlStateMachine(
     }
 
     private fun handleVideoEncoderStart(wireBytes: Int = 12): ControlTransitionResult {
-        // Send 0x0001800A (MSG_CMD_VIDEO_ENCODER_START_DONE) + 0x00018025 (MSG_CMD_FOREGROUND)
+        // Send 0x0001800A (MSG_CMD_VIDEO_ENCODER_START_DONE) + 0x00018025 (MSG_CMD_FOREGROUND) + 0x00018018 (MSG_CMD_SCREEN_ON)
         val startDoneFrame = CarLifeFrameCodec.createCommandFrame(
             channel = CarLifeChannel.CONTROL,
             serviceType = CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_DONE, // 0x0001800A
@@ -256,16 +283,23 @@ class CarLifeControlStateMachine(
             serviceType = CarLifeMsgType.MSG_CMD_FOREGROUND, // 0x00018025
             commandBody = ByteArray(0)
         )
+        val screenOnFrame = CarLifeFrameCodec.createCommandFrame(
+            channel = CarLifeChannel.CONTROL,
+            serviceType = CarLifeMsgType.MSG_CMD_SCREEN_ON, // 0x00018018
+            commandBody = ByteArray(0)
+        )
         val summary = "RX MSG_CMD_VIDEO_ENCODER_START (${wireBytes}B) -> TX START_DONE (0x0001800A) + SPS/PPS + IDR"
         _sessionState.update {
             it.copy(
                 phase = CarLifeSessionPhase.VIDEO_STREAMING,
+                isHuForeground = true,
+                isHuScreenOn = true,
                 lastControlAction = summary
             )
         }
         return ControlTransitionResult(
             updatedState = _sessionState.value,
-            outboundFrames = listOf(startDoneFrame, foregroundFrame),
+            outboundFrames = listOf(startDoneFrame, foregroundFrame, screenOnFrame),
             summary = summary
         )
     }

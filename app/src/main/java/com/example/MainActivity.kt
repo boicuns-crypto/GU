@@ -361,7 +361,7 @@ fun CarLifeBridgeApp(
 
     var configuredWidth by rememberSaveable { mutableIntStateOf(1280) }
     var configuredHeight by rememberSaveable { mutableIntStateOf(720) }
-    var configuredBitrateMbps by rememberSaveable { mutableIntStateOf(8) }
+    var configuredBitrateMbps by rememberSaveable { mutableIntStateOf(4) }
 
     var checklistStatus by remember {
         mutableStateOf(
@@ -1267,14 +1267,16 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                 val rawHeader = CarLifeFrameCodec.encodeHeader(decoded.header)
                 val chHex = rawHeader.sliceArray(0..3).joinToString(" ") { "%02X".format(it) }
                 val lenHex = rawHeader.sliceArray(4..7).joinToString(" ") { "%02X".format(it) }
-                val tsPart = if (decoded.channel.hasTimestampHeader) {
+                val tsPart = if (decoded.header.includeOuterTimestamp && rawHeader.size >= 12) {
                     val tsHex = rawHeader.sliceArray(8..11).joinToString(" ") { "%02X".format(it) }
                     "\n• Bytes [8..11] Timestamp: [$tsHex] -> ${decoded.header.timestamp} ms"
+                } else if (decoded.channel == CarLifeChannel.VIDEO) {
+                    "\n• Video Framing: AOA 20B (8B AOA + 12B 0x00028001) | ts=${decoded.header.timestamp} ms"
                 } else {
                     "\n• Timestamp Field: Omitted (8-byte Standard Channel Header)"
                 }
                 val cmdSub = decoded.parseCommandMessageOrNull()?.let {
-                    "\n• Inner Cmd Header: len=${it.body.size}B | service=${it.serviceName} (0x${it.serviceType.toUInt().toString(16).uppercase().padStart(8, '0')})"
+                    "\n• Inner Header: len=${it.body.size}B | service=${it.serviceName} (0x${it.serviceType.toUInt().toString(16).uppercase().padStart(8, '0')})"
                 }.orEmpty()
 
                 buildString {
@@ -1320,20 +1322,28 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                         Text(
                             text = "Виртуальный экран ГУ (VirtualDisplay)",
                             style = MaterialTheme.typography.titleMedium,
-                            color = TextPrimary
+                            color = TextPrimary,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f)
                         )
+                        Spacer(modifier = Modifier.width(8.dp))
                         Surface(
                             color = if (state.projectionStats.isRunning) SuccessBadgeBg else ObsidianSurfaceHigh,
                             shape = RoundedCornerShape(8.dp)
                         ) {
                             Text(
                                 text = if (state.projectionStats.isRunning) {
-                                    "VD #${state.projectionStats.virtualDisplayId} АКТИВЕН"
+                                    "VD #${state.projectionStats.virtualDisplayId} • ON"
                                 } else {
-                                    "ОЖИДАНИЕ"
+                                    "VD • OFF"
                                 },
-                                style = MaterialTheme.typography.labelSmall,
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    fontWeight = FontWeight.SemiBold
+                                ),
                                 color = if (state.projectionStats.isRunning) SuccessBadgeFg else TextSecondary,
+                                softWrap = false,
+                                maxLines = 1,
                                 modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
                             )
                         }
@@ -1389,7 +1399,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
             }
         }
 
-        // 2. Настройки H.264 видеопотока (разрешение 1280x720 / 1920x1080, битрейт, 60 FPS)
+        // 2. Настройки H.264 видеопотока (разрешение 1280x720 / 1920x1080, битрейт, формат канала 0x0002)
         item {
             Card(
                 modifier = Modifier.fillMaxWidth(),
@@ -1411,17 +1421,21 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                         Text(
                             text = "Параметры видеопотока H.264",
                             style = MaterialTheme.typography.titleMedium,
-                            color = TextPrimary
+                            color = TextPrimary,
+                            modifier = Modifier.weight(1f)
                         )
+                        Spacer(modifier = Modifier.width(8.dp))
                         Surface(
                             color = ObsidianSurfaceHigh,
                             shape = RoundedCornerShape(8.dp),
                             border = BorderStroke(1.dp, ObsidianBorder)
                         ) {
                             Text(
-                                text = "60 FPS • Low-Latency",
+                                text = "Baseline L3.1 • 30 FPS",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = ElectricCyan,
+                                softWrap = false,
+                                maxLines = 1,
                                 modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
                             )
                         }
@@ -1454,7 +1468,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                     }
 
                     Text(
-                        text = "Битрейт аппаратного кодека (CBR)",
+                        text = "Битрейт аппаратного кодека (Baseline 0 B-frames)",
                         style = MaterialTheme.typography.labelMedium,
                         color = TextSecondary
                     )
@@ -1463,6 +1477,13 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
+                        SelectableOptionButton(
+                            label = "4 Мбит/с",
+                            selected = configuredBitrateMbps == 4,
+                            testTag = "bitrate_4m_btn",
+                            onClick = { onSelectBitrate(4) },
+                            modifier = Modifier.weight(1f)
+                        )
                         SelectableOptionButton(
                             label = "6 Мбит/с",
                             selected = configuredBitrateMbps == 6,
@@ -1477,66 +1498,53 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                             onClick = { onSelectBitrate(8) },
                             modifier = Modifier.weight(1f)
                         )
-                        SelectableOptionButton(
-                            label = "12 Мбит/с",
-                            selected = configuredBitrateMbps == 12,
-                            testTag = "bitrate_12m_btn",
-                            onClick = { onSelectBitrate(12) },
-                            modifier = Modifier.weight(1f)
-                        )
                     }
 
-                    Surface(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(10.dp))
-                            .clickable {
-                                val newMode = !CarLifeFrameCodec.useNestedVideoMsgHeader
-                                CarLifeFrameCodec.useNestedVideoMsgHeader = newMode
-                                BridgeTelemetryBus.updateState {
-                                    it.copy(
-                                        useNestedVideoMsgHeader = newMode,
-                                        lastProtocolEvent = if (newMode) {
-                                            "Video Framing: Nested MSG_VIDEO_DATA (0x00020001) + 12B Header"
-                                        } else {
-                                            "Video Framing: Standard 12B Media Header (Raw Annex-B NAL)"
-                                        }
-                                    )
-                                }
-                                if (state.isServiceRunning) {
-                                    val intent = Intent(context, BridgeForegroundService::class.java).apply {
-                                        action = BridgeForegroundService.ACTION_TOGGLE_VIDEO_HEADER_MODE
-                                    }
-                                    context.startService(intent)
-                                }
-                            }
-                            .testTag("toggle_video_header_mode_btn"),
-                        color = ObsidianSurfaceHigh,
-                        shape = RoundedCornerShape(10.dp),
-                        border = BorderStroke(1.dp, ObsidianBorder)
-                    ) {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = 12.dp, vertical = 10.dp),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(
-                                text = "Формат пакета канала 0x0002",
-                                style = MaterialTheme.typography.labelMedium,
-                                color = TextSecondary
-                            )
-                            Text(
-                                text = if (state.useNestedVideoMsgHeader) {
-                                    "Nested MSG_VIDEO_DATA"
+                    Text(
+                        text = "Инкапсуляция видеопакетов в канале 0x0002 (USB AOA)",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = TextSecondary
+                    )
+
+                    fun applyVideoHeaderMode(useAoA20B: Boolean) {
+                        CarLifeFrameCodec.useNestedVideoMsgHeader = useAoA20B
+                        BridgeTelemetryBus.updateState {
+                            it.copy(
+                                useNestedVideoMsgHeader = useAoA20B,
+                                lastProtocolEvent = if (useAoA20B) {
+                                    "Video 0x0002 Framing: AOA 20B (8B AOA + 12B 0x00028001) active"
                                 } else {
-                                    "Standard 12B Annex-B"
-                                },
-                                style = MaterialTheme.typography.labelMedium,
-                                color = ElectricCyan
+                                    "Video 0x0002 Framing: Legacy 12B (Raw Annex-B NAL) active"
+                                }
                             )
                         }
+                        if (state.isServiceRunning) {
+                            val intent = Intent(context, BridgeForegroundService::class.java).apply {
+                                action = BridgeForegroundService.ACTION_TOGGLE_VIDEO_HEADER_MODE
+                                putExtra(BridgeForegroundService.EXTRA_USE_NESTED_VIDEO_HEADER, useAoA20B)
+                            }
+                            context.startService(intent)
+                        }
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        SelectableOptionButton(
+                            label = "AOA 20B (8B AOA + 12B 0x00028001)",
+                            selected = state.useNestedVideoMsgHeader,
+                            testTag = "toggle_video_header_mode_btn",
+                            onClick = { applyVideoHeaderMode(true) },
+                            modifier = Modifier.weight(1.4f)
+                        )
+                        SelectableOptionButton(
+                            label = "Legacy 12B",
+                            selected = !state.useNestedVideoMsgHeader,
+                            testTag = "video_header_legacy_12b_btn",
+                            onClick = { applyVideoHeaderMode(false) },
+                            modifier = Modifier.weight(0.8f)
+                        )
                     }
                 }
             }

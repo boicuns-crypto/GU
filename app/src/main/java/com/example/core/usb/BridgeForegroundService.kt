@@ -212,15 +212,17 @@ class BridgeForegroundService : Service() {
                 val videoFrame = CarLifeFrameCodec.createVideoFrame(nalBytes, timestampMs)
                 val nalType = if (nalBytes.size > 4) (nalBytes[4].toInt() and 0x1F) else 0
                 val isSpsPps = nalType == 7 || nalType == 8
+                val isIdr = isKeyFrame || nalType == 5
                 serviceScope.launch {
-                    if (pktIndex <= 8L || isSpsPps) {
-                        // Send initial SPS/PPS and IDR packets immediately (chunked by 16,384B) and log them
+                    if (pktIndex <= 10L || isSpsPps || isIdr) {
+                        // Send SPS/PPS and IDR keyframes immediately (chunked by 16,384B) and log them
                         usbTransport.sendFrameImmediate(videoFrame)
                         val nalLabel = when {
                             isSpsPps -> "SPS/PPS (CODEC_CONFIG)"
-                            isKeyFrame || nalType == 5 -> "IDR KeyFrame #$pktIndex"
+                            isIdr -> "IDR KeyFrame #$pktIndex"
                             else -> "H.264 Slice #$pktIndex"
                         }
+                        val hdrMode = if (CarLifeFrameCodec.useNestedVideoMsgHeader) "AOA 20B" else "Legacy 12B"
                         BridgeTelemetryBus.recordFrame(
                             direction = "TX (S26U -> HU)",
                             frame = videoFrame,
@@ -228,7 +230,7 @@ class BridgeForegroundService : Service() {
                             txBytesTotal = usbTransport.txBytes,
                             rxFramesTotal = usbTransport.rxFrames,
                             txFramesTotal = usbTransport.txFrames,
-                            protocolNote = "TX H.264 Video (0x0002) $nalLabel (${nalBytes.size}B, 16KB-chunked, ts=${timestampMs}ms)",
+                            protocolNote = "TX H.264 Video (0x0002 $hdrMode) $nalLabel (${nalBytes.size}B, 16KB-chunked, ts=${timestampMs}ms)",
                             serviceNameOverride = nalLabel
                         )
                     } else {
@@ -448,16 +450,20 @@ class BridgeForegroundService : Service() {
             }
 
             ACTION_TOGGLE_VIDEO_HEADER_MODE -> {
-                val newMode = !CarLifeFrameCodec.useNestedVideoMsgHeader
+                val newMode = if (intent.hasExtra(EXTRA_USE_NESTED_VIDEO_HEADER)) {
+                    intent.getBooleanExtra(EXTRA_USE_NESTED_VIDEO_HEADER, true)
+                } else {
+                    !CarLifeFrameCodec.useNestedVideoMsgHeader
+                }
                 CarLifeFrameCodec.useNestedVideoMsgHeader = newMode
                 projectionManager.requestInstantIdrKeyFrame()
                 BridgeTelemetryBus.updateState {
                     it.copy(
                         useNestedVideoMsgHeader = newMode,
                         lastProtocolEvent = if (newMode) {
-                            "Video Framing: Nested MSG_VIDEO_DATA (0x00020001) + 12B Header enabled"
+                            "Video 0x0002 Framing: AOA 20B (8B AOA + 12B 0x00028001) active"
                         } else {
-                            "Video Framing: Standard 12B Media Header (Raw Annex-B NAL) enabled"
+                            "Video 0x0002 Framing: Legacy 12B (Raw Annex-B NAL) active"
                         }
                     )
                 }
@@ -781,6 +787,7 @@ class BridgeForegroundService : Service() {
         const val EXTRA_FPS = "extra_fps"
         const val EXTRA_TOUCH_X = "extra_touch_x"
         const val EXTRA_TOUCH_Y = "extra_touch_y"
+        const val EXTRA_USE_NESTED_VIDEO_HEADER = "extra_use_nested_video_header"
 
         fun grantMediaProjection(context: Context, resultCode: Int, resultData: Intent) {
             MediaProjectionTokenStore.saveToken(resultCode, resultData)

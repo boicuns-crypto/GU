@@ -133,7 +133,7 @@ data class ProjectionPipelineStats(
     val width: Int = 1280,
     val height: Int = 720,
     val fps: Int = 30,
-    val bitRateMbps: Int = 6,
+    val bitRateMbps: Int = 4,
     val encodedNalFrames: Long = 0L,
     val encodedBytes: Long = 0L,
     val spsPpsConfigured: Boolean = false,
@@ -189,7 +189,7 @@ class CockpitProjectionManager(
         width: Int = 1280,
         height: Int = 720,
         frameRate: Int = 30,
-        bitRate: Int = 2_500_000,
+        bitRate: Int = 4_000_000,
         densityDpi: Int = DisplayMetrics.DENSITY_XHIGH
     ): Boolean = projectionMutex.withLock {
         stopProjectionLocked()
@@ -643,16 +643,20 @@ class CockpitProjectionManager(
     }
 
     /**
-     * Immediately sends Packet #1 (`SPS + PPS` `BUFFER_FLAG_CODEC_CONFIG`) on channel `0x0002`
-     * and requests a fresh `IDR` sync frame from `MediaCodec`.
+     * Immediately sends Packet #1 (`SPS + PPS` `BUFFER_FLAG_CODEC_CONFIG`) on channel `0x0002`,
+     * sends the cached IDR keyframe if available, and requests a fresh `IDR` sync frame from `MediaCodec`.
      */
     fun requestInstantIdrKeyFrame() {
         val codec = mediaCodec ?: return
         val spsPps = cachedSpsPpsAnnexB
+        val idr = lastKeyFrameAnnexB
+        val tsMs = SystemClock.uptimeMillis() and 0x7FFF_FFFFL
         if (spsPps != null) {
-            val tsMs = SystemClock.uptimeMillis() and 0x7FFF_FFFFL
-            // Send standalone SPS + PPS packet immediately before the upcoming IDR keyframe
+            // Send standalone SPS + PPS packet immediately before the IDR keyframe
             onEncodedVideoNal(spsPps, tsMs, false)
+        }
+        if (idr != null) {
+            onEncodedVideoNal(idr, tsMs + 1L, true)
         }
         runCatching {
             val params = Bundle().apply {
@@ -870,7 +874,7 @@ class CockpitProjectionManager(
     ): MediaCodec {
         val codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
 
-        // Stage 1: Pure AVCProfileBaseline (1280x720 -> Level 3.1) + 0 B-frames + VBR
+        // Stage 1: Pure AVCProfileBaseline (0x01) + AVCLevel31 + KEY_MAX_B_FRAMES = 0 + KEY_REPEAT_PREVIOUS_FRAME_AFTER = 100_000L
         val baselineLevel31Format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
             setInteger(
                 MediaFormat.KEY_COLOR_FORMAT,
@@ -878,7 +882,7 @@ class CockpitProjectionManager(
             )
             setInteger(MediaFormat.KEY_BIT_RATE, bitRate)
             setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
             setInteger(
                 MediaFormat.KEY_PROFILE,
                 MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline
@@ -894,10 +898,10 @@ class CockpitProjectionManager(
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
             }
-            setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 1_000_000L / frameRate.coerceAtLeast(1))
+            setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000L)
         }
 
-        // Stage 2: Strict AVCProfileBaseline + Level 3.1 without optional VBR/B-frame keys
+        // Stage 2: Strict AVCProfileBaseline + Level 3.1 + KEY_REPEAT_PREVIOUS_FRAME_AFTER = 100_000L
         val baselineMinimalLevelFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
             setInteger(
                 MediaFormat.KEY_COLOR_FORMAT,
@@ -905,7 +909,7 @@ class CockpitProjectionManager(
             )
             setInteger(MediaFormat.KEY_BIT_RATE, bitRate)
             setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
             setInteger(
                 MediaFormat.KEY_PROFILE,
                 MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline
@@ -914,6 +918,7 @@ class CockpitProjectionManager(
                 MediaFormat.KEY_LEVEL,
                 MediaCodecInfo.CodecProfileLevel.AVCLevel31
             )
+            setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000L)
         }
 
         // Stage 3: Strict AVCProfileBaseline (auto-level selection by hardware codec)
@@ -924,11 +929,12 @@ class CockpitProjectionManager(
             )
             setInteger(MediaFormat.KEY_BIT_RATE, bitRate)
             setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
             setInteger(
                 MediaFormat.KEY_PROFILE,
                 MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline
             )
+            setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000L)
         }
 
         val candidates = listOf(
@@ -956,10 +962,11 @@ class CockpitProjectionManager(
             )
             setInteger(MediaFormat.KEY_BIT_RATE, bitRate)
             setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
             }
+            setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000L)
         }
         codec.reset()
         codec.configure(fallbackFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
@@ -1007,7 +1014,7 @@ class CockpitProjectionManager(
 
     private suspend fun CoroutineScope.drainHardwareEncoderLoop(codec: MediaCodec) {
         val bufferInfo = MediaCodec.BufferInfo()
-        var sentInitialCodecConfig = false
+        var spsPpsSentSinceLastSlice = false
 
         try {
             while (isActive && isEncoding.get()) {
@@ -1037,10 +1044,9 @@ class CockpitProjectionManager(
                         val spsPpsBytes = combined.toByteArray()
                         if (spsPpsBytes.isNotEmpty()) {
                             cachedSpsPpsAnnexB = spsPpsBytes
-                            if (!sentInitialCodecConfig) {
-                                sentInitialCodecConfig = true
+                            if (!spsPpsSentSinceLastSlice) {
+                                spsPpsSentSinceLastSlice = true
                                 val tsMs = SystemClock.uptimeMillis() and 0x7FFF_FFFFL
-                                // Send standalone SPS/PPS packet #1 (isKeyFrame = false so label is SPS/PPS)
                                 onEncodedVideoNal(spsPpsBytes, tsMs, false)
                                 _stats.update {
                                     it.copy(
@@ -1068,8 +1074,8 @@ class CockpitProjectionManager(
 
                             if (isCodecConfig) {
                                 cachedSpsPpsAnnexB = rawNal
-                                if (!sentInitialCodecConfig) {
-                                    sentInitialCodecConfig = true
+                                if (!spsPpsSentSinceLastSlice) {
+                                    spsPpsSentSinceLastSlice = true
                                     onEncodedVideoNal(rawNal, timestampMs, false)
                                     _stats.update {
                                         it.copy(
@@ -1107,9 +1113,9 @@ class CockpitProjectionManager(
 
                                 val pureSliceBytes = if (sliceOut.size() > 0) sliceOut.toByteArray() else rawNal
 
-                                // Always ensure standalone SPS+PPS packet is sent before the first frame (or if not yet sent)
-                                if (!sentInitialCodecConfig && cachedSpsPpsAnnexB != null) {
-                                    sentInitialCodecConfig = true
+                                // Task 3 requirement: Forcibly send cached SPS/PPS as a separate packet
+                                // immediately before EVERY key IDR frame!
+                                if (containsIdrNal && !spsPpsSentSinceLastSlice && cachedSpsPpsAnnexB != null) {
                                     val spsPps = cachedSpsPpsAnnexB!!
                                     onEncodedVideoNal(spsPps, timestampMs, false)
                                     _stats.update {
@@ -1125,8 +1131,9 @@ class CockpitProjectionManager(
                                     lastKeyFrameAnnexB = pureSliceBytes
                                 }
 
-                                // Send pure Annex-B slice (IDR or P-frame) with 12-byte 0x0002 header
+                                // Send pure Annex-B slice (IDR or P-frame) on channel 0x0002
                                 onEncodedVideoNal(pureSliceBytes, timestampMs, containsIdrNal)
+                                spsPpsSentSinceLastSlice = false
 
                                 _stats.update {
                                     it.copy(
