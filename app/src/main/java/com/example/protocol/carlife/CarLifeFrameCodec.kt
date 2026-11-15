@@ -805,51 +805,91 @@ object CarLifeFrameCodec {
 
     /**
      * Runtime toggle for Baidu CarLife Video Channel (`0x0002`) payload framing:
-     * - `true` (default — **AOA 20B (8B AOA + 12B 0x00028001)**):
-     *   Outer 8-byte AOA header `[0x00000002][12 + h264Data.size]` + Inner 12-byte `CarlifeVideoMessage`
-     *   header `[h264Data.size (4B)][timestampMs (4B)][MSG_VIDEO_DATA = 0x00028001 (4B)]` + `h264Data`.
-     * - `false` (**Legacy 12B**):
-     *   12-byte media header `[0x00000002][h264Data.size][timestampMs]` + `h264Data`.
+     * - `false` (default — **Strict 12-Byte `CarlifeVideoMessage` Wire Header**):
+     *   - `Bytes [0..3]`: `0x00000002` (Channel ID = 2)
+     *   - `Bytes [4..7]`: `h264Bytes.size` (Exact Annex-B byte length)
+     *   - `Bytes [8..11]`: `timestampMs` (4-byte Big-Endian `(SystemClock.uptimeMillis() and 0x7FFFFFFF).toInt()`)
+     *   - `Bytes [12..N]`: Raw H.264 Annex-B starting strictly with `00 00 00 01`!
+     * - `true` (Optional AOA 20B nested header for legacy testing):
+     *   8-byte outer header + 12-byte inner `[len][ts][0x00028001]` header.
      */
     @Volatile
-    var useNestedVideoMsgHeader: Boolean = true
+    var useNestedVideoMsgHeader: Boolean = false
+
+    /**
+     * Ensures an H.264 buffer starts with the 4-byte Annex-B start code `00 00 00 01`.
+     */
+    fun ensureAnnexBStartCode(nalData: ByteArray): ByteArray {
+        if (nalData.size >= 4 &&
+            nalData[0] == 0x00.toByte() &&
+            nalData[1] == 0x00.toByte() &&
+            nalData[2] == 0x00.toByte() &&
+            nalData[3] == 0x01.toByte()
+        ) {
+            return nalData
+        }
+        if (nalData.size >= 3 &&
+            nalData[0] == 0x00.toByte() &&
+            nalData[1] == 0x00.toByte() &&
+            nalData[2] == 0x01.toByte()
+        ) {
+            val fixed = ByteArray(nalData.size + 1)
+            fixed[0] = 0x00
+            fixed[1] = 0x00
+            fixed[2] = 0x00
+            fixed[3] = 0x01
+            System.arraycopy(nalData, 3, fixed, 4, nalData.size - 3)
+            return fixed
+        }
+        val prefixed = ByteArray(4 + nalData.size)
+        prefixed[0] = 0x00
+        prefixed[1] = 0x00
+        prefixed[2] = 0x00
+        prefixed[3] = 0x01
+        System.arraycopy(nalData, 0, prefixed, 4, nalData.size)
+        return prefixed
+    }
 
     fun createVideoFrame(
         nalData: ByteArray,
         timestampMs: Long = (android.os.SystemClock.uptimeMillis().takeIf { it > 0L } ?: System.currentTimeMillis()) and 0x7FFF_FFFFL,
         nestedVideoMsgHeader: Boolean = useNestedVideoMsgHeader
     ): CarLifeFrame {
+        val annexBData = ensureAnnexBStartCode(nalData)
         val safeTs = timestampMs and 0x7FFF_FFFFL
         return if (nestedVideoMsgHeader) {
-            // AOA 20B (8B AOA outer header + 12B CarlifeVideoMessage inner header with 0x00028001)
-            val innerVideoMsg = ByteBuffer.allocate(12 + nalData.size)
+            val innerVideoMsg = ByteBuffer.allocate(12 + annexBData.size)
                 .order(ByteOrder.BIG_ENDIAN)
-                .putInt(nalData.size)                      // Bytes [8..11]: Size of H.264 NAL data
-                .putInt(safeTs.toInt())                    // Bytes [12..15]: Timestamp in ms
-                .putInt(CarLifeMsgType.MSG_VIDEO_DATA)     // Bytes [16..19]: 0x00028001 (MSG_VIDEO_DATA)
-                .put(nalData)                              // Bytes [20..N]: Raw H.264 Annex-B (00 00 00 01 ...)
+                .putInt(annexBData.size)
+                .putInt(safeTs.toInt())
+                .putInt(CarLifeMsgType.MSG_VIDEO_DATA)
+                .put(annexBData)
                 .array()
             CarLifeFrame(
                 header = CarLifeHeader(
                     channel = CarLifeChannel.VIDEO,
-                    rawChannelId = CarLifeChannel.VIDEO.id, // Bytes [0..3]: 0x00000002
-                    payloadLength = innerVideoMsg.size,     // Bytes [4..7]: 12 + nalData.size
+                    rawChannelId = CarLifeChannel.VIDEO.id,
+                    payloadLength = innerVideoMsg.size,
                     timestamp = safeTs,
-                    includeOuterTimestamp = false           // 8B outer header + 12B inner header = 20B total header
+                    includeOuterTimestamp = false
                 ),
                 payload = innerVideoMsg
             )
         } else {
-            // Legacy 12B: [0x00000002: 4B][nalData.size: 4B][timestampMs: 4B][nalData]
+            // Strict 12-byte Video Header:
+            // Bytes [0..3]: 0x00000002 (Channel ID = 2)
+            // Bytes [4..7]: annexBData.size (Exact H.264 Annex-B length)
+            // Bytes [8..11]: timestampMs (4B Big-Endian)
+            // Bytes [12..N]: annexBData starting strictly with 00 00 00 01
             CarLifeFrame(
                 header = CarLifeHeader(
                     channel = CarLifeChannel.VIDEO,
                     rawChannelId = CarLifeChannel.VIDEO.id,
-                    payloadLength = nalData.size,
+                    payloadLength = annexBData.size,
                     timestamp = safeTs,
                     includeOuterTimestamp = true
                 ),
-                payload = nalData
+                payload = annexBData
             )
         }
     }

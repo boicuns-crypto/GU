@@ -361,7 +361,7 @@ fun CarLifeBridgeApp(
 
     var configuredWidth by rememberSaveable { mutableIntStateOf(1280) }
     var configuredHeight by rememberSaveable { mutableIntStateOf(720) }
-    var configuredBitrateMbps by rememberSaveable { mutableIntStateOf(4) }
+    var configuredBitrateMbps by rememberSaveable { mutableIntStateOf(2) }
 
     var checklistStatus by remember {
         mutableStateOf(
@@ -1206,6 +1206,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
     val scope = rememberCoroutineScope()
     val localStateMachine = remember { CarLifeControlStateMachine() }
     var diagnosticsExpanded by rememberSaveable { mutableStateOf(false) }
+    var filterCommandsAndRxOnly by rememberSaveable { mutableStateOf(true) }
     var lastDecodedBreakdown by remember {
         mutableStateOf(
             "Выберите тестовый вектор ниже для проверки бинарного кадра через CarLifeFrameCodec и декодер тачскрина."
@@ -1468,7 +1469,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                     }
 
                     Text(
-                        text = "Битрейт аппаратного кодека (Baseline 0 B-frames)",
+                        text = "Битрейт аппаратного кодека (Baseline 0 B-frames, IDR < 32 KB)",
                         style = MaterialTheme.typography.labelMedium,
                         color = TextSecondary
                     )
@@ -1477,6 +1478,13 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
+                        SelectableOptionButton(
+                            label = "2 Мбит/с",
+                            selected = configuredBitrateMbps == 2,
+                            testTag = "bitrate_2m_btn",
+                            onClick = { onSelectBitrate(2) },
+                            modifier = Modifier.weight(1f)
+                        )
                         SelectableOptionButton(
                             label = "4 Мбит/с",
                             selected = configuredBitrateMbps == 4,
@@ -1491,17 +1499,10 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                             onClick = { onSelectBitrate(6) },
                             modifier = Modifier.weight(1f)
                         )
-                        SelectableOptionButton(
-                            label = "8 Мбит/с",
-                            selected = configuredBitrateMbps == 8,
-                            testTag = "bitrate_8m_btn",
-                            onClick = { onSelectBitrate(8) },
-                            modifier = Modifier.weight(1f)
-                        )
                     }
 
                     Text(
-                        text = "Инкапсуляция видеопакетов в канале 0x0002 (USB AOA)",
+                        text = "Формат заголовка видеопакета 0x0002 (USB AOA)",
                         style = MaterialTheme.typography.labelMedium,
                         color = TextSecondary
                     )
@@ -1514,7 +1515,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                 lastProtocolEvent = if (useAoA20B) {
                                     "Video 0x0002 Framing: AOA 20B (8B AOA + 12B 0x00028001) active"
                                 } else {
-                                    "Video 0x0002 Framing: Legacy 12B (Raw Annex-B NAL) active"
+                                    "Video 0x0002 Framing: Strict 12B Header (00 00 00 01 Annex-B) active"
                                 }
                             )
                         }
@@ -1532,18 +1533,18 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         SelectableOptionButton(
-                            label = "AOA 20B (8B AOA + 12B 0x00028001)",
-                            selected = state.useNestedVideoMsgHeader,
-                            testTag = "toggle_video_header_mode_btn",
-                            onClick = { applyVideoHeaderMode(true) },
-                            modifier = Modifier.weight(1.4f)
-                        )
-                        SelectableOptionButton(
-                            label = "Legacy 12B",
+                            label = "12B Header (00 00 00 01 Annex-B)",
                             selected = !state.useNestedVideoMsgHeader,
                             testTag = "video_header_legacy_12b_btn",
                             onClick = { applyVideoHeaderMode(false) },
-                            modifier = Modifier.weight(0.8f)
+                            modifier = Modifier.weight(1.3f)
+                        )
+                        SelectableOptionButton(
+                            label = "AOA 20B (Nested)",
+                            selected = state.useNestedVideoMsgHeader,
+                            testTag = "toggle_video_header_mode_btn",
+                            onClick = { applyVideoHeaderMode(true) },
+                            modifier = Modifier.weight(0.9f)
                         )
                     }
                 }
@@ -1743,7 +1744,8 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                 Text(
                                     text = "Журнал бинарных пакетов (${state.packetLogs.size})",
                                     style = MaterialTheme.typography.labelLarge,
-                                    color = ElectricCyan
+                                    color = ElectricCyan,
+                                    modifier = Modifier.weight(1f)
                                 )
                                 IconButton(
                                     onClick = { BridgeTelemetryBus.clearLogs() },
@@ -1756,6 +1758,26 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                     )
                                 }
                             }
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                SelectableOptionButton(
+                                    label = "Только команды (0x0001 / RX)",
+                                    selected = filterCommandsAndRxOnly,
+                                    testTag = "filter_rx_commands_chip",
+                                    onClick = { filterCommandsAndRxOnly = !filterCommandsAndRxOnly },
+                                    modifier = Modifier.weight(1.35f)
+                                )
+                                SelectableOptionButton(
+                                    label = "Все пакеты",
+                                    selected = !filterCommandsAndRxOnly,
+                                    testTag = "filter_all_packets_chip",
+                                    onClick = { filterCommandsAndRxOnly = false },
+                                    modifier = Modifier.weight(0.65f)
+                                )
+                            }
                         }
                     }
                 }
@@ -1763,12 +1785,38 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
         }
 
         if (diagnosticsExpanded) {
-            if (state.packetLogs.isEmpty()) {
+            val displayedLogs = if (!filterCommandsAndRxOnly) {
+                state.packetLogs
+            } else {
+                val chronological = state.packetLogs.asReversed()
+                var seenFirstSpsPps = false
+                var seenFirstIdr = false
+                val keptIds = HashSet<Long>()
+                for (entry in chronological) {
+                    val isCmdOrRx = entry.channel == CarLifeChannel.CONTROL ||
+                        entry.direction.startsWith("RX")
+                    if (isCmdOrRx) {
+                        keptIds.add(entry.id)
+                    } else if (entry.channel == CarLifeChannel.VIDEO) {
+                        val svc = entry.serviceName.orEmpty()
+                        if (!seenFirstSpsPps && svc.startsWith("SPS/PPS")) {
+                            seenFirstSpsPps = true
+                            keptIds.add(entry.id)
+                        } else if (!seenFirstIdr && svc.startsWith("IDR")) {
+                            seenFirstIdr = true
+                            keptIds.add(entry.id)
+                        }
+                    }
+                }
+                state.packetLogs.filter { it.id in keptIds }
+            }
+
+            if (displayedLogs.isEmpty()) {
                 item {
                     EmptyPacketLogCard()
                 }
             } else {
-                items(state.packetLogs, key = { it.id }) { entry ->
+                items(displayedLogs, key = { it.id }) { entry ->
                     PacketLogItemCard(entry = entry)
                 }
             }

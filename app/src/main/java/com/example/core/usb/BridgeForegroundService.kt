@@ -109,6 +109,8 @@ object BridgeTelemetryBus {
     ) {
         val timeFmt = SimpleDateFormat("HH:mm:ss.SSS", Locale.US).format(Date())
         val cmdMsg = frame.parseCommandMessageOrNull()
+        val isRxOrControl = direction.startsWith("RX") || frame.channel == CarLifeChannel.CONTROL
+        val hexMaxBytes = if (isRxOrControl) 256 else 24
         val entry = PacketLogEntry(
             id = ++logSequence,
             timestampFormatted = timeFmt,
@@ -118,13 +120,25 @@ object BridgeTelemetryBus {
             payloadSizeBytes = frame.payload.size,
             mediaTimestampMs = frame.header.timestamp,
             serviceName = serviceNameOverride ?: cmdMsg?.serviceName,
-            hexPreview = CarLifeFrameCodec.formatHexPreview(frame, maxPayloadBytes = 16)
+            hexPreview = CarLifeFrameCodec.formatHexPreview(frame, maxPayloadBytes = hexMaxBytes)
         )
 
         _runtimeState.update { current ->
             val updatedChannelCounts = current.channelFrameCounts.toMutableMap()
             updatedChannelCounts[frame.channel] = (updatedChannelCounts[frame.channel] ?: 0L) + 1L
-            val updatedLogs = (listOf(entry) + current.packetLogs).take(60)
+            val combined = listOf(entry) + current.packetLogs
+            val updatedLogs = if (combined.size <= 120) {
+                combined
+            } else {
+                // Never evict 0x0001 (CMD) or RX packets because of TX video packets
+                val priorityEntries = combined.filter {
+                    it.channel == CarLifeChannel.CONTROL || it.direction.startsWith("RX")
+                }.take(100)
+                val otherEntries = combined.filterNot {
+                    it.channel == CarLifeChannel.CONTROL || it.direction.startsWith("RX")
+                }.take(120 - priorityEntries.size)
+                (priorityEntries + otherEntries).sortedByDescending { it.id }
+            }
             current.copy(
                 rxBytes = rxBytesTotal ?: current.rxBytes,
                 txBytes = txBytesTotal ?: current.txBytes,
@@ -192,6 +206,14 @@ class BridgeForegroundService : Service() {
 
     val controlStateMachine = CarLifeControlStateMachine()
     private val videoPacketCounter = java.util.concurrent.atomic.AtomicLong(0L)
+    private val loggedFirstSpsPps = java.util.concurrent.atomic.AtomicBoolean(false)
+    private val loggedFirstIdr = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    private fun resetVideoLogFlags() {
+        videoPacketCounter.set(0L)
+        loggedFirstSpsPps.set(false)
+        loggedFirstIdr.set(false)
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -211,18 +233,28 @@ class BridgeForegroundService : Service() {
                 val pktIndex = videoPacketCounter.incrementAndGet()
                 val videoFrame = CarLifeFrameCodec.createVideoFrame(nalBytes, timestampMs)
                 val nalType = if (nalBytes.size > 4) (nalBytes[4].toInt() and 0x1F) else 0
-                val isSpsPps = nalType == 7 || nalType == 8
                 val isIdr = isKeyFrame || nalType == 5
+                val isStandaloneSpsPps = !isIdr && (nalType == 7 || nalType == 8)
+                val shouldLogToUi = when {
+                    isStandaloneSpsPps -> loggedFirstSpsPps.compareAndSet(false, true)
+                    isIdr -> loggedFirstIdr.compareAndSet(false, true)
+                    else -> false
+                }
                 serviceScope.launch {
-                    if (pktIndex <= 10L || isSpsPps || isIdr) {
-                        // Send SPS/PPS and IDR keyframes immediately (chunked by 16,384B) and log them
+                    if (pktIndex <= 4L || isStandaloneSpsPps || isIdr) {
+                        // Send SPS/PPS and IDR keyframes immediately (chunked by 16,384B)
                         usbTransport.sendFrameImmediate(videoFrame)
+                    } else {
+                        usbTransport.sendFrame(videoFrame)
+                    }
+
+                    if (shouldLogToUi) {
                         val nalLabel = when {
-                            isSpsPps -> "SPS/PPS (CODEC_CONFIG)"
+                            isStandaloneSpsPps -> "SPS/PPS (CODEC_CONFIG)"
                             isIdr -> "IDR KeyFrame #$pktIndex"
                             else -> "H.264 Slice #$pktIndex"
                         }
-                        val hdrMode = if (CarLifeFrameCodec.useNestedVideoMsgHeader) "AOA 20B" else "Legacy 12B"
+                        val hdrMode = if (CarLifeFrameCodec.useNestedVideoMsgHeader) "AOA 20B" else "12B Header"
                         BridgeTelemetryBus.recordFrame(
                             direction = "TX (S26U -> HU)",
                             frame = videoFrame,
@@ -230,11 +262,10 @@ class BridgeForegroundService : Service() {
                             txBytesTotal = usbTransport.txBytes,
                             rxFramesTotal = usbTransport.rxFrames,
                             txFramesTotal = usbTransport.txFrames,
-                            protocolNote = "TX H.264 Video (0x0002 $hdrMode) $nalLabel (${nalBytes.size}B, 16KB-chunked, ts=${timestampMs}ms)",
+                            protocolNote = "TX H.264 Video (0x0002 $hdrMode) $nalLabel (${nalBytes.size}B, ts=${timestampMs}ms)",
                             serviceNameOverride = nalLabel
                         )
                     } else {
-                        usbTransport.sendFrame(videoFrame)
                         BridgeTelemetryBus.recordVideoFrameCountersOnly(
                             rxBytesTotal = usbTransport.rxBytes,
                             txBytesTotal = usbTransport.txBytes,
@@ -356,7 +387,7 @@ class BridgeForegroundService : Service() {
                     val targetH = session.negotiatedVideoHeight.coerceAtLeast(720)
                     val targetFps = session.negotiatedFps.coerceIn(30, 60)
                     serviceScope.launch {
-                        videoPacketCounter.set(0L)
+                        resetVideoLogFlags()
                         if (projectionManager.stats.value.isRunning) {
                             projectionManager.stopProjection()
                         }
@@ -379,7 +410,7 @@ class BridgeForegroundService : Service() {
                 val height = intent.getIntExtra(EXTRA_HEIGHT, 720)
                 val fps = intent.getIntExtra(EXTRA_FPS, 30)
                 serviceScope.launch {
-                    videoPacketCounter.set(0L)
+                    resetVideoLogFlags()
                     projectionManager.startProjection(
                         width = width,
                         height = height,
@@ -451,11 +482,12 @@ class BridgeForegroundService : Service() {
 
             ACTION_TOGGLE_VIDEO_HEADER_MODE -> {
                 val newMode = if (intent.hasExtra(EXTRA_USE_NESTED_VIDEO_HEADER)) {
-                    intent.getBooleanExtra(EXTRA_USE_NESTED_VIDEO_HEADER, true)
+                    intent.getBooleanExtra(EXTRA_USE_NESTED_VIDEO_HEADER, false)
                 } else {
                     !CarLifeFrameCodec.useNestedVideoMsgHeader
                 }
                 CarLifeFrameCodec.useNestedVideoMsgHeader = newMode
+                resetVideoLogFlags()
                 projectionManager.requestInstantIdrKeyFrame()
                 BridgeTelemetryBus.updateState {
                     it.copy(
@@ -463,7 +495,7 @@ class BridgeForegroundService : Service() {
                         lastProtocolEvent = if (newMode) {
                             "Video 0x0002 Framing: AOA 20B (8B AOA + 12B 0x00028001) active"
                         } else {
-                            "Video 0x0002 Framing: Legacy 12B (Raw Annex-B NAL) active"
+                            "Video 0x0002 Framing: Strict 12B Header (00 00 00 01 Annex-B) active"
                         }
                     )
                 }
@@ -537,7 +569,7 @@ class BridgeForegroundService : Service() {
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_RESET,
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_RESET_ALT -> {
                         val s = transition.updatedState
-                        videoPacketCounter.set(0L)
+                        resetVideoLogFlags()
                         // Start H.264 encoder & 0x0002 streaming IMMEDIATELY after MSG_CMD_VIDEO_ENCODER_INIT_DONE
                         projectionManager.startProjection(
                             width = s.negotiatedVideoWidth,
@@ -548,7 +580,7 @@ class BridgeForegroundService : Service() {
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START,
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_ALT -> {
                         val s = transition.updatedState
-                        videoPacketCounter.set(0L)
+                        resetVideoLogFlags()
                         if (!projectionManager.stats.value.isRunning) {
                             projectionManager.startProjection(
                                 width = s.negotiatedVideoWidth,

@@ -133,7 +133,7 @@ data class ProjectionPipelineStats(
     val width: Int = 1280,
     val height: Int = 720,
     val fps: Int = 30,
-    val bitRateMbps: Int = 4,
+    val bitRateMbps: Int = 2,
     val encodedNalFrames: Long = 0L,
     val encodedBytes: Long = 0L,
     val spsPpsConfigured: Boolean = false,
@@ -146,7 +146,7 @@ data class ProjectionPipelineStats(
 /**
  * Core 2 (`:core:projection`):
  * - Hardware H.264 `MediaCodec` (`COLOR_FormatSurface`) that immediately emits Packet #1 (`SPS+PPS`
- *   with `BUFFER_FLAG_CODEC_CONFIG`) followed by Packet #2 (`IDR` keyframe) into channel `0x0002`.
+ *   with `BUFFER_FLAG_CODEC_CONFIG`) followed by Packet #2 (`SPS+PPS+IDR` keyframe) into channel `0x0002`.
  * - Supports both `MediaProjection` full-screen mirroring and a guaranteed 33ms (30fps)
  *   `Canvas`-to-`Surface` Launcher generator so the Head Unit NEVER hangs at "Connecting... 90%"
  *   even if `MediaProjection` has not yet been started or `VirtualDisplay` has not rendered a frame.
@@ -189,7 +189,7 @@ class CockpitProjectionManager(
         width: Int = 1280,
         height: Int = 720,
         frameRate: Int = 30,
-        bitRate: Int = 4_000_000,
+        bitRate: Int = 2_000_000,
         densityDpi: Int = DisplayMetrics.DENSITY_XHIGH
     ): Boolean = projectionMutex.withLock {
         stopProjectionLocked()
@@ -644,7 +644,7 @@ class CockpitProjectionManager(
 
     /**
      * Immediately sends Packet #1 (`SPS + PPS` `BUFFER_FLAG_CODEC_CONFIG`) on channel `0x0002`,
-     * sends the cached IDR keyframe if available, and requests a fresh `IDR` sync frame from `MediaCodec`.
+     * sends the cached `SPS + PPS + IDR` keyframe if available, and requests a fresh `IDR` sync frame from `MediaCodec`.
      */
     fun requestInstantIdrKeyFrame() {
         val codec = mediaCodec ?: return
@@ -652,11 +652,13 @@ class CockpitProjectionManager(
         val idr = lastKeyFrameAnnexB
         val tsMs = SystemClock.uptimeMillis() and 0x7FFF_FFFFL
         if (spsPps != null) {
-            // Send standalone SPS + PPS packet immediately before the IDR keyframe
+            // 1. Send standalone 12-byte header SPS + PPS packet
             onEncodedVideoNal(spsPps, tsMs, false)
         }
         if (idr != null) {
-            onEncodedVideoNal(idr, tsMs + 1L, true)
+            // 2. Send IDR keyframe prefixed with SPS/PPS (spsPpsBytes + idrBytes)
+            val combinedIdr = if (spsPps != null) spsPps + idr else idr
+            onEncodedVideoNal(combinedIdr, tsMs + 1L, true)
         }
         runCatching {
             val params = Bundle().apply {
@@ -1113,33 +1115,43 @@ class CockpitProjectionManager(
 
                                 val pureSliceBytes = if (sliceOut.size() > 0) sliceOut.toByteArray() else rawNal
 
-                                // Task 3 requirement: Forcibly send cached SPS/PPS as a separate packet
-                                // immediately before EVERY key IDR frame!
-                                if (containsIdrNal && !spsPpsSentSinceLastSlice && cachedSpsPpsAnnexB != null) {
-                                    val spsPps = cachedSpsPpsAnnexB!!
-                                    onEncodedVideoNal(spsPps, timestampMs, false)
-                                    _stats.update {
-                                        it.copy(
-                                            spsPpsConfigured = true,
-                                            encodedNalFrames = it.encodedNalFrames + 1L,
-                                            encodedBytes = it.encodedBytes + spsPps.size
-                                        )
-                                    }
-                                }
-
                                 if (containsIdrNal) {
                                     lastKeyFrameAnnexB = pureSliceBytes
-                                }
+                                    val spsPps = cachedSpsPpsAnnexB
+                                    if (spsPps != null && !spsPpsSentSinceLastSlice) {
+                                        // 1. Send standalone 12-byte header SPS/PPS packet first
+                                        onEncodedVideoNal(spsPps, timestampMs, false)
+                                        _stats.update {
+                                            it.copy(
+                                                spsPpsConfigured = true,
+                                                encodedNalFrames = it.encodedNalFrames + 1L,
+                                                encodedBytes = it.encodedBytes + spsPps.size
+                                            )
+                                        }
+                                    }
+                                    // 2. Also prepend SPS/PPS directly to the IDR buffer (spsPpsBytes + idrBytes)
+                                    // so the Head Unit hardware decoder initializes immediately on any keyframe!
+                                    val idrWithSpsPps = if (spsPps != null) spsPps + pureSliceBytes else pureSliceBytes
+                                    onEncodedVideoNal(idrWithSpsPps, timestampMs, true)
+                                    spsPpsSentSinceLastSlice = false
 
-                                // Send pure Annex-B slice (IDR or P-frame) on channel 0x0002
-                                onEncodedVideoNal(pureSliceBytes, timestampMs, containsIdrNal)
-                                spsPpsSentSinceLastSlice = false
+                                    _stats.update {
+                                        it.copy(
+                                            encodedNalFrames = it.encodedNalFrames + 1L,
+                                            encodedBytes = it.encodedBytes + idrWithSpsPps.size
+                                        )
+                                    }
+                                } else {
+                                    // Non-keyframe P-slice
+                                    onEncodedVideoNal(pureSliceBytes, timestampMs, false)
+                                    spsPpsSentSinceLastSlice = false
 
-                                _stats.update {
-                                    it.copy(
-                                        encodedNalFrames = it.encodedNalFrames + 1L,
-                                        encodedBytes = it.encodedBytes + pureSliceBytes.size
-                                    )
+                                    _stats.update {
+                                        it.copy(
+                                            encodedNalFrames = it.encodedNalFrames + 1L,
+                                            encodedBytes = it.encodedBytes + pureSliceBytes.size
+                                        )
+                                    }
                                 }
                             }
                         }
