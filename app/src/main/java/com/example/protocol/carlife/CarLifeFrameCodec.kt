@@ -287,6 +287,7 @@ object CarLifeFrameCodec {
 
     const val STANDARD_HEADER_SIZE = 8
     const val MEDIA_HEADER_SIZE = 12
+    const val MAX_AOA_WRITE_SIZE = 16_384
     const val MAX_FRAME_PAYLOAD_SIZE = 8 * 1024 * 1024
 
     fun encodeHeader(header: CarLifeHeader): ByteArray {
@@ -447,6 +448,8 @@ object CarLifeFrameCodec {
 
     /**
      * Zero-allocation native `DirectByteBuffer` writer over a [FileChannel] (from `FileOutputStream.channel`).
+     * Strictly chunks every write syscall to [MAX_AOA_WRITE_SIZE] (16,384 bytes) to comply with
+     * the Linux kernel `f_accessory` (`/dev/usb_accessory`) bulk buffer limit.
      */
     @Throws(IOException::class)
     fun writeFrameDirect(
@@ -465,10 +468,18 @@ object CarLifeFrameCodec {
             directBuf.put(frame.payload)
             directBuf.flip()
             while (directBuf.hasRemaining()) {
-                val written = channel.write(directBuf)
-                if (written < 0) {
-                    throw EOFException("USB AOA FileChannel closed during write")
+                val remaining = directBuf.remaining()
+                val savedLimit = directBuf.limit()
+                if (remaining > MAX_AOA_WRITE_SIZE) {
+                    directBuf.limit(directBuf.position() + MAX_AOA_WRITE_SIZE)
                 }
+                while (directBuf.hasRemaining()) {
+                    val written = channel.write(directBuf)
+                    if (written < 0) {
+                        throw EOFException("USB AOA FileChannel closed during write")
+                    }
+                }
+                directBuf.limit(savedLimit)
             }
         } finally {
             DirectBufferPool.release(directBuf)
@@ -503,6 +514,11 @@ object CarLifeFrameCodec {
         return CarLifeFrame(header = fullHeader, payload = payload)
     }
 
+    /**
+     * Writes a complete [CarLifeFrame] to [output] (`FileOutputStream` for `/dev/usb_accessory`)
+     * in strict chunks of [MAX_AOA_WRITE_SIZE] (16,384 bytes / 16 KB) so the kernel `f_accessory`
+     * driver never drops or truncates keyframes larger than 16 KB.
+     */
     @Throws(IOException::class)
     fun writeFrame(output: OutputStream, frame: CarLifeFrame) {
         val headerWithActualLength = if (frame.header.payloadLength != frame.payload.size) {
@@ -510,14 +526,12 @@ object CarLifeFrameCodec {
         } else {
             frame.header
         }
-
-        if (frame.payload.size <= 16_384) {
-            val packetBytes = encodeFrame(frame.copy(header = headerWithActualLength))
-            output.write(packetBytes)
-        } else {
-            val headerBytes = encodeHeader(headerWithActualLength)
-            output.write(headerBytes)
-            output.write(frame.payload)
+        val fullPacket = encodeFrame(frame.copy(header = headerWithActualLength))
+        var offset = 0
+        while (offset < fullPacket.size) {
+            val chunk = minOf(MAX_AOA_WRITE_SIZE, fullPacket.size - offset)
+            output.write(fullPacket, offset, chunk)
+            offset += chunk
         }
         output.flush()
     }
@@ -618,10 +632,18 @@ object CarLifeFrameCodec {
     @Throws(IOException::class)
     private fun readChannelFully(channel: FileChannel, dst: ByteBuffer) {
         while (dst.hasRemaining()) {
-            val read = channel.read(dst)
-            if (read < 0) {
-                throw EOFException("USB AOA FileChannel closed while reading frame")
+            val remaining = dst.remaining()
+            val savedLimit = dst.limit()
+            if (remaining > MAX_AOA_WRITE_SIZE) {
+                dst.limit(dst.position() + MAX_AOA_WRITE_SIZE)
             }
+            while (dst.hasRemaining()) {
+                val read = channel.read(dst)
+                if (read < 0) {
+                    throw EOFException("USB AOA FileChannel closed while reading frame")
+                }
+            }
+            dst.limit(savedLimit)
         }
     }
 
@@ -629,7 +651,8 @@ object CarLifeFrameCodec {
     private fun readFully(input: InputStream, buffer: ByteArray, offset: Int, length: Int) {
         var totalRead = 0
         while (totalRead < length) {
-            val read = input.read(buffer, offset + totalRead, length - totalRead)
+            val chunkLen = minOf(MAX_AOA_WRITE_SIZE, length - totalRead)
+            val read = input.read(buffer, offset + totalRead, chunkLen)
             if (read < 0) {
                 throw EOFException(
                     "USB AOA stream closed while reading CarLife frame ($totalRead / $length bytes read)"

@@ -98,6 +98,7 @@ class UsbAccessoryTransport(
 
     private val lifecycleMutex = Mutex()
     private val writeMutex = Mutex()
+    private val usbWriteLock = Any()
     private val isReceiverRegistered = AtomicBoolean(false)
 
     private var parcelFd: ParcelFileDescriptor? = null
@@ -243,10 +244,10 @@ class UsbAccessoryTransport(
         Log.i(TAG, "Opened CarLife Direct-IO USB AOA session: ${info.manufacturer} ${info.model} (fd=$fdNum)")
 
         readJob = externalScope.launch(ioDispatcher) {
-            runDirectReadLoop(fis.channel)
+            runDirectReadLoop(fis)
         }
         writeJob = externalScope.launch(ioDispatcher) {
-            runDirectWriteLoop(fos.channel)
+            runDirectWriteLoop(fos)
         }
         return true
     }
@@ -260,15 +261,15 @@ class UsbAccessoryTransport(
     }
 
     suspend fun sendFrameImmediate(frame: CarLifeFrame): Boolean = withContext(ioDispatcher) {
-        val channel = outChannel ?: return@withContext false
+        val fos = fileOutputStream ?: return@withContext false
         writeMutex.withLock {
             try {
-                CarLifeFrameCodec.writeFrameDirect(channel, frame)
+                writeFrameChunked16K(fos, frame)
                 _txFrames.incrementAndGet()
                 _txBytes.addAndGet(frame.totalFrameBytes.toLong())
                 true
             } catch (e: IOException) {
-                Log.e(TAG, "USB AOA direct write failed on channel=${frame.channel}", e)
+                Log.e(TAG, "USB AOA chunked write failed on channel=${frame.channel}", e)
                 externalScope.launch { closeSession("USB write failure: ${e.message}") }
                 false
             }
@@ -276,17 +277,37 @@ class UsbAccessoryTransport(
     }
 
     /**
-     * Zero-allocation native `DirectByteBuffer` read loop over [FileChannel].
+     * Writes any CarLife frame to `/dev/usb_accessory` (`FileOutputStream`) in strict
+     * **16,384-byte (16 KB)** chunks inside `synchronized(usbWriteLock)` so the Linux kernel
+     * `f_accessory` driver never drops or truncates >16KB H.264 IDR keyframes.
      */
-    private suspend fun CoroutineScope.runDirectReadLoop(channel: FileChannel) {
-        val directHeaderScratch = ByteBuffer.allocateDirect(CarLifeFrameCodec.MEDIA_HEADER_SIZE)
-            .order(ByteOrder.BIG_ENDIAN)
+    @Throws(IOException::class)
+    private fun writeFrameChunked16K(usbOutputStream: FileOutputStream, frame: CarLifeFrame) {
+        val fullPacket = CarLifeFrameCodec.encodeFrame(frame)
+        synchronized(usbWriteLock) {
+            var offset = 0
+            while (offset < fullPacket.size) {
+                val chunk = minOf(MAX_AOA_WRITE_SIZE, fullPacket.size - offset)
+                usbOutputStream.write(fullPacket, offset, chunk)
+                offset += chunk
+            }
+            usbOutputStream.flush()
+        }
+    }
+
+    /**
+     * Chunk-safe read loop over [FileInputStream] (`<= 16,384` bytes per read syscall).
+     */
+    private suspend fun CoroutineScope.runDirectReadLoop(fis: FileInputStream) {
+        val baseHeaderScratch = ByteArray(CarLifeFrameCodec.STANDARD_HEADER_SIZE)
+        val timestampScratch = ByteArray(4)
 
         try {
             while (isActive) {
-                val frame = CarLifeFrameCodec.readNextFrameDirect(
-                    channel = channel,
-                    directHeaderBuffer = directHeaderScratch
+                val frame = CarLifeFrameCodec.readNextFrame(
+                    input = fis,
+                    baseHeaderScratch = baseHeaderScratch,
+                    timestampScratch = timestampScratch
                 )
                 _rxFrames.incrementAndGet()
                 _rxBytes.addAndGet(frame.totalFrameBytes.toLong())
@@ -295,14 +316,14 @@ class UsbAccessoryTransport(
         } catch (ce: CancellationException) {
             throw ce
         } catch (ioe: IOException) {
-            Log.w(TAG, "USB AOA bulk IN FileChannel terminated: ${ioe.message}")
+            Log.w(TAG, "USB AOA bulk IN stream terminated: ${ioe.message}")
             if (isActive) {
                 externalScope.launch {
                     closeSession("Head Unit stream closed (${ioe.javaClass.simpleName}: ${ioe.message})")
                 }
             }
         } catch (t: Throwable) {
-            Log.e(TAG, "Unexpected error in USB AOA direct read loop", t)
+            Log.e(TAG, "Unexpected error in USB AOA read loop", t)
             if (isActive) {
                 externalScope.launch {
                     closeSession("Fatal transport error: ${t.message}")
@@ -312,14 +333,14 @@ class UsbAccessoryTransport(
     }
 
     /**
-     * Zero-allocation native `DirectByteBuffer` write loop over [FileChannel].
+     * Chunk-safe write loop over [FileOutputStream] (`16,384`-byte chunks).
      */
-    private suspend fun CoroutineScope.runDirectWriteLoop(channel: FileChannel) {
+    private suspend fun CoroutineScope.runDirectWriteLoop(fos: FileOutputStream) {
         try {
             for (frame in outgoingQueue) {
                 if (!isActive) break
                 writeMutex.withLock {
-                    CarLifeFrameCodec.writeFrameDirect(channel, frame)
+                    writeFrameChunked16K(fos, frame)
                 }
                 _txFrames.incrementAndGet()
                 _txBytes.addAndGet(frame.totalFrameBytes.toLong())
@@ -327,7 +348,7 @@ class UsbAccessoryTransport(
         } catch (ce: CancellationException) {
             throw ce
         } catch (ioe: IOException) {
-            Log.w(TAG, "USB AOA bulk OUT FileChannel terminated: ${ioe.message}")
+            Log.w(TAG, "USB AOA bulk OUT stream terminated: ${ioe.message}")
             if (isActive) {
                 externalScope.launch {
                     closeSession("USB bulk OUT write error: ${ioe.message}")
@@ -418,6 +439,7 @@ class UsbAccessoryTransport(
     companion object {
         private const val TAG = "UsbAccessoryTransport"
         const val ACTION_USB_PERMISSION = "com.example.core.usb.ACTION_USB_PERMISSION"
+        const val MAX_AOA_WRITE_SIZE = 16_384
 
         val KNOWN_MANUFACTURERS = setOf(
             "Baidu",
