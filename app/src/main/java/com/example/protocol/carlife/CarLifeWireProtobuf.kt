@@ -304,9 +304,9 @@ data class CarlifeDeviceInfoProto(
  * - Field 3: `int32 frameRate` (e.g. 30 or 60)
  */
 data class CarlifeVideoEncoderInfoProto(
-    val width: Int = 1920,
-    val height: Int = 1080,
-    val frameRate: Int = 60
+    val width: Int = 1280,
+    val height: Int = 720,
+    val frameRate: Int = 30
 ) {
     fun encode(): ByteArray = CarLifeWireProtobuf.Writer(24)
         .writeVarintField(1, width)
@@ -316,9 +316,9 @@ data class CarlifeVideoEncoderInfoProto(
 
     companion object {
         fun decode(bytes: ByteArray): CarlifeVideoEncoderInfoProto {
-            var width = 1280
-            var height = 720
-            var fps = 60
+            var width = 0
+            var height = 0
+            var fps = 0
             val reader = CarLifeWireProtobuf.Reader(bytes)
             while (reader.readTag()) {
                 when (reader.lastFieldNumber) {
@@ -328,10 +328,13 @@ data class CarlifeVideoEncoderInfoProto(
                     else -> reader.skipField()
                 }
             }
+            val validWidth = if (width in 480..3840) width else 1280
+            val validHeight = if (height in 272..2160) height else 720
+            val validFps = if (fps in 15..60) fps else 30
             return CarlifeVideoEncoderInfoProto(
-                width = width.coerceIn(480, 3840),
-                height = height.coerceIn(272, 2160),
-                frameRate = fps.coerceIn(15, 60)
+                width = validWidth,
+                height = validHeight,
+                frameRate = validFps
             )
         }
     }
@@ -342,7 +345,7 @@ data class CarlifeVideoEncoderInfoProto(
  * - Field 1: `int32 frameRate`
  */
 data class CarlifeVideoFrameRateProto(
-    val frameRate: Int = 60
+    val frameRate: Int = 30
 ) {
     fun encode(): ByteArray = CarLifeWireProtobuf.Writer(8)
         .writeVarintField(1, frameRate)
@@ -350,7 +353,7 @@ data class CarlifeVideoFrameRateProto(
 
     companion object {
         fun decode(bytes: ByteArray): CarlifeVideoFrameRateProto {
-            var fps = 60
+            var fps = 30
             val reader = CarLifeWireProtobuf.Reader(bytes)
             while (reader.readTag()) {
                 when (reader.lastFieldNumber) {
@@ -358,7 +361,7 @@ data class CarlifeVideoFrameRateProto(
                     else -> reader.skipField()
                 }
             }
-            return CarlifeVideoFrameRateProto(fps.coerceIn(15, 60))
+            return CarlifeVideoFrameRateProto(if (fps in 15..60) fps else 30)
         }
     }
 }

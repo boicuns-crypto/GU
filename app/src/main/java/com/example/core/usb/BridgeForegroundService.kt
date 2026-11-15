@@ -104,7 +104,8 @@ object BridgeTelemetryBus {
         txBytesTotal: Long? = null,
         rxFramesTotal: Long? = null,
         txFramesTotal: Long? = null,
-        protocolNote: String? = null
+        protocolNote: String? = null,
+        serviceNameOverride: String? = null
     ) {
         val timeFmt = SimpleDateFormat("HH:mm:ss.SSS", Locale.US).format(Date())
         val cmdMsg = frame.parseCommandMessageOrNull()
@@ -116,7 +117,7 @@ object BridgeTelemetryBus {
             headerSizeBytes = frame.header.headerSizeBytes,
             payloadSizeBytes = frame.payload.size,
             mediaTimestampMs = frame.header.timestamp,
-            serviceName = cmdMsg?.serviceName,
+            serviceName = serviceNameOverride ?: cmdMsg?.serviceName,
             hexPreview = CarLifeFrameCodec.formatHexPreview(frame, maxPayloadBytes = 16)
         )
 
@@ -132,6 +133,26 @@ object BridgeTelemetryBus {
                 channelFrameCounts = updatedChannelCounts,
                 packetLogs = updatedLogs,
                 lastProtocolEvent = protocolNote ?: current.lastProtocolEvent
+            )
+        }
+    }
+
+    fun recordVideoFrameCountersOnly(
+        rxBytesTotal: Long? = null,
+        txBytesTotal: Long? = null,
+        rxFramesTotal: Long? = null,
+        txFramesTotal: Long? = null
+    ) {
+        _runtimeState.update { current ->
+            val updatedChannelCounts = current.channelFrameCounts.toMutableMap()
+            updatedChannelCounts[CarLifeChannel.VIDEO] =
+                (updatedChannelCounts[CarLifeChannel.VIDEO] ?: 0L) + 1L
+            current.copy(
+                rxBytes = rxBytesTotal ?: current.rxBytes,
+                txBytes = txBytesTotal ?: current.txBytes,
+                rxFrames = rxFramesTotal ?: current.rxFrames,
+                txFrames = txFramesTotal ?: current.txFrames,
+                channelFrameCounts = updatedChannelCounts
             )
         }
     }
@@ -170,6 +191,7 @@ class BridgeForegroundService : Service() {
         private set
 
     val controlStateMachine = CarLifeControlStateMachine()
+    private val videoPacketCounter = java.util.concurrent.atomic.AtomicLong(0L)
 
     override fun onCreate() {
         super.onCreate()
@@ -184,11 +206,38 @@ class BridgeForegroundService : Service() {
 
         projectionManager = CockpitProjectionManager(
             context = applicationContext,
-            onEncodedVideoNal = { nalBytes, timestampMs, _ ->
-                // Forward H.264 NAL units directly into the active USB AOA transport
+            onEncodedVideoNal = { nalBytes, timestampMs, isKeyFrame ->
+                // Forward H.264 NAL units directly into the active USB AOA transport on channel 0x0002
+                val pktIndex = videoPacketCounter.incrementAndGet()
                 val videoFrame = CarLifeFrameCodec.createVideoFrame(nalBytes, timestampMs)
                 serviceScope.launch {
-                    usbTransport.sendFrame(videoFrame)
+                    if (pktIndex <= 8L) {
+                        // Send initial SPS/PPS and IDR packets immediately and log them in the Binary Packet Log
+                        usbTransport.sendFrameImmediate(videoFrame)
+                        val nalLabel = when {
+                            pktIndex == 1L -> "SPS/PPS (CODEC_CONFIG)"
+                            isKeyFrame -> "IDR KeyFrame #$pktIndex"
+                            else -> "H.264 Slice #$pktIndex"
+                        }
+                        BridgeTelemetryBus.recordFrame(
+                            direction = "TX (S26U -> HU)",
+                            frame = videoFrame,
+                            rxBytesTotal = usbTransport.rxBytes,
+                            txBytesTotal = usbTransport.txBytes,
+                            rxFramesTotal = usbTransport.rxFrames,
+                            txFramesTotal = usbTransport.txFrames,
+                            protocolNote = "TX H.264 Video (0x0002) $nalLabel (${nalBytes.size}B, ts=${timestampMs}ms)",
+                            serviceNameOverride = nalLabel
+                        )
+                    } else {
+                        usbTransport.sendFrame(videoFrame)
+                        BridgeTelemetryBus.recordVideoFrameCountersOnly(
+                            rxBytesTotal = usbTransport.rxBytes,
+                            txBytesTotal = usbTransport.txBytes,
+                            rxFramesTotal = usbTransport.rxFrames,
+                            txFramesTotal = usbTransport.txFrames
+                        )
+                    }
                 }
             },
             externalScope = serviceScope
@@ -303,6 +352,7 @@ class BridgeForegroundService : Service() {
                     val targetH = session.negotiatedVideoHeight.coerceAtLeast(720)
                     val targetFps = session.negotiatedFps.coerceIn(30, 60)
                     serviceScope.launch {
+                        videoPacketCounter.set(0L)
                         if (projectionManager.stats.value.isRunning) {
                             projectionManager.stopProjection()
                         }
@@ -324,13 +374,15 @@ class BridgeForegroundService : Service() {
             ACTION_START_PROJECTION -> {
                 val width = intent.getIntExtra(EXTRA_WIDTH, 1280)
                 val height = intent.getIntExtra(EXTRA_HEIGHT, 720)
-                val fps = intent.getIntExtra(EXTRA_FPS, 60)
+                val fps = intent.getIntExtra(EXTRA_FPS, 30)
                 serviceScope.launch {
+                    videoPacketCounter.set(0L)
                     projectionManager.startProjection(
                         width = width,
                         height = height,
                         frameRate = fps
                     )
+                    projectionManager.requestInstantIdrKeyFrame()
                 }
             }
 
@@ -475,16 +527,23 @@ class BridgeForegroundService : Service() {
                 val cmd = frame.parseCommandMessageOrNull()
                 when (cmd?.serviceType) {
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT,
+                    CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT_ALT,
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_RESET -> {
                         val s = transition.updatedState
+                        videoPacketCounter.set(0L)
+                        // Start H.264 encoder & 0x0002 streaming IMMEDIATELY after MSG_CMD_VIDEO_ENCODER_INIT_DONE
+                        // without waiting for MSG_CMD_VIDEO_ENCODER_START (fixes 90% hang on MQB Head Units)
                         projectionManager.startProjection(
                             width = s.negotiatedVideoWidth,
                             height = s.negotiatedVideoHeight,
                             frameRate = s.negotiatedFps
                         )
+                        projectionManager.requestInstantIdrKeyFrame()
                     }
-                    CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START -> {
+                    CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START,
+                    CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_ALT -> {
                         val s = transition.updatedState
+                        videoPacketCounter.set(0L)
                         if (!projectionManager.stats.value.isRunning) {
                             projectionManager.startProjection(
                                 width = s.negotiatedVideoWidth,

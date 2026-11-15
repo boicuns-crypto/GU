@@ -53,8 +53,13 @@ object CarLifeMsgType {
     const val MSG_CMD_HU_BT_OOB_INFO = 0x00018005
     const val MSG_CMD_MD_BT_OOB_INFO = 0x00010006
     const val MSG_CMD_VIDEO_ENCODER_INIT = 0x00018007
+    const val MSG_CMD_VIDEO_ENCODER_INIT_ALT = 0x00010007
     const val MSG_CMD_VIDEO_ENCODER_INIT_DONE = 0x00010008
+    const val MSG_CMD_VIDEO_ENCODER_INIT_DONE_ALT = 0x00018008
     const val MSG_CMD_VIDEO_ENCODER_START = 0x00018009
+    const val MSG_CMD_VIDEO_ENCODER_START_ALT = 0x00010009
+    const val MSG_CMD_VIDEO_ENCODER_START_DONE = 0x0001000A
+    const val MSG_CMD_VIDEO_ENCODER_START_DONE_ALT = 0x0001800A
     const val MSG_CMD_VIDEO_ENCODER_PAUSE = 0x0001800A
     const val MSG_CMD_VIDEO_ENCODER_RESET = 0x0001800B
     const val MSG_CMD_VIDEO_ENCODER_FRAME_RATE_CHANGE = 0x0001800C
@@ -72,7 +77,7 @@ object CarLifeMsgType {
     const val MSG_CMD_SCREEN_ON = 0x00018018
     const val MSG_CMD_SCREEN_OFF = 0x00018019
     const val MSG_CMD_SCREEN_USER_PRESENT = 0x0001801A
-    const val MSG_CMD_FOREGROUND = 0x0001801B
+    const val MSG_CMD_FOREGROUND_LEGACY = 0x0001801B
     const val MSG_CMD_BACKGROUND = 0x0001801C
     const val MSG_CMD_GO_TO_DESKTOP = 0x0001801E
     const val MSG_CMD_MIC_RECORD_WAKEUP_START = 0x0001801F
@@ -81,6 +86,7 @@ object CarLifeMsgType {
     const val MSG_CMD_GO_TO_FOREGROUND = 0x00018022
     const val MSG_CMD_MODULE_STATUS = 0x00018023
     const val MSG_CMD_STATISTIC_INFO = 0x00018024
+    const val MSG_CMD_FOREGROUND = 0x00018025
     const val MSG_CMD_MODULE_CONTROL = 0x00018025
 
     // Video Channel (0x0002) — H.264 NAL Stream & Heartbeat
@@ -112,16 +118,21 @@ object CarLifeMsgType {
         MSG_CMD_MD_INFO -> "MSG_CMD_MD_INFO"
         MSG_CMD_HU_BT_OOB_INFO -> "MSG_CMD_HU_BT_OOB_INFO"
         MSG_CMD_MD_BT_OOB_INFO -> "MSG_CMD_MD_BT_OOB_INFO"
-        MSG_CMD_VIDEO_ENCODER_INIT -> "MSG_CMD_VIDEO_ENCODER_INIT"
-        MSG_CMD_VIDEO_ENCODER_INIT_DONE -> "MSG_CMD_VIDEO_ENCODER_INIT_DONE"
-        MSG_CMD_VIDEO_ENCODER_START -> "MSG_CMD_VIDEO_ENCODER_START"
+        MSG_CMD_VIDEO_ENCODER_INIT,
+        MSG_CMD_VIDEO_ENCODER_INIT_ALT -> "MSG_CMD_VIDEO_ENCODER_INIT"
+        MSG_CMD_VIDEO_ENCODER_INIT_DONE,
+        MSG_CMD_VIDEO_ENCODER_INIT_DONE_ALT -> "MSG_CMD_VIDEO_ENCODER_INIT_DONE"
+        MSG_CMD_VIDEO_ENCODER_START,
+        MSG_CMD_VIDEO_ENCODER_START_ALT -> "MSG_CMD_VIDEO_ENCODER_START"
+        MSG_CMD_VIDEO_ENCODER_START_DONE -> "MSG_CMD_VIDEO_ENCODER_START_DONE"
         MSG_CMD_VIDEO_ENCODER_PAUSE -> "MSG_CMD_VIDEO_ENCODER_PAUSE"
         MSG_CMD_VIDEO_ENCODER_RESET -> "MSG_CMD_VIDEO_ENCODER_RESET"
         MSG_CMD_VIDEO_ENCODER_FRAME_RATE_CHANGE -> "MSG_CMD_VIDEO_ENCODER_FRAME_RATE_CHANGE"
         MSG_CMD_VIDEO_ENCODER_FRAME_RATE_CHANGE_DONE -> "MSG_CMD_VIDEO_ENCODER_FRAME_RATE_CHANGE_DONE"
         MSG_CMD_SCREEN_ON -> "MSG_CMD_SCREEN_ON"
         MSG_CMD_SCREEN_OFF -> "MSG_CMD_SCREEN_OFF"
-        MSG_CMD_FOREGROUND -> "MSG_CMD_FOREGROUND"
+        MSG_CMD_FOREGROUND,
+        MSG_CMD_FOREGROUND_LEGACY -> "MSG_CMD_FOREGROUND"
         MSG_CMD_BACKGROUND -> "MSG_CMD_BACKGROUND"
         MSG_CMD_GO_TO_DESKTOP -> "MSG_CMD_GO_TO_DESKTOP"
         MSG_CMD_GO_TO_FOREGROUND -> "MSG_CMD_GO_TO_FOREGROUND"
@@ -287,7 +298,7 @@ object CarLifeFrameCodec {
         buffer.putInt(header.rawChannelId)
         buffer.putInt(header.payloadLength)
         if (header.channel.hasTimestampHeader) {
-            buffer.putInt((header.timestamp and 0xFFFF_FFFFL).toInt())
+            buffer.putInt((header.timestamp and 0x7FFF_FFFFL).toInt())
         }
         return buffer.array()
     }
@@ -297,7 +308,7 @@ object CarLifeFrameCodec {
         target.putInt(header.rawChannelId)
         target.putInt(header.payloadLength)
         if (header.channel.hasTimestampHeader) {
-            target.putInt((header.timestamp and 0xFFFF_FFFFL).toInt())
+            target.putInt((header.timestamp and 0x7FFF_FFFFL).toInt())
         }
     }
 
@@ -548,7 +559,7 @@ object CarLifeFrameCodec {
 
     fun createVideoFrame(
         nalData: ByteArray,
-        timestampMs: Long = System.currentTimeMillis() and 0xFFFF_FFFFL,
+        timestampMs: Long = (android.os.SystemClock.uptimeMillis().takeIf { it > 0L } ?: System.currentTimeMillis()) and 0x7FFF_FFFFL,
         nestedVideoMsgHeader: Boolean = useNestedVideoMsgHeader
     ): CarLifeFrame {
         val framePayload = if (nestedVideoMsgHeader) {
@@ -564,9 +575,9 @@ object CarLifeFrameCodec {
         return CarLifeFrame(
             header = CarLifeHeader(
                 channel = CarLifeChannel.VIDEO,
-                rawChannelId = CarLifeChannel.VIDEO.id,
-                payloadLength = framePayload.size,
-                timestamp = timestampMs and 0xFFFF_FFFFL
+                rawChannelId = CarLifeChannel.VIDEO.id, // 0x00000002 Big-Endian
+                payloadLength = framePayload.size,      // Payload length ONLY (excluding 12B header)
+                timestamp = timestampMs and 0x7FFF_FFFFL // 4B Big-Endian uptimeMillis
             ),
             payload = framePayload
         )
