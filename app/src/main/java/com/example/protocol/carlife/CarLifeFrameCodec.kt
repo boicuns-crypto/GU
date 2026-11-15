@@ -47,11 +47,17 @@ enum class CarLifeChannel(
 object CarLifeMsgType {
     // Control Channel (0x0001) — Handshake, Device Info, Video Negotiation & Lifecycle
     const val MSG_CMD_HU_PROTOCOL_VERSION = 0x00018001
+    const val MSG_CMD_HU_PROTOCOL_VERSION_ALT = 0x00010001
     const val MSG_CMD_PROTOCOL_VERSION_MATCH_STATUS = 0x00010002
+    const val MSG_CMD_PROTOCOL_VERSION_MATCH_STATUS_ALT = 0x00018002
     const val MSG_CMD_HU_INFO = 0x00018003
+    const val MSG_CMD_HU_INFO_ALT = 0x00010003
     const val MSG_CMD_MD_INFO = 0x00010004
+    const val MSG_CMD_MD_INFO_ALT = 0x00018004
     const val MSG_CMD_HU_BT_OOB_INFO = 0x00018005
+    const val MSG_CMD_HU_BT_OOB_INFO_ALT = 0x00010005
     const val MSG_CMD_MD_BT_OOB_INFO = 0x00010006
+    const val MSG_CMD_MD_BT_OOB_INFO_ALT = 0x00018006
     const val MSG_CMD_VIDEO_ENCODER_INIT = 0x00018007
     const val MSG_CMD_VIDEO_ENCODER_INIT_ALT = 0x00010007
     const val MSG_CMD_VIDEO_ENCODER_INIT_DONE = 0x00010008
@@ -62,7 +68,9 @@ object CarLifeMsgType {
     const val MSG_CMD_VIDEO_ENCODER_START_DONE_ALT = 0x0001800A
     const val MSG_CMD_VIDEO_ENCODER_PAUSE = 0x0001800A
     const val MSG_CMD_VIDEO_ENCODER_RESET = 0x0001800B
+    const val MSG_CMD_VIDEO_ENCODER_RESET_ALT = 0x0001000B
     const val MSG_CMD_VIDEO_ENCODER_FRAME_RATE_CHANGE = 0x0001800C
+    const val MSG_CMD_VIDEO_ENCODER_FRAME_RATE_CHANGE_ALT = 0x0001000C
     const val MSG_CMD_VIDEO_ENCODER_FRAME_RATE_CHANGE_DONE = 0x0001000D
     const val MSG_CMD_PAUSE_MEDIA = 0x0001800E
     const val MSG_CMD_CAR_VELOCITY = 0x0001800F
@@ -87,6 +95,7 @@ object CarLifeMsgType {
     const val MSG_CMD_MODULE_STATUS = 0x00018023
     const val MSG_CMD_STATISTIC_INFO = 0x00018024
     const val MSG_CMD_FOREGROUND = 0x00018025
+    const val MSG_CMD_FOREGROUND_ALT = 0x00010025
     const val MSG_CMD_MODULE_CONTROL = 0x00018025
 
     // Video Channel (0x0002) — H.264 NAL Stream & Heartbeat
@@ -111,31 +120,48 @@ object CarLifeMsgType {
     const val MSG_TOUCH_CAR_HARD_KEY_CODE = 0x00068008
     const val MSG_TOUCH_UI_ACTION_SOUND = 0x00060009
 
+    fun isCarLifeServiceId(candidate: Int): Boolean {
+        val high16 = (candidate ushr 16) and 0xFFFF
+        val low16 = candidate and 0xFFFF
+        return (high16 in 0x0001..0x0006) && (low16 != 0)
+    }
+
     fun nameOf(serviceType: Int): String = when (serviceType) {
-        MSG_CMD_HU_PROTOCOL_VERSION -> "MSG_CMD_HU_PROTOCOL_VERSION"
-        MSG_CMD_PROTOCOL_VERSION_MATCH_STATUS -> "MSG_CMD_PROTOCOL_VERSION_MATCH_STATUS"
-        MSG_CMD_HU_INFO -> "MSG_CMD_HU_INFO"
-        MSG_CMD_MD_INFO -> "MSG_CMD_MD_INFO"
-        MSG_CMD_HU_BT_OOB_INFO -> "MSG_CMD_HU_BT_OOB_INFO"
-        MSG_CMD_MD_BT_OOB_INFO -> "MSG_CMD_MD_BT_OOB_INFO"
+        MSG_CMD_HU_PROTOCOL_VERSION,
+        MSG_CMD_HU_PROTOCOL_VERSION_ALT -> "MSG_CMD_HU_PROTOCOL_VERSION"
+        MSG_CMD_PROTOCOL_VERSION_MATCH_STATUS,
+        MSG_CMD_PROTOCOL_VERSION_MATCH_STATUS_ALT -> "MSG_CMD_PROTOCOL_VERSION_MATCH_STATUS"
+        MSG_CMD_HU_INFO,
+        MSG_CMD_HU_INFO_ALT -> "MSG_CMD_HU_INFO"
+        MSG_CMD_MD_INFO,
+        MSG_CMD_MD_INFO_ALT -> "MSG_CMD_MD_INFO"
+        MSG_CMD_HU_BT_OOB_INFO,
+        MSG_CMD_HU_BT_OOB_INFO_ALT -> "MSG_CMD_HU_BT_OOB_INFO"
+        MSG_CMD_MD_BT_OOB_INFO,
+        MSG_CMD_MD_BT_OOB_INFO_ALT -> "MSG_CMD_MD_BT_OOB_INFO"
         MSG_CMD_VIDEO_ENCODER_INIT,
         MSG_CMD_VIDEO_ENCODER_INIT_ALT -> "MSG_CMD_VIDEO_ENCODER_INIT"
         MSG_CMD_VIDEO_ENCODER_INIT_DONE,
         MSG_CMD_VIDEO_ENCODER_INIT_DONE_ALT -> "MSG_CMD_VIDEO_ENCODER_INIT_DONE"
         MSG_CMD_VIDEO_ENCODER_START,
         MSG_CMD_VIDEO_ENCODER_START_ALT -> "MSG_CMD_VIDEO_ENCODER_START"
-        MSG_CMD_VIDEO_ENCODER_START_DONE -> "MSG_CMD_VIDEO_ENCODER_START_DONE"
-        MSG_CMD_VIDEO_ENCODER_PAUSE -> "MSG_CMD_VIDEO_ENCODER_PAUSE"
-        MSG_CMD_VIDEO_ENCODER_RESET -> "MSG_CMD_VIDEO_ENCODER_RESET"
-        MSG_CMD_VIDEO_ENCODER_FRAME_RATE_CHANGE -> "MSG_CMD_VIDEO_ENCODER_FRAME_RATE_CHANGE"
+        MSG_CMD_VIDEO_ENCODER_START_DONE,
+        MSG_CMD_VIDEO_ENCODER_START_DONE_ALT -> "MSG_CMD_VIDEO_ENCODER_START_DONE"
+        MSG_CMD_VIDEO_ENCODER_RESET,
+        MSG_CMD_VIDEO_ENCODER_RESET_ALT -> "MSG_CMD_VIDEO_ENCODER_RESET"
+        MSG_CMD_VIDEO_ENCODER_FRAME_RATE_CHANGE,
+        MSG_CMD_VIDEO_ENCODER_FRAME_RATE_CHANGE_ALT -> "MSG_CMD_VIDEO_ENCODER_FRAME_RATE_CHANGE"
         MSG_CMD_VIDEO_ENCODER_FRAME_RATE_CHANGE_DONE -> "MSG_CMD_VIDEO_ENCODER_FRAME_RATE_CHANGE_DONE"
         MSG_CMD_SCREEN_ON -> "MSG_CMD_SCREEN_ON"
         MSG_CMD_SCREEN_OFF -> "MSG_CMD_SCREEN_OFF"
         MSG_CMD_FOREGROUND,
+        MSG_CMD_FOREGROUND_ALT,
         MSG_CMD_FOREGROUND_LEGACY -> "MSG_CMD_FOREGROUND"
         MSG_CMD_BACKGROUND -> "MSG_CMD_BACKGROUND"
         MSG_CMD_GO_TO_DESKTOP -> "MSG_CMD_GO_TO_DESKTOP"
         MSG_CMD_GO_TO_FOREGROUND -> "MSG_CMD_GO_TO_FOREGROUND"
+        MSG_CMD_MODULE_STATUS -> "MSG_CMD_MODULE_STATUS"
+        MSG_CMD_STATISTIC_INFO -> "MSG_CMD_STATISTIC_INFO"
         MSG_VIDEO_DATA -> "MSG_VIDEO_DATA"
         MSG_VIDEO_HEARTBEAT -> "MSG_VIDEO_HEARTBEAT"
         MSG_TOUCH_ACTION -> "MSG_TOUCH_ACTION"
@@ -217,26 +243,97 @@ data class CarLifeFrame(
         get() = header.headerSizeBytes + payload.size
 
     /**
-     * Extracts the inner Control/Touch command sub-header if present:
-     * `[InnerMsgDataLength: 4B Big-Endian][ServiceType: 4B Big-Endian][ProtobufBody: N bytes]`
+     * Extracts the Control (`0x0001`) or Touch (`0x0006`) command from any Jetta VS7 / MQB frame format:
+     * 1. **12-byte wire frame (`payload.size == 4`)**:
+     *    `bytes[8..11]` (`payload[0..3]`) is directly `serviceType` (`protoPayload = ByteArray(0)`).
+     * 2. **16+ byte wire frame (`payload.size >= 8`)**:
+     *    Checks `word0 = bytes[8..11]` (`payload[0..3]`), `word1 = bytes[12..15]` (`payload[4..7]`),
+     *    and (when `payload.size >= 12`) `word2 = bytes[16..19]` (`payload[8..11]`):
+     *    - If `word0` starts with `0x0001xxxx` (or `0x0006xxxx`), `serviceType = word0`.
+     *    - Else if `word1` starts with `0x0001xxxx` (standard `[innerProtoLen: 4B][serviceId: 4B]`),
+     *      `serviceType = word1` and `innerProtoLen = word0` (clamped to `payload.size - 8`).
+     *    - Else if `payload.size >= 12` and `word2` starts with `0x0001xxxx` (12B media-style header
+     *      with 4B timestamp + 4B innerProtoLen + 4B serviceId), `serviceType = word2`.
+     *    - Never returns `null` for any Control frame with `payload.size >= 4`.
      */
     fun parseCommandMessageOrNull(): CarLifeCommandMessage? {
-        if (payload.size < 8) return null
+        if (payload.isEmpty()) return null
+        if (payload.size < 4) {
+            var padded = 0
+            for (b in payload) {
+                padded = (padded shl 8) or (b.toInt() and 0xFF)
+            }
+            return CarLifeCommandMessage(serviceType = padded, body = ByteArray(0))
+        }
+
         val buf = ByteBuffer.wrap(payload).order(ByteOrder.BIG_ENDIAN)
-        val innerDataLen = buf.int
-        val serviceType = buf.int
-        if (innerDataLen < 0 || innerDataLen > payload.size - 8) {
-            return null
+        val word0 = buf.getInt(0) // wire bytes[8..11]
+
+        // Case 1: 12-byte total wire frame (8B channel header + 4B payload = serviceId)
+        if (payload.size in 4..7) {
+            val body = if (payload.size > 4) payload.copyOfRange(4, payload.size) else ByteArray(0)
+            return CarLifeCommandMessage(
+                serviceType = word0,
+                body = body
+            )
         }
-        val body = if (innerDataLen > 0) {
-            ByteArray(innerDataLen).also { buf.get(it) }
-        } else {
-            ByteArray(0)
+
+        // Case 2: payload.size >= 8 (wire frame >= 16 bytes)
+        val word1 = buf.getInt(4) // wire bytes[12..15]
+        val word2 = if (payload.size >= 12) buf.getInt(8) else 0 // wire bytes[16..19]
+
+        val word0IsService = CarLifeMsgType.isCarLifeServiceId(word0)
+        val word1IsService = CarLifeMsgType.isCarLifeServiceId(word1)
+        val word2IsService = payload.size >= 12 && CarLifeMsgType.isCarLifeServiceId(word2)
+
+        return when {
+            // Subcase 2A: bytes[8..11] (word0) is already 0x0001xxxx / 0x0006xxxx serviceId
+            word0IsService && !word1IsService -> {
+                val body = if (word1 in 0..(payload.size - 8) && (word1 == payload.size - 8 || word1 == 0)) {
+                    if (word1 > 0) payload.copyOfRange(8, 8 + word1) else payload.copyOfRange(8, payload.size)
+                } else {
+                    payload.copyOfRange(4, payload.size)
+                }
+                CarLifeCommandMessage(
+                    serviceType = word0,
+                    body = body
+                )
+            }
+
+            // Subcase 2B: Standard format -> bytes[8..11] is innerProtoLen, bytes[12..15] (word1) is serviceId
+            word1IsService -> {
+                val avail = payload.size - 8
+                val safeLen = if (word0 in 0..avail) word0 else avail
+                val body = if (safeLen > 0) payload.copyOfRange(8, 8 + safeLen) else ByteArray(0)
+                CarLifeCommandMessage(
+                    serviceType = word1,
+                    body = body
+                )
+            }
+
+            // Subcase 2C: 12-byte payload where bytes[8..11] is 4B timestamp, bytes[12..15] is innerLen, bytes[16..19] (word2) is serviceId
+            word2IsService -> {
+                val avail = payload.size - 12
+                val safeLen = if (word1 in 0..avail) word1 else avail
+                val body = if (safeLen > 0) payload.copyOfRange(12, 12 + safeLen) else ByteArray(0)
+                CarLifeCommandMessage(
+                    serviceType = word2,
+                    body = body
+                )
+            }
+
+            // Fallback: never drop any Control/Touch frame as malformed
+            else -> {
+                val chosenService = if (word1 != 0) word1 else word0
+                val avail = payload.size - 8
+                val safeLen = if (word0 in 0..avail) word0 else avail
+                val body = if (safeLen > 0) payload.copyOfRange(8, 8 + safeLen) else ByteArray(0)
+                CarLifeCommandMessage(
+                    serviceType = chosenService,
+                    body = body
+                )
+            }
         }
-        return CarLifeCommandMessage(
-            serviceType = serviceType,
-            body = body
-        )
     }
 
     override fun equals(other: Any?): Boolean {
@@ -619,7 +716,13 @@ object CarLifeFrameCodec {
     fun formatHexPreview(frame: CarLifeFrame, maxPayloadBytes: Int = 16): String {
         val headerBytes = encodeHeader(frame.header)
         val headerHex = headerBytes.joinToString(" ") { "%02X".format(it) }
-        val sliceLen = minOf(frame.payload.size, maxPayloadBytes)
+        // Always output full HEX dump for Control (0x0001) and Touch (0x0006) frames (including 12B frames)
+        val effectiveMaxPayload = if (frame.channel == CarLifeChannel.CONTROL || frame.channel == CarLifeChannel.TOUCH) {
+            maxOf(maxPayloadBytes, 64)
+        } else {
+            maxPayloadBytes
+        }
+        val sliceLen = minOf(frame.payload.size, effectiveMaxPayload)
         val payloadHex = if (sliceLen > 0) {
             frame.payload.take(sliceLen).joinToString(" ") { "%02X".format(it) } +
                 if (frame.payload.size > sliceLen) " … (+${frame.payload.size - sliceLen}B)" else ""
@@ -662,3 +765,171 @@ object CarLifeFrameCodec {
         }
     }
 }
+
+/**
+ * Streaming ring/sliding buffer assembler for USB Open Accessory (`FileInputStream`).
+ *
+ * Handles:
+ * 1. Two or more CarLife frames coalesced into a single `usbInputStream.read(buffer)` transfer.
+ * 2. Large frames split across multiple `usbInputStream.read(buffer)` transfers.
+ * 3. 12-byte Control (`0x0001`) frames (`8B header + 4B serviceId`, or `rawLength == 0` / `rawLength == 12`
+ *    followed by a 4-byte `0x0001xxxx` parameterless command).
+ */
+class CarLifeStreamAssembler(initialCapacity: Int = 65_536) {
+    private var buf = ByteArray(initialCapacity.coerceAtLeast(16_384))
+    private var readPos = 0
+    private var writePos = 0
+
+    val availableBytes: Int
+        get() = writePos - readPos
+
+    fun reset() {
+        readPos = 0
+        writePos = 0
+    }
+
+    fun append(data: ByteArray, offset: Int = 0, length: Int = data.size) {
+        if (length <= 0) return
+        ensureCapacity(length)
+        System.arraycopy(data, offset, buf, writePos, length)
+        writePos += length
+    }
+
+    fun drainFrames(): List<CarLifeFrame> {
+        if (availableBytes < CarLifeFrameCodec.STANDARD_HEADER_SIZE) return emptyList()
+        val out = ArrayList<CarLifeFrame>(4)
+
+        while (availableBytes >= CarLifeFrameCodec.STANDARD_HEADER_SIZE) {
+            // Re-align stream if header is not a valid CarLife channel (0x00000001 .. 0x00000006)
+            val rawChannelId = peekIntBigEndian(readPos)
+            val rawLength = peekIntBigEndian(readPos + 4)
+            val isValidChannelHeader =
+                (rawChannelId in 1..6) && (rawLength in 0..CarLifeFrameCodec.MAX_FRAME_PAYLOAD_SIZE)
+
+            if (!isValidChannelHeader) {
+                readPos++
+                continue
+            }
+
+            val channel = CarLifeChannel.fromId(rawChannelId) ?: run {
+                readPos++
+                continue
+            }
+
+            val headerSize = channel.headerSizeBytes // 8 for 0x0001 & 0x0006; 12 for 0x0002..0x0005
+            var effectivePayloadLen = rawLength
+
+            // Special handling for 12-byte Control (0x0001) & Touch (0x0006) frames from MQB Head Unit:
+            if (!channel.hasTimestampHeader && availableBytes >= 12) {
+                val wordAt8 = peekIntBigEndian(readPos + 8)
+                val wordAt8IsServiceId = CarLifeMsgType.isCarLifeServiceId(wordAt8)
+                if (rawLength == 0 && wordAt8IsServiceId) {
+                    // [00 00 00 01][00 00 00 00][00 01 xx xx] -> 12-byte frame with 4B serviceId at [8..11]
+                    effectivePayloadLen = 4
+                } else if (rawLength == 12 && wordAt8IsServiceId) {
+                    // Check if HU wrote total packet length (12) instead of payload length (4)
+                    val nextHeaderStartsAt12 = availableBytes >= 20 &&
+                        (peekIntBigEndian(readPos + 12) in 1..6) &&
+                        (peekIntBigEndian(readPos + 16) in 0..4096)
+                    val isNoArgStartOrLifecycleCmd = (availableBytes == 12) && when (wordAt8) {
+                        CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START,
+                        CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_ALT,
+                        CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_PAUSE,
+                        CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_RESET,
+                        CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_RESET_ALT,
+                        CarLifeMsgType.MSG_CMD_SCREEN_ON,
+                        CarLifeMsgType.MSG_CMD_SCREEN_OFF,
+                        CarLifeMsgType.MSG_CMD_FOREGROUND,
+                        CarLifeMsgType.MSG_CMD_FOREGROUND_ALT,
+                        CarLifeMsgType.MSG_CMD_FOREGROUND_LEGACY,
+                        CarLifeMsgType.MSG_CMD_BACKGROUND,
+                        CarLifeMsgType.MSG_CMD_GO_TO_DESKTOP,
+                        CarLifeMsgType.MSG_CMD_GO_TO_FOREGROUND -> true
+                        else -> false
+                    }
+                    if (nextHeaderStartsAt12 || isNoArgStartOrLifecycleCmd) {
+                        effectivePayloadLen = 4
+                    }
+                }
+            }
+
+            val totalFrameBytes = headerSize + effectivePayloadLen
+            if (availableBytes < totalFrameBytes) {
+                // Wait for remaining bytes of this packet from next usbInputStream.read()
+                break
+            }
+
+            val timestamp = if (channel.hasTimestampHeader) {
+                peekIntBigEndian(readPos + 8).toLong() and 0xFFFF_FFFFL
+            } else {
+                0L
+            }
+
+            val payload = if (effectivePayloadLen > 0) {
+                buf.copyOfRange(readPos + headerSize, readPos + totalFrameBytes)
+            } else {
+                ByteArray(0)
+            }
+
+            readPos += totalFrameBytes
+            if (readPos == writePos) {
+                readPos = 0
+                writePos = 0
+            }
+
+            out.add(
+                CarLifeFrame(
+                    header = CarLifeHeader(
+                        channel = channel,
+                        rawChannelId = rawChannelId,
+                        payloadLength = payload.size,
+                        timestamp = timestamp
+                    ),
+                    payload = payload
+                )
+            )
+        }
+
+        if (readPos > 32_768 && availableBytes > 0) {
+            val rem = availableBytes
+            System.arraycopy(buf, readPos, buf, 0, rem)
+            readPos = 0
+            writePos = rem
+        } else if (availableBytes == 0) {
+            readPos = 0
+            writePos = 0
+        }
+
+        return out
+    }
+
+    private fun peekIntBigEndian(offset: Int): Int {
+        return ((buf[offset].toInt() and 0xFF) shl 24) or
+            ((buf[offset + 1].toInt() and 0xFF) shl 16) or
+            ((buf[offset + 2].toInt() and 0xFF) shl 8) or
+            (buf[offset + 3].toInt() and 0xFF)
+    }
+
+    private fun ensureCapacity(additional: Int) {
+        if (writePos + additional <= buf.size) return
+        val rem = availableBytes
+        if (readPos > 0 && rem + additional <= buf.size) {
+            System.arraycopy(buf, readPos, buf, 0, rem)
+            readPos = 0
+            writePos = rem
+            return
+        }
+        var newCap = buf.size * 2
+        while (newCap < rem + additional) {
+            newCap *= 2
+        }
+        val newBuf = ByteArray(newCap)
+        if (rem > 0) {
+            System.arraycopy(buf, readPos, newBuf, 0, rem)
+        }
+        buf = newBuf
+        readPos = 0
+        writePos = rem
+    }
+}
+

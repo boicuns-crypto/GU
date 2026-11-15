@@ -528,11 +528,11 @@ class BridgeForegroundService : Service() {
                 when (cmd?.serviceType) {
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT,
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT_ALT,
-                    CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_RESET -> {
+                    CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_RESET,
+                    CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_RESET_ALT -> {
                         val s = transition.updatedState
                         videoPacketCounter.set(0L)
                         // Start H.264 encoder & 0x0002 streaming IMMEDIATELY after MSG_CMD_VIDEO_ENCODER_INIT_DONE
-                        // without waiting for MSG_CMD_VIDEO_ENCODER_START (fixes 90% hang on MQB Head Units)
                         projectionManager.startProjection(
                             width = s.negotiatedVideoWidth,
                             height = s.negotiatedVideoHeight,
@@ -549,12 +549,9 @@ class BridgeForegroundService : Service() {
                                 height = s.negotiatedVideoHeight,
                                 frameRate = s.negotiatedFps
                             )
-                        } else {
-                            projectionManager.requestInstantIdrKeyFrame()
                         }
-                    }
-                    CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_PAUSE -> {
-                        projectionManager.stopProjection()
+                        // Immediately send SPS/PPS packet on channel 0x0002 and request IDR sync frame
+                        projectionManager.requestInstantIdrKeyFrame()
                     }
                 }
             }

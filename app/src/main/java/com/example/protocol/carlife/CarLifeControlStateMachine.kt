@@ -64,30 +64,43 @@ class CarLifeControlStateMachine(
      */
     fun onControlFrame(frame: CarLifeFrame): ControlTransitionResult {
         val cmd = frame.parseCommandMessageOrNull()
-            ?: return ControlTransitionResult(
+        if (cmd == null) {
+            val hex = CarLifeFrameCodec.formatHexPreview(frame, maxPayloadBytes = 64)
+            val note = "RX Control Frame (${frame.totalFrameBytes}B) $hex"
+            _sessionState.update { it.copy(lastControlAction = note) }
+            return ControlTransitionResult(
                 updatedState = _sessionState.value,
                 outboundFrames = emptyList(),
-                summary = "Ignored malformed Control frame (${frame.payload.size}B)"
+                summary = note
             )
+        }
 
         return when (cmd.serviceType) {
-            CarLifeMsgType.MSG_CMD_HU_PROTOCOL_VERSION -> handleProtocolVersion(cmd.body)
-            CarLifeMsgType.MSG_CMD_HU_INFO -> handleHuInfo(cmd.body)
+            CarLifeMsgType.MSG_CMD_HU_PROTOCOL_VERSION,
+            CarLifeMsgType.MSG_CMD_HU_PROTOCOL_VERSION_ALT -> handleProtocolVersion(cmd.body)
+            CarLifeMsgType.MSG_CMD_HU_INFO,
+            CarLifeMsgType.MSG_CMD_HU_INFO_ALT -> handleHuInfo(cmd.body)
+            CarLifeMsgType.MSG_CMD_HU_BT_OOB_INFO,
+            CarLifeMsgType.MSG_CMD_HU_BT_OOB_INFO_ALT -> handleBtOobInfo()
             CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT,
             CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT_ALT -> handleVideoEncoderInit(cmd.body)
             CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START,
-            CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_ALT -> handleVideoEncoderStart()
+            CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_ALT -> handleVideoEncoderStart(frame.totalFrameBytes)
             CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_PAUSE -> handleVideoEncoderPause()
-            CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_RESET -> handleVideoEncoderReset()
-            CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_FRAME_RATE_CHANGE -> handleFrameRateChange(cmd.body)
+            CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_RESET,
+            CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_RESET_ALT -> handleVideoEncoderReset()
+            CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_FRAME_RATE_CHANGE,
+            CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_FRAME_RATE_CHANGE_ALT -> handleFrameRateChange(cmd.body)
             CarLifeMsgType.MSG_CMD_SCREEN_ON -> updateScreenLifecycle(screenOn = true, eventName = "MSG_CMD_SCREEN_ON")
             CarLifeMsgType.MSG_CMD_SCREEN_OFF -> updateScreenLifecycle(screenOn = false, eventName = "MSG_CMD_SCREEN_OFF")
             CarLifeMsgType.MSG_CMD_FOREGROUND,
+            CarLifeMsgType.MSG_CMD_FOREGROUND_ALT,
             CarLifeMsgType.MSG_CMD_FOREGROUND_LEGACY -> updateForegroundLifecycle(foreground = true)
             CarLifeMsgType.MSG_CMD_BACKGROUND -> updateForegroundLifecycle(foreground = false)
             else -> {
                 val msgName = CarLifeMsgType.nameOf(cmd.serviceType)
-                val note = "RX Control $msgName (${cmd.body.size}B)"
+                val hex = CarLifeFrameCodec.formatHexPreview(frame, maxPayloadBytes = 64)
+                val note = "RX Control $msgName (${frame.totalFrameBytes}B wire / ${cmd.body.size}B proto) $hex"
                 _sessionState.update { it.copy(lastControlAction = note) }
                 ControlTransitionResult(
                     updatedState = _sessionState.value,
@@ -220,18 +233,36 @@ class CarLifeControlStateMachine(
         )
     }
 
-    private fun handleVideoEncoderStart(): ControlTransitionResult {
-        val startDoneFrame = CarLifeFrameCodec.createCommandFrame(
+    private fun handleBtOobInfo(): ControlTransitionResult {
+        val btReply = CarLifeFrameCodec.createCommandFrame(
             channel = CarLifeChannel.CONTROL,
-            serviceType = CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_DONE,
+            serviceType = CarLifeMsgType.MSG_CMD_MD_BT_OOB_INFO,
             commandBody = ByteArray(0)
         )
-        val startDoneAltFrame = CarLifeFrameCodec.createCommandFrame(
+        val summary = "RX MSG_CMD_HU_BT_OOB_INFO -> TX MSG_CMD_MD_BT_OOB_INFO (0x00010006)"
+        _sessionState.update {
+            it.copy(lastControlAction = summary)
+        }
+        return ControlTransitionResult(
+            updatedState = _sessionState.value,
+            outboundFrames = listOf(btReply),
+            summary = summary
+        )
+    }
+
+    private fun handleVideoEncoderStart(wireBytes: Int = 12): ControlTransitionResult {
+        // Send 0x0001800A (MSG_CMD_VIDEO_ENCODER_START_DONE) immediately, plus 0x0001000A
+        val startDonePrimary = CarLifeFrameCodec.createCommandFrame(
             channel = CarLifeChannel.CONTROL,
-            serviceType = CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_DONE_ALT,
+            serviceType = CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_DONE_ALT, // 0x0001800A
             commandBody = ByteArray(0)
         )
-        val summary = "RX MSG_CMD_VIDEO_ENCODER_START -> TX START_DONE + Instant IDR KeyFrame"
+        val startDoneSecondary = CarLifeFrameCodec.createCommandFrame(
+            channel = CarLifeChannel.CONTROL,
+            serviceType = CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_DONE, // 0x0001000A
+            commandBody = ByteArray(0)
+        )
+        val summary = "RX MSG_CMD_VIDEO_ENCODER_START (${wireBytes}B) -> TX START_DONE (0x0001800A) + SPS/PPS + IDR"
         _sessionState.update {
             it.copy(
                 phase = CarLifeSessionPhase.VIDEO_STREAMING,
@@ -240,7 +271,7 @@ class CarLifeControlStateMachine(
         }
         return ControlTransitionResult(
             updatedState = _sessionState.value,
-            outboundFrames = listOf(startDoneFrame, startDoneAltFrame),
+            outboundFrames = listOf(startDonePrimary, startDoneSecondary),
             summary = summary
         )
     }

@@ -13,6 +13,8 @@ import android.util.Log
 import androidx.core.content.ContextCompat
 import com.example.protocol.carlife.CarLifeFrame
 import com.example.protocol.carlife.CarLifeFrameCodec
+import com.example.protocol.carlife.CarLifeStreamAssembler
+import java.io.EOFException
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.IOException
@@ -296,22 +298,30 @@ class UsbAccessoryTransport(
     }
 
     /**
-     * Chunk-safe read loop over [FileInputStream] (`<= 16,384` bytes per read syscall).
+     * Ring-buffer stream read loop over [FileInputStream]:
+     * Reads up to [MAX_AOA_WRITE_SIZE] (16,384 bytes) per `fis.read()` syscall and reassembles
+     * coalesced or fragmented packets in [CarLifeStreamAssembler] strictly by `8 + payloadLen`
+     * (Control `0x0001` / Touch `0x0006`) and `12 + payloadLen` (Video/Audio `0x0002..0x0005`).
      */
     private suspend fun CoroutineScope.runDirectReadLoop(fis: FileInputStream) {
-        val baseHeaderScratch = ByteArray(CarLifeFrameCodec.STANDARD_HEADER_SIZE)
-        val timestampScratch = ByteArray(4)
+        val usbReadChunk = ByteArray(MAX_AOA_WRITE_SIZE)
+        val streamAssembler = CarLifeStreamAssembler(initialCapacity = 65_536)
 
         try {
             while (isActive) {
-                val frame = CarLifeFrameCodec.readNextFrame(
-                    input = fis,
-                    baseHeaderScratch = baseHeaderScratch,
-                    timestampScratch = timestampScratch
-                )
-                _rxFrames.incrementAndGet()
-                _rxBytes.addAndGet(frame.totalFrameBytes.toLong())
-                _incomingFrames.emit(frame)
+                val bytesRead = fis.read(usbReadChunk, 0, MAX_AOA_WRITE_SIZE)
+                if (bytesRead < 0) {
+                    throw EOFException("USB AOA input stream reached EOF")
+                }
+                if (bytesRead == 0) continue
+
+                streamAssembler.append(usbReadChunk, 0, bytesRead)
+                val frames = streamAssembler.drainFrames()
+                for (frame in frames) {
+                    _rxFrames.incrementAndGet()
+                    _rxBytes.addAndGet(frame.totalFrameBytes.toLong())
+                    _incomingFrames.emit(frame)
+                }
             }
         } catch (ce: CancellationException) {
             throw ce
