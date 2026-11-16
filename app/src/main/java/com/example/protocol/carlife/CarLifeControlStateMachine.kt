@@ -91,6 +91,18 @@ class CarLifeControlStateMachine(
             CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_RESET_ALT -> handleVideoEncoderReset()
             CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_FRAME_RATE_CHANGE,
             CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_FRAME_RATE_CHANGE_ALT -> handleFrameRateChange(cmd.body)
+            CarLifeMsgType.MSG_CMD_MODULE_CONTROL,
+            CarLifeMsgType.MSG_CMD_MODULE_CONTROL_ALT -> handleModuleControl(frame, cmd.body)
+            CarLifeMsgType.MSG_CMD_HU_AUTHEN_REQUEST,
+            CarLifeMsgType.MSG_CMD_HU_AUTHEN_REQUEST_ALT,
+            CarLifeMsgType.MSG_CMD_HU_AUTHEN_REQUEST_LEGACY -> handleHuAuthenRequest(frame, cmd.serviceType, cmd.body)
+            CarLifeMsgType.MSG_CMD_HU_AUTHEN_RESULT,
+            CarLifeMsgType.MSG_CMD_HU_AUTHEN_RESULT_ALT -> handleHuAuthenResult(frame)
+            CarLifeMsgType.MSG_CMD_HU_FEATURE_CONFIG_REQUEST,
+            CarLifeMsgType.MSG_CMD_MD_FEATURE_CONFIG_REQUEST -> handleFeatureConfigRequest(frame)
+            CarLifeMsgType.MSG_CMD_MD_AES_KEY_REQUEST,
+            CarLifeMsgType.MSG_CMD_MD_AES_KEY_REQUEST_ALT,
+            CarLifeMsgType.MSG_CMD_HU_AES_KEY_REQUEST -> handleAesKeyRequest(frame)
             CarLifeMsgType.MSG_CMD_SCREEN_ON -> updateScreenLifecycle(screenOn = true, eventName = "MSG_CMD_SCREEN_ON")
             CarLifeMsgType.MSG_CMD_SCREEN_OFF -> updateScreenLifecycle(screenOn = false, eventName = "MSG_CMD_SCREEN_OFF")
             CarLifeMsgType.MSG_CMD_FOREGROUND,
@@ -99,7 +111,7 @@ class CarLifeControlStateMachine(
             CarLifeMsgType.MSG_CMD_BACKGROUND -> updateForegroundLifecycle(foreground = false)
             else -> {
                 val msgName = CarLifeMsgType.nameOf(cmd.serviceType)
-                val hex = CarLifeFrameCodec.formatHexPreview(frame, maxPayloadBytes = 64)
+                val hex = CarLifeFrameCodec.formatHexPreview(frame, maxPayloadBytes = 256)
                 val note = "RX Control $msgName (${frame.totalFrameBytes}B wire / ${cmd.body.size}B proto) $hex"
                 _sessionState.update { it.copy(lastControlAction = note) }
                 ControlTransitionResult(
@@ -131,7 +143,7 @@ class CarLifeControlStateMachine(
 
     private fun handleProtocolVersion(body: ByteArray): ControlTransitionResult {
         val versionProto = CarlifeProtocolVersionProto.decode(body)
-        // protoBytes = [08 01] (field 1 varint = 1 MATCH_SUCCESS)
+        // 1. MSG_CMD_PROTOCOL_VERSION_MATCH_STATUS (0x00018002) with matchStatus = 1 (08 01)
         val matchReplyProto = CarlifeProtocolVersionMatchStatusProto(
             matchStatus = CarlifeProtocolVersionMatchStatusProto.MATCH_SUCCESS
         )
@@ -140,19 +152,15 @@ class CarLifeControlStateMachine(
             serviceType = CarLifeMsgType.MSG_CMD_PROTOCOL_VERSION_MATCH_STATUS, // 0x00018002
             commandBody = matchReplyProto.encode()
         )
+        // 2. MSG_CMD_MD_INFO (0x00018003) with filled CarlifeDeviceInfoProto
         val encodedMdInfo = mobileDeviceInfo.encode()
         val mdInfo03Frame = CarLifeFrameCodec.createCommandFrame(
             channel = CarLifeChannel.CONTROL,
             serviceType = CarLifeMsgType.MSG_CMD_MD_INFO_03, // 0x00018003
             commandBody = encodedMdInfo
         )
-        val mdInfo04Frame = CarLifeFrameCodec.createCommandFrame(
-            channel = CarLifeChannel.CONTROL,
-            serviceType = CarLifeMsgType.MSG_CMD_MD_INFO, // 0x00018004
-            commandBody = encodedMdInfo
-        )
 
-        val summary = "HU Protocol v${versionProto.majorVersion}.${versionProto.minorVersion} -> TX MATCH_STATUS (0x00018002 [08 01]) + MD_INFO"
+        val summary = "HU Protocol v${versionProto.majorVersion}.${versionProto.minorVersion} -> TX MATCH_STATUS (0x00018002 [08 01]) + MD_INFO (0x00018003)"
         _sessionState.update {
             it.copy(
                 phase = CarLifeSessionPhase.VERSION_MATCHED,
@@ -163,7 +171,7 @@ class CarLifeControlStateMachine(
         }
         return ControlTransitionResult(
             updatedState = _sessionState.value,
-            outboundFrames = listOf(replyFrame, mdInfo03Frame, mdInfo04Frame),
+            outboundFrames = listOf(replyFrame, mdInfo03Frame),
             summary = summary
         )
     }
@@ -192,6 +200,107 @@ class CarLifeControlStateMachine(
         return ControlTransitionResult(
             updatedState = _sessionState.value,
             outboundFrames = listOf(mdInfo03Frame, mdInfo04Frame),
+            summary = summary
+        )
+    }
+
+    private fun handleModuleControl(frame: CarLifeFrame, body: ByteArray): ControlTransitionResult {
+        val hex = CarLifeFrameCodec.formatHexPreview(frame, maxPayloadBytes = 256)
+        val reqStatus = CarlifeModuleStatusProto.decode(body)
+        val replyStatus = CarlifeModuleStatusProto(
+            moduleId = reqStatus.moduleId,
+            statusId = reqStatus.statusId
+        )
+        val replyFrame = CarLifeFrameCodec.createCommandFrame(
+            channel = CarLifeChannel.CONTROL,
+            serviceType = CarLifeMsgType.MSG_CMD_MODULE_STATUS, // 0x00018023
+            commandBody = replyStatus.encode()
+        )
+        val summary = "RX MSG_CMD_MODULE_CONTROL (module=${reqStatus.moduleId}, status=${reqStatus.statusId}) $hex -> TX MSG_CMD_MODULE_STATUS (0x00018023)"
+        _sessionState.update { it.copy(lastControlAction = summary) }
+        return ControlTransitionResult(
+            updatedState = _sessionState.value,
+            outboundFrames = listOf(replyFrame),
+            summary = summary
+        )
+    }
+
+    private fun handleHuAuthenRequest(frame: CarLifeFrame, serviceType: Int, body: ByteArray): ControlTransitionResult {
+        val hex = CarLifeFrameCodec.formatHexPreview(frame, maxPayloadBytes = 256)
+        // Reply with CarlifeAuthenResponse (field 1 string = random/echoed value)
+        val replyProto = if (body.isNotEmpty()) body else CarLifeWireProtobuf.Writer(32)
+            .writeStringField(1, "CarLife_S26U_Auth_OK")
+            .toByteArray()
+        val responseServiceId = if (serviceType == CarLifeMsgType.MSG_CMD_HU_AUTHEN_REQUEST_LEGACY) {
+            CarLifeMsgType.MSG_CMD_MD_AUTHEN_RESPONSE_LEGACY
+        } else {
+            CarLifeMsgType.MSG_CMD_MD_AUTHEN_RESPONSE
+        }
+        val replyFrame = CarLifeFrameCodec.createCommandFrame(
+            channel = CarLifeChannel.CONTROL,
+            serviceType = responseServiceId,
+            commandBody = replyProto
+        )
+        val summary = "RX MSG_CMD_HU_AUTHEN_REQUEST $hex -> TX MSG_CMD_MD_AUTHEN_RESPONSE (0x${responseServiceId.toUInt().toString(16).uppercase()})"
+        _sessionState.update { it.copy(lastControlAction = summary) }
+        return ControlTransitionResult(
+            updatedState = _sessionState.value,
+            outboundFrames = listOf(replyFrame),
+            summary = summary
+        )
+    }
+
+    private fun handleHuAuthenResult(frame: CarLifeFrame): ControlTransitionResult {
+        val hex = CarLifeFrameCodec.formatHexPreview(frame, maxPayloadBytes = 256)
+        val ackProto = byteArrayOf(0x08, 0x01) // status = 1 (SUCCESS)
+        val replyFrame = CarLifeFrameCodec.createCommandFrame(
+            channel = CarLifeChannel.CONTROL,
+            serviceType = CarLifeMsgType.MSG_CMD_MD_AUTHEN_RESULT, // 0x0001804B
+            commandBody = ackProto
+        )
+        val summary = "RX MSG_CMD_HU_AUTHEN_RESULT $hex -> TX MSG_CMD_MD_AUTHEN_RESULT (0x0001804B)"
+        _sessionState.update { it.copy(lastControlAction = summary) }
+        return ControlTransitionResult(
+            updatedState = _sessionState.value,
+            outboundFrames = listOf(replyFrame),
+            summary = summary
+        )
+    }
+
+    private fun handleFeatureConfigRequest(frame: CarLifeFrame): ControlTransitionResult {
+        val hex = CarLifeFrameCodec.formatHexPreview(frame, maxPayloadBytes = 256)
+        val replyFrame = CarLifeFrameCodec.createCommandFrame(
+            channel = CarLifeChannel.CONTROL,
+            serviceType = CarLifeMsgType.MSG_CMD_MD_FEATURE_CONFIG_RESPONSE, // 0x00018052
+            commandBody = ByteArray(0)
+        )
+        val summary = "RX MSG_CMD_HU_FEATURE_CONFIG_REQUEST $hex -> TX MSG_CMD_MD_FEATURE_CONFIG_RESPONSE (0x00018052)"
+        _sessionState.update { it.copy(lastControlAction = summary) }
+        return ControlTransitionResult(
+            updatedState = _sessionState.value,
+            outboundFrames = listOf(replyFrame),
+            summary = summary
+        )
+    }
+
+    private fun handleAesKeyRequest(frame: CarLifeFrame): ControlTransitionResult {
+        val hex = CarLifeFrameCodec.formatHexPreview(frame, maxPayloadBytes = 256)
+        val ackProto = byteArrayOf(0x08, 0x01)
+        val resp57 = CarLifeFrameCodec.createCommandFrame(
+            channel = CarLifeChannel.CONTROL,
+            serviceType = CarLifeMsgType.MSG_CMD_MD_AES_KEY_RESPONSE, // 0x00018057
+            commandBody = ackProto
+        )
+        val resp58 = CarLifeFrameCodec.createCommandFrame(
+            channel = CarLifeChannel.CONTROL,
+            serviceType = CarLifeMsgType.MSG_CMD_HU_AES_REC_RESPONSE, // 0x00018058
+            commandBody = ackProto
+        )
+        val summary = "RX MSG_CMD_MD_AES_KEY_REQUEST $hex -> TX MSG_CMD_HU_AES_REC_RESPONSE (0x00018057/58)"
+        _sessionState.update { it.copy(lastControlAction = summary) }
+        return ControlTransitionResult(
+            updatedState = _sessionState.value,
+            outboundFrames = listOf(resp57, resp58),
             summary = summary
         )
     }

@@ -449,7 +449,8 @@ class UsbAccessoryTransport(
     companion object {
         private const val TAG = "UsbAccessoryTransport"
         const val ACTION_USB_PERMISSION = "com.example.core.usb.ACTION_USB_PERMISSION"
-        const val MAX_AOA_WRITE_SIZE = 16_384
+        const val MAX_AOA_CHUNK = 16_384
+        const val MAX_AOA_WRITE_SIZE = MAX_AOA_CHUNK
 
         val KNOWN_MANUFACTURERS = setOf(
             "Baidu",

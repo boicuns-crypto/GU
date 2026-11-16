@@ -73,12 +73,15 @@ data class BridgeRuntimeState(
     val controlSession: CarLifeControlSessionState = CarLifeControlSessionState(),
     val projectionStats: ProjectionPipelineStats = ProjectionPipelineStats(),
     val useNestedVideoMsgHeader: Boolean = CarLifeFrameCodec.useNestedVideoMsgHeader,
+    val configuredBitrateBps: Int = 1_800_000,
     val lastTouchOrKeyEvent: String = "None — Waiting for Touch/Hardkey Channel (0x0006)",
     val rxBytes: Long = 0L,
     val txBytes: Long = 0L,
     val rxFrames: Long = 0L,
     val txFrames: Long = 0L,
     val channelFrameCounts: Map<CarLifeChannel, Long> = CarLifeChannel.entries.associateWith { 0L },
+    val commandPacketLogs: List<PacketLogEntry> = emptyList(),
+    val videoPacketLogs: List<PacketLogEntry> = emptyList(),
     val packetLogs: List<PacketLogEntry> = emptyList(),
     val lastProtocolEvent: String = "Idle — Waiting for Jetta VS7 (MQB) Baidu CarLife USB AOA attachment"
 )
@@ -109,15 +112,19 @@ object BridgeTelemetryBus {
     ) {
         val timeFmt = SimpleDateFormat("HH:mm:ss.SSS", Locale.US).format(Date())
         val cmdMsg = frame.parseCommandMessageOrNull()
-        val isRxOrControl = direction.startsWith("RX") || frame.channel == CarLifeChannel.CONTROL
-        val hexMaxBytes = if (isRxOrControl) 256 else 24
+        val isVideo = frame.channel == CarLifeChannel.VIDEO
+        val isAoA20BVideo = isVideo && !frame.header.includeOuterTimestamp && frame.payload.size >= 12
+        val effectiveHeaderBytes = if (isAoA20BVideo) 20 else frame.header.headerSizeBytes
+        val effectivePayloadBytes = if (isAoA20BVideo) (frame.payload.size - 12) else frame.payload.size
+        val hexMaxBytes = if (!isVideo || direction.startsWith("RX")) 256 else 24
+
         val entry = PacketLogEntry(
             id = ++logSequence,
             timestampFormatted = timeFmt,
             direction = direction,
             channel = frame.channel,
-            headerSizeBytes = frame.header.headerSizeBytes,
-            payloadSizeBytes = frame.payload.size,
+            headerSizeBytes = effectiveHeaderBytes,
+            payloadSizeBytes = effectivePayloadBytes,
             mediaTimestampMs = frame.header.timestamp,
             serviceName = serviceNameOverride ?: cmdMsg?.serviceName,
             hexPreview = CarLifeFrameCodec.formatHexPreview(frame, maxPayloadBytes = hexMaxBytes)
@@ -126,26 +133,32 @@ object BridgeTelemetryBus {
         _runtimeState.update { current ->
             val updatedChannelCounts = current.channelFrameCounts.toMutableMap()
             updatedChannelCounts[frame.channel] = (updatedChannelCounts[frame.channel] ?: 0L) + 1L
-            val combined = listOf(entry) + current.packetLogs
-            val updatedLogs = if (combined.size <= 120) {
-                combined
+
+            // Task 5: Strictly separate Tab 1 (Commands 0x0001 & 0x0006 RX/TX, up to 200 items, NO video)
+            // from Tab 2 (Video stream 0x0002, up to 60 items).
+            val updatedCommandLogs = if (!isVideo) {
+                (listOf(entry) + current.commandPacketLogs).take(200)
             } else {
-                // Never evict 0x0001 (CMD) or RX packets because of TX video packets
-                val priorityEntries = combined.filter {
-                    it.channel == CarLifeChannel.CONTROL || it.direction.startsWith("RX")
-                }.take(100)
-                val otherEntries = combined.filterNot {
-                    it.channel == CarLifeChannel.CONTROL || it.direction.startsWith("RX")
-                }.take(120 - priorityEntries.size)
-                (priorityEntries + otherEntries).sortedByDescending { it.id }
+                current.commandPacketLogs
             }
+
+            val updatedVideoLogs = if (isVideo) {
+                (listOf(entry) + current.videoPacketLogs).take(60)
+            } else {
+                current.videoPacketLogs
+            }
+
+            val updatedCombined = (listOf(entry) + current.packetLogs).take(200)
+
             current.copy(
                 rxBytes = rxBytesTotal ?: current.rxBytes,
                 txBytes = txBytesTotal ?: current.txBytes,
                 rxFrames = rxFramesTotal ?: current.rxFrames,
                 txFrames = txFramesTotal ?: current.txFrames,
                 channelFrameCounts = updatedChannelCounts,
-                packetLogs = updatedLogs,
+                commandPacketLogs = updatedCommandLogs,
+                videoPacketLogs = updatedVideoLogs,
+                packetLogs = updatedCombined,
                 lastProtocolEvent = protocolNote ?: current.lastProtocolEvent
             )
         }
@@ -174,6 +187,8 @@ object BridgeTelemetryBus {
     fun clearLogs() {
         _runtimeState.update {
             it.copy(
+                commandPacketLogs = emptyList(),
+                videoPacketLogs = emptyList(),
                 packetLogs = emptyList(),
                 channelFrameCounts = CarLifeChannel.entries.associateWith { 0L },
                 lastProtocolEvent = "Packet log cleared"
@@ -206,13 +221,11 @@ class BridgeForegroundService : Service() {
 
     val controlStateMachine = CarLifeControlStateMachine()
     private val videoPacketCounter = java.util.concurrent.atomic.AtomicLong(0L)
-    private val loggedFirstSpsPps = java.util.concurrent.atomic.AtomicBoolean(false)
-    private val loggedFirstIdr = java.util.concurrent.atomic.AtomicBoolean(false)
+    @Volatile
+    private var activeBitrateBps: Int = 1_800_000
 
     private fun resetVideoLogFlags() {
         videoPacketCounter.set(0L)
-        loggedFirstSpsPps.set(false)
-        loggedFirstIdr.set(false)
     }
 
     override fun onCreate() {
@@ -235,11 +248,8 @@ class BridgeForegroundService : Service() {
                 val nalType = if (nalBytes.size > 4) (nalBytes[4].toInt() and 0x1F) else 0
                 val isIdr = isKeyFrame || nalType == 5
                 val isStandaloneSpsPps = !isIdr && (nalType == 7 || nalType == 8)
-                val shouldLogToUi = when {
-                    isStandaloneSpsPps -> loggedFirstSpsPps.compareAndSet(false, true)
-                    isIdr -> loggedFirstIdr.compareAndSet(false, true)
-                    else -> false
-                }
+                // Log all SPS/PPS, all IDR keyframes, and every 15th Slice to the dedicated Video Tab (0x0002)
+                val shouldLogToVideoTab = isStandaloneSpsPps || isIdr || pktIndex <= 6L || (pktIndex % 15L == 0L)
                 serviceScope.launch {
                     if (pktIndex <= 4L || isStandaloneSpsPps || isIdr) {
                         // Send SPS/PPS and IDR keyframes immediately (chunked by 16,384B)
@@ -248,13 +258,13 @@ class BridgeForegroundService : Service() {
                         usbTransport.sendFrame(videoFrame)
                     }
 
-                    if (shouldLogToUi) {
+                    if (shouldLogToVideoTab) {
                         val nalLabel = when {
                             isStandaloneSpsPps -> "SPS/PPS (CODEC_CONFIG)"
-                            isIdr -> "IDR KeyFrame #$pktIndex"
+                            isIdr -> "IDR KeyFrame #$pktIndex (SPS/PPS+IDR)"
                             else -> "H.264 Slice #$pktIndex"
                         }
-                        val hdrMode = if (CarLifeFrameCodec.useNestedVideoMsgHeader) "AOA 20B" else "12B Header"
+                        val hdrMode = if (CarLifeFrameCodec.useNestedVideoMsgHeader) "AOA 20B" else "Direct 12B"
                         BridgeTelemetryBus.recordFrame(
                             direction = "TX (S26U -> HU)",
                             frame = videoFrame,
@@ -394,7 +404,8 @@ class BridgeForegroundService : Service() {
                         projectionManager.startProjection(
                             width = targetW,
                             height = targetH,
-                            frameRate = targetFps
+                            frameRate = targetFps,
+                            bitRate = activeBitrateBps
                         )
                     }
                     BridgeTelemetryBus.updateState {
@@ -409,12 +420,16 @@ class BridgeForegroundService : Service() {
                 val width = intent.getIntExtra(EXTRA_WIDTH, 1280)
                 val height = intent.getIntExtra(EXTRA_HEIGHT, 720)
                 val fps = intent.getIntExtra(EXTRA_FPS, 30)
+                val bitrate = intent.getIntExtra(EXTRA_BITRATE, activeBitrateBps).coerceIn(800_000, 12_000_000)
+                activeBitrateBps = bitrate
+                BridgeTelemetryBus.updateState { it.copy(configuredBitrateBps = bitrate) }
                 serviceScope.launch {
                     resetVideoLogFlags()
                     projectionManager.startProjection(
                         width = width,
                         height = height,
-                        frameRate = fps
+                        frameRate = fps,
+                        bitRate = bitrate
                     )
                 }
             }
@@ -574,7 +589,8 @@ class BridgeForegroundService : Service() {
                         projectionManager.startProjection(
                             width = s.negotiatedVideoWidth,
                             height = s.negotiatedVideoHeight,
-                            frameRate = s.negotiatedFps
+                            frameRate = s.negotiatedFps,
+                            bitRate = activeBitrateBps
                         )
                     }
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START,
@@ -585,7 +601,8 @@ class BridgeForegroundService : Service() {
                             projectionManager.startProjection(
                                 width = s.negotiatedVideoWidth,
                                 height = s.negotiatedVideoHeight,
-                                frameRate = s.negotiatedFps
+                                frameRate = s.negotiatedFps,
+                                bitRate = activeBitrateBps
                             )
                         }
                         // Immediately send SPS/PPS packet on channel 0x0002 and request IDR sync frame
@@ -817,6 +834,7 @@ class BridgeForegroundService : Service() {
         const val EXTRA_WIDTH = "extra_width"
         const val EXTRA_HEIGHT = "extra_height"
         const val EXTRA_FPS = "extra_fps"
+        const val EXTRA_BITRATE = "extra_bitrate"
         const val EXTRA_TOUCH_X = "extra_touch_x"
         const val EXTRA_TOUCH_Y = "extra_touch_y"
         const val EXTRA_USE_NESTED_VIDEO_HEADER = "extra_use_nested_video_header"

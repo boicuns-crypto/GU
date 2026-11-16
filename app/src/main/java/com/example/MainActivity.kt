@@ -199,11 +199,13 @@ class MainActivity : ComponentActivity() {
                         if (!MediaProjectionTokenStore.hasValidToken.value) {
                             requestScreenCapturePermission()
                         } else {
+                            val currentBitrate = BridgeTelemetryBus.runtimeState.value.configuredBitrateBps
                             val intent = Intent(this, BridgeForegroundService::class.java).apply {
                                 action = BridgeForegroundService.ACTION_START_PROJECTION
                                 putExtra(BridgeForegroundService.EXTRA_WIDTH, width)
                                 putExtra(BridgeForegroundService.EXTRA_HEIGHT, height)
                                 putExtra(BridgeForegroundService.EXTRA_FPS, fps)
+                                putExtra(BridgeForegroundService.EXTRA_BITRATE, currentBitrate)
                             }
                             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                                 startForegroundService(intent)
@@ -361,7 +363,7 @@ fun CarLifeBridgeApp(
 
     var configuredWidth by rememberSaveable { mutableIntStateOf(1280) }
     var configuredHeight by rememberSaveable { mutableIntStateOf(720) }
-    var configuredBitrateMbps by rememberSaveable { mutableIntStateOf(2) }
+    var configuredBitrateKbps by rememberSaveable { mutableIntStateOf(1800) }
 
     var checklistStatus by remember {
         mutableStateOf(
@@ -644,22 +646,27 @@ fun CarLifeBridgeApp(
                         lastLaunchStatus = lastLaunchStatus,
                         configuredWidth = configuredWidth,
                         configuredHeight = configuredHeight,
-                        configuredBitrateMbps = configuredBitrateMbps,
+                        configuredBitrateKbps = configuredBitrateKbps,
                         onSelectResolution = { w, h ->
                             configuredWidth = w
                             configuredHeight = h
                             if (runtimeState.projectionStats.isRunning) {
-                                onStartProjection(w, h, 60)
+                                onStartProjection(w, h, 30)
                             }
                         },
-                        onSelectBitrate = { mbps ->
-                            configuredBitrateMbps = mbps
+                        onSelectBitrate = { kbps ->
+                            configuredBitrateKbps = kbps
+                            val bps = kbps * 1_000
+                            BridgeTelemetryBus.updateState { it.copy(configuredBitrateBps = bps) }
+                            if (runtimeState.projectionStats.isRunning) {
+                                onStartProjection(configuredWidth, configuredHeight, 30)
+                            }
                         },
                         onToggleProjection = {
                             if (runtimeState.projectionStats.isRunning) {
                                 onStopProjection()
                             } else {
-                                onStartProjection(configuredWidth, configuredHeight, 60)
+                                onStartProjection(configuredWidth, configuredHeight, 30)
                             }
                         },
                         onOpenAccessibilitySettings = {
@@ -1190,7 +1197,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
     lastLaunchStatus: String,
     configuredWidth: Int,
     configuredHeight: Int,
-    configuredBitrateMbps: Int,
+    configuredBitrateKbps: Int,
     onSelectResolution: (Int, Int) -> Unit,
     onSelectBitrate: (Int) -> Unit,
     onToggleProjection: () -> Unit,
@@ -1206,7 +1213,9 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
     val scope = rememberCoroutineScope()
     val localStateMachine = remember { CarLifeControlStateMachine() }
     var diagnosticsExpanded by rememberSaveable { mutableStateOf(false) }
-    var filterCommandsAndRxOnly by rememberSaveable { mutableStateOf(true) }
+    // Tab 0 (default): «Команды 0x0001 & 0x0006 (RX/TX)»
+    // Tab 1: «Видеопоток 0x0002»
+    var selectedLogTab by rememberSaveable { mutableIntStateOf(0) }
     var lastDecodedBreakdown by remember {
         mutableStateOf(
             "Выберите тестовый вектор ниже для проверки бинарного кадра через CarLifeFrameCodec и декодер тачскрина."
@@ -1335,9 +1344,9 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                         ) {
                             Text(
                                 text = if (state.projectionStats.isRunning) {
-                                    "VD #${state.projectionStats.virtualDisplayId} • ON"
+                                    "VD #${state.projectionStats.virtualDisplayId} АКТИВЕН"
                                 } else {
-                                    "VD • OFF"
+                                    "VD ВЫКЛ"
                                 },
                                 style = MaterialTheme.typography.labelSmall.copy(
                                     fontWeight = FontWeight.SemiBold
@@ -1400,7 +1409,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
             }
         }
 
-        // 2. Настройки H.264 видеопотока (разрешение 1280x720 / 1920x1080, битрейт, формат канала 0x0002)
+        // 2. Настройки H.264 видеопотока (разрешение 1280x720 / 1920x1080, битрейт 1.8 Мбит/с, формат канала 0x0002)
         item {
             Card(
                 modifier = Modifier.fillMaxWidth(),
@@ -1479,30 +1488,30 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         SelectableOptionButton(
-                            label = "2 Мбит/с",
-                            selected = configuredBitrateMbps == 2,
+                            label = "1.8 Мбит/с",
+                            selected = configuredBitrateKbps == 1800,
                             testTag = "bitrate_2m_btn",
-                            onClick = { onSelectBitrate(2) },
+                            onClick = { onSelectBitrate(1800) },
                             modifier = Modifier.weight(1f)
                         )
                         SelectableOptionButton(
-                            label = "4 Мбит/с",
-                            selected = configuredBitrateMbps == 4,
+                            label = "2.5 Мбит/с",
+                            selected = configuredBitrateKbps == 2500,
                             testTag = "bitrate_4m_btn",
-                            onClick = { onSelectBitrate(4) },
+                            onClick = { onSelectBitrate(2500) },
                             modifier = Modifier.weight(1f)
                         )
                         SelectableOptionButton(
-                            label = "6 Мбит/с",
-                            selected = configuredBitrateMbps == 6,
+                            label = "4.0 Мбит/с",
+                            selected = configuredBitrateKbps == 4000,
                             testTag = "bitrate_6m_btn",
-                            onClick = { onSelectBitrate(6) },
+                            onClick = { onSelectBitrate(4000) },
                             modifier = Modifier.weight(1f)
                         )
                     }
 
                     Text(
-                        text = "Формат заголовка видеопакета 0x0002 (USB AOA)",
+                        text = "Формат шапки видеоканала 0x0002 (одинаково для SPS/PPS и IDR)",
                         style = MaterialTheme.typography.labelMedium,
                         color = TextSecondary
                     )
@@ -1513,9 +1522,9 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                             it.copy(
                                 useNestedVideoMsgHeader = useAoA20B,
                                 lastProtocolEvent = if (useAoA20B) {
-                                    "Video 0x0002 Framing: AOA 20B (8B AOA + 12B 0x00028001) active"
+                                    "Video 0x0002 Framing: Режим 1 (AOA 20B: 8B AOA + 12B 0x00028001) active"
                                 } else {
-                                    "Video 0x0002 Framing: Strict 12B Header (00 00 00 01 Annex-B) active"
+                                    "Video 0x0002 Framing: Режим 2 (Direct 12B Header) active"
                                 }
                             )
                         }
@@ -1533,18 +1542,18 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         SelectableOptionButton(
-                            label = "12B Header (00 00 00 01 Annex-B)",
-                            selected = !state.useNestedVideoMsgHeader,
-                            testTag = "video_header_legacy_12b_btn",
-                            onClick = { applyVideoHeaderMode(false) },
-                            modifier = Modifier.weight(1.3f)
-                        )
-                        SelectableOptionButton(
-                            label = "AOA 20B (Nested)",
+                            label = "Режим 1: AOA 20B (По умолч.)",
                             selected = state.useNestedVideoMsgHeader,
                             testTag = "toggle_video_header_mode_btn",
                             onClick = { applyVideoHeaderMode(true) },
-                            modifier = Modifier.weight(0.9f)
+                            modifier = Modifier.weight(1.25f)
+                        )
+                        SelectableOptionButton(
+                            label = "Режим 2: Direct 12B",
+                            selected = !state.useNestedVideoMsgHeader,
+                            testTag = "video_header_legacy_12b_btn",
+                            onClick = { applyVideoHeaderMode(false) },
+                            modifier = Modifier.weight(0.95f)
                         )
                     }
                 }
@@ -1653,30 +1662,31 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                                 val videoInitFrame = CarLifeFrameCodec.createCommandFrame(
                                                     channel = CarLifeChannel.CONTROL,
                                                     serviceType = CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT,
-                                                    commandBody = CarlifeVideoEncoderInfoProto(1920, 1080, 60).encode()
+                                                    commandBody = CarlifeVideoEncoderInfoProto(1280, 720, 30).encode()
                                                 )
                                                 runLoopbackCodecTest(versionFrame, "Control 0x0001: MSG_CMD_HU_PROTOCOL_VERSION (v2.0)")
-                                                runLoopbackCodecTest(videoInitFrame, "Control 0x0001: MSG_CMD_VIDEO_ENCODER_INIT (1920x1080@60)")
+                                                runLoopbackCodecTest(videoInitFrame, "Control 0x0001: MSG_CMD_VIDEO_ENCODER_INIT (1280x720@30)")
                                             }
                                         )
 
                                         CodecTestButton(
-                                            title = "2. Video (12B+TS)",
-                                            subtitle = "0x0002 H.264 SPS/IDR",
+                                            title = "2. Video (0x0002)",
+                                            subtitle = "H.264 SPS/PPS + IDR",
                                             icon = CockpitIcons.Videocam,
                                             accent = TelemetryEmerald,
                                             testTag = "test_video_frame_btn",
                                             modifier = Modifier.weight(1f),
                                             onClick = {
                                                 val h264SpsPps = byteArrayOf(
-                                                    0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x2A,
+                                                    0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1F,
                                                     0x00, 0x00, 0x00, 0x01, 0x68, 0xCE.toByte(), 0x3C, 0x80.toByte()
                                                 )
                                                 val frame = CarLifeFrameCodec.createVideoFrame(
                                                     nalData = h264SpsPps,
-                                                    timestampMs = System.currentTimeMillis() and 0xFFFF_FFFFL
+                                                    timestampMs = System.currentTimeMillis() and 0x7FFF_FFFFL
                                                 )
-                                                runLoopbackCodecTest(frame, "Video 0x0002: H.264 SPS/PPS NAL @ 60fps")
+                                                selectedLogTab = 1
+                                                runLoopbackCodecTest(frame, "Video 0x0002: H.264 SPS/PPS NAL")
                                             }
                                         )
                                     }
@@ -1700,6 +1710,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                                     huWidth = 1280,
                                                     huHeight = 720
                                                 )
+                                                selectedLogTab = 0
                                                 runLoopbackCodecTest(frame, "Touch 0x0006: MSG_TOUCH_ACTION (640,360 on 1280x720)")
                                             }
                                         )
@@ -1713,6 +1724,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                             modifier = Modifier.weight(1f),
                                             onClick = {
                                                 val frame = CarLifeTouchDecoder.createHardKeyFrame(CarLifeHardKey.SEEK_ADD)
+                                                selectedLogTab = 0
                                                 runLoopbackCodecTest(frame, "Touch 0x0006: MSG_TOUCH_CAR_HARD_KEY_CODE (SEEK_ADD)")
                                             }
                                         )
@@ -1742,7 +1754,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Text(
-                                    text = "Журнал бинарных пакетов (${state.packetLogs.size})",
+                                    text = "Журнал бинарных пакетов",
                                     style = MaterialTheme.typography.labelLarge,
                                     color = ElectricCyan,
                                     modifier = Modifier.weight(1f)
@@ -1759,24 +1771,58 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                 }
                             }
 
+                            // Задача 5: Переключатель из 2 независимых вкладок журнала
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.spacedBy(8.dp)
                             ) {
                                 SelectableOptionButton(
-                                    label = "Только команды (0x0001 / RX)",
-                                    selected = filterCommandsAndRxOnly,
+                                    label = "Команды 0x0001 & 0x0006 (${state.commandPacketLogs.size})",
+                                    selected = selectedLogTab == 0,
                                     testTag = "filter_rx_commands_chip",
-                                    onClick = { filterCommandsAndRxOnly = !filterCommandsAndRxOnly },
-                                    modifier = Modifier.weight(1.35f)
+                                    onClick = { selectedLogTab = 0 },
+                                    modifier = Modifier.weight(1.25f)
                                 )
                                 SelectableOptionButton(
-                                    label = "Все пакеты",
-                                    selected = !filterCommandsAndRxOnly,
+                                    label = "Видеопоток 0x0002 (${state.videoPacketLogs.size})",
+                                    selected = selectedLogTab == 1,
                                     testTag = "filter_all_packets_chip",
-                                    onClick = { filterCommandsAndRxOnly = false },
-                                    modifier = Modifier.weight(0.65f)
+                                    onClick = { selectedLogTab = 1 },
+                                    modifier = Modifier.weight(0.95f)
                                 )
+                            }
+
+                            if (selectedLogTab == 1) {
+                                val videoFramesCount = state.channelFrameCounts[CarLifeChannel.VIDEO] ?: 0L
+                                val hdrModeLabel = if (state.useNestedVideoMsgHeader) {
+                                    "Режим 1: AOA 20B (8B AOA + 12B 0x00028001)"
+                                } else {
+                                    "Режим 2: Direct 12B ([0x0002][len][ts])"
+                                }
+                                Surface(
+                                    color = ObsidianSurfaceHigh,
+                                    shape = RoundedCornerShape(12.dp),
+                                    border = BorderStroke(1.dp, ObsidianBorder)
+                                ) {
+                                    Column(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(12.dp),
+                                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                                    ) {
+                                        Text(
+                                            text = "Статистика видеоканала 0x0002 • $hdrModeLabel",
+                                            style = MaterialTheme.typography.labelMedium,
+                                            color = TelemetryEmerald
+                                        )
+                                        Text(
+                                            text = "Кадров 0x0002: $videoFramesCount • Кодек: ${state.projectionStats.width}×${state.projectionStats.height}@${state.projectionStats.fps}fps (${state.configuredBitrateBps / 1000} kbps) • Передано: ${state.projectionStats.encodedBytes / 1024} КБ",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            fontFamily = JetBrainsMonoFamily,
+                                            color = TextSecondary
+                                        )
+                                    }
+                                }
                             }
                         }
                     }
@@ -1785,30 +1831,10 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
         }
 
         if (diagnosticsExpanded) {
-            val displayedLogs = if (!filterCommandsAndRxOnly) {
-                state.packetLogs
+            val displayedLogs = if (selectedLogTab == 0) {
+                state.commandPacketLogs
             } else {
-                val chronological = state.packetLogs.asReversed()
-                var seenFirstSpsPps = false
-                var seenFirstIdr = false
-                val keptIds = HashSet<Long>()
-                for (entry in chronological) {
-                    val isCmdOrRx = entry.channel == CarLifeChannel.CONTROL ||
-                        entry.direction.startsWith("RX")
-                    if (isCmdOrRx) {
-                        keptIds.add(entry.id)
-                    } else if (entry.channel == CarLifeChannel.VIDEO) {
-                        val svc = entry.serviceName.orEmpty()
-                        if (!seenFirstSpsPps && svc.startsWith("SPS/PPS")) {
-                            seenFirstSpsPps = true
-                            keptIds.add(entry.id)
-                        } else if (!seenFirstIdr && svc.startsWith("IDR")) {
-                            seenFirstIdr = true
-                            keptIds.add(entry.id)
-                        }
-                    }
-                }
-                state.packetLogs.filter { it.id in keptIds }
+                state.videoPacketLogs
             }
 
             if (displayedLogs.isEmpty()) {

@@ -365,3 +365,35 @@ data class CarlifeVideoFrameRateProto(
         }
     }
 }
+
+/**
+ * `CarlifeModuleStatus` (`MSG_CMD_MODULE_STATUS = 0x00018023` & `MSG_CMD_MODULE_CONTROL = 0x00010026`)
+ * - Field 1: `int32 moduleID`
+ * - Field 2: `int32 statusID`
+ */
+data class CarlifeModuleStatusProto(
+    val moduleId: Int = 1,
+    val statusId: Int = 0
+) {
+    fun encode(): ByteArray = CarLifeWireProtobuf.Writer(16)
+        .writeVarintField(1, moduleId)
+        .writeVarintField(2, statusId)
+        .toByteArray()
+
+    companion object {
+        fun decode(bytes: ByteArray): CarlifeModuleStatusProto {
+            var moduleId = 1
+            var statusId = 0
+            val reader = CarLifeWireProtobuf.Reader(bytes)
+            while (reader.readTag()) {
+                when (reader.lastFieldNumber) {
+                    1 -> moduleId = reader.readVarint32()
+                    2 -> statusId = reader.readVarint32()
+                    else -> reader.skipField()
+                }
+            }
+            return CarlifeModuleStatusProto(moduleId = moduleId, statusId = statusId)
+        }
+    }
+}
+

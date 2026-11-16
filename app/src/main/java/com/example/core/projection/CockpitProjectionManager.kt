@@ -66,6 +66,7 @@ import com.example.core.input.CarLifeTouchAccessibilityService
 import com.example.feature.cockpit.CarLifeAppLauncherScreen
 import com.example.feature.cockpit.CarLifeLauncherRepository
 import com.example.feature.cockpit.MediaControllerRepository
+import com.example.protocol.carlife.CarLifeFrameCodec
 import com.example.ui.theme.AmberSignal
 import com.example.ui.theme.ElectricCyan
 import com.example.ui.theme.MyApplicationTheme
@@ -189,7 +190,7 @@ class CockpitProjectionManager(
         width: Int = 1280,
         height: Int = 720,
         frameRate: Int = 30,
-        bitRate: Int = 2_000_000,
+        bitRate: Int = 1_800_000,
         densityDpi: Int = DisplayMetrics.DENSITY_XHIGH
     ): Boolean = projectionMutex.withLock {
         stopProjectionLocked()
@@ -1016,7 +1017,6 @@ class CockpitProjectionManager(
 
     private suspend fun CoroutineScope.drainHardwareEncoderLoop(codec: MediaCodec) {
         val bufferInfo = MediaCodec.BufferInfo()
-        var spsPpsSentSinceLastSlice = false
 
         try {
             while (isActive && isEncoding.get()) {
@@ -1035,28 +1035,19 @@ class CockpitProjectionManager(
                             val spsDup = sps.duplicate()
                             val bytes = ByteArray(spsDup.remaining())
                             spsDup.get(bytes)
-                            combined.write(bytes)
+                            combined.write(CarLifeFrameCodec.ensureAnnexBStartCode(bytes))
                         }
                         if (pps != null) {
                             val ppsDup = pps.duplicate()
                             val bytes = ByteArray(ppsDup.remaining())
                             ppsDup.get(bytes)
-                            combined.write(bytes)
+                            combined.write(CarLifeFrameCodec.ensureAnnexBStartCode(bytes))
                         }
                         val spsPpsBytes = combined.toByteArray()
                         if (spsPpsBytes.isNotEmpty()) {
-                            cachedSpsPpsAnnexB = spsPpsBytes
-                            if (!spsPpsSentSinceLastSlice) {
-                                spsPpsSentSinceLastSlice = true
-                                val tsMs = SystemClock.uptimeMillis() and 0x7FFF_FFFFL
-                                onEncodedVideoNal(spsPpsBytes, tsMs, false)
-                                _stats.update {
-                                    it.copy(
-                                        spsPpsConfigured = true,
-                                        encodedNalFrames = it.encodedNalFrames + 1L,
-                                        encodedBytes = it.encodedBytes + spsPpsBytes.size
-                                    )
-                                }
+                            cachedSpsPpsAnnexB = CarLifeFrameCodec.ensureAnnexBStartCode(spsPpsBytes)
+                            _stats.update {
+                                it.copy(spsPpsConfigured = true)
                             }
                         }
                     }
@@ -1075,17 +1066,11 @@ class CockpitProjectionManager(
                             val timestampMs = SystemClock.uptimeMillis() and 0x7FFF_FFFFL
 
                             if (isCodecConfig) {
-                                cachedSpsPpsAnnexB = rawNal
-                                if (!spsPpsSentSinceLastSlice) {
-                                    spsPpsSentSinceLastSlice = true
-                                    onEncodedVideoNal(rawNal, timestampMs, false)
-                                    _stats.update {
-                                        it.copy(
-                                            spsPpsConfigured = true,
-                                            encodedNalFrames = it.encodedNalFrames + 1L,
-                                            encodedBytes = it.encodedBytes + rawNal.size
-                                        )
-                                    }
+                                // Task 2: On BUFFER_FLAG_CODEC_CONFIG, store spsPpsBytes with Annex-B start code 00 00 00 01
+                                val normalizedSpsPps = CarLifeFrameCodec.ensureAnnexBStartCode(rawNal)
+                                cachedSpsPpsAnnexB = normalizedSpsPps
+                                _stats.update {
+                                    it.copy(spsPpsConfigured = true)
                                 }
                             } else {
                                 // Separate any inlined SPS (7) / PPS (8) from video slices (IDR=5 / P=1)
@@ -1097,29 +1082,34 @@ class CockpitProjectionManager(
                                 for (nal in nals) {
                                     val nalType = if (nal.size > 4) (nal[4].toInt() and 0x1F) else 0
                                     when (nalType) {
-                                        7, 8 -> configOut.write(nal)
+                                        7, 8 -> configOut.write(CarLifeFrameCodec.ensureAnnexBStartCode(nal))
                                         5 -> {
                                             containsIdrNal = true
-                                            sliceOut.write(nal)
+                                            sliceOut.write(CarLifeFrameCodec.ensureAnnexBStartCode(nal))
                                         }
                                         6 -> {
                                             // Drop optional SEI metadata NALs to keep keyframes compact & clean for MQB HU
                                         }
-                                        else -> sliceOut.write(nal)
+                                        else -> sliceOut.write(CarLifeFrameCodec.ensureAnnexBStartCode(nal))
                                     }
                                 }
 
                                 if (configOut.size() > 0) {
-                                    cachedSpsPpsAnnexB = configOut.toByteArray()
+                                    cachedSpsPpsAnnexB = CarLifeFrameCodec.ensureAnnexBStartCode(configOut.toByteArray())
+                                    _stats.update {
+                                        it.copy(spsPpsConfigured = true)
+                                    }
                                 }
 
-                                val pureSliceBytes = if (sliceOut.size() > 0) sliceOut.toByteArray() else rawNal
+                                val pureSliceBytes = CarLifeFrameCodec.ensureAnnexBStartCode(
+                                    if (sliceOut.size() > 0) sliceOut.toByteArray() else rawNal
+                                )
 
                                 if (containsIdrNal) {
                                     lastKeyFrameAnnexB = pureSliceBytes
-                                    val spsPps = cachedSpsPpsAnnexB
-                                    if (spsPps != null && !spsPpsSentSinceLastSlice) {
-                                        // 1. Send standalone 12-byte header SPS/PPS packet first
+                                    val spsPps = cachedSpsPpsAnnexB?.let { CarLifeFrameCodec.ensureAnnexBStartCode(it) }
+                                    if (spsPps != null) {
+                                        // 1. Before every IDR keyframe: first send standalone packet with spsPpsBytes
                                         onEncodedVideoNal(spsPps, timestampMs, false)
                                         _stats.update {
                                             it.copy(
@@ -1129,11 +1119,9 @@ class CockpitProjectionManager(
                                             )
                                         }
                                     }
-                                    // 2. Also prepend SPS/PPS directly to the IDR buffer (spsPpsBytes + idrBytes)
-                                    // so the Head Unit hardware decoder initializes immediately on any keyframe!
+                                    // 2. Immediately follow with concatenated spsPpsBytes + idrBytes in a single video frame
                                     val idrWithSpsPps = if (spsPps != null) spsPps + pureSliceBytes else pureSliceBytes
                                     onEncodedVideoNal(idrWithSpsPps, timestampMs, true)
-                                    spsPpsSentSinceLastSlice = false
 
                                     _stats.update {
                                         it.copy(
@@ -1144,7 +1132,6 @@ class CockpitProjectionManager(
                                 } else {
                                     // Non-keyframe P-slice
                                     onEncodedVideoNal(pureSliceBytes, timestampMs, false)
-                                    spsPpsSentSinceLastSlice = false
 
                                     _stats.update {
                                         it.copy(
