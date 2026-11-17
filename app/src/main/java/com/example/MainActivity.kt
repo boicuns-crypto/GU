@@ -1488,7 +1488,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                             border = BorderStroke(1.dp, ObsidianBorder)
                         ) {
                             Text(
-                                text = "Baseline CBR • 30fps • I=2s",
+                                text = "Baseline CBR • 30fps • I=1s",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = ElectricCyan,
                                 softWrap = false,

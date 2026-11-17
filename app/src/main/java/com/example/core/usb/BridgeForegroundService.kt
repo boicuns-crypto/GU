@@ -15,6 +15,7 @@ import android.os.Binder
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import android.os.SystemClock
 import android.util.Log
 import android.view.MotionEvent
 import androidx.core.app.NotificationCompat
@@ -309,13 +310,15 @@ class BridgeForegroundService : Service() {
 
     /**
      * Mandatory Jetta VS7 Audio-Init before video streaming:
-     * Immediately after `MSG_CMD_MD_INFO (0x00018003)`, sends empty 12-byte audio frames:
-     * - `0x0003` (Media Audio): `[00 00 00 03][00 00 00 00][00 00 00 00]`
-     * - `0x0004` (TTS Audio): `[00 00 00 04][00 00 00 00][00 00 00 00]`
+     * Immediately after `MSG_CMD_MD_INFO (0x00018003)`, sends empty 12-byte audio frames
+     * with a valid `SystemClock.uptimeMillis()` timestamp:
+     * - `0x0003` (Media Audio): `[00 00 00 03][00 00 00 00][ts (4B)]`
+     * - `0x0004` (TTS Audio): `[00 00 00 04][00 00 00 00][ts (4B)]`
      */
     private suspend fun sendAudioMultiplexerInitPackets() {
         if (usbTransport.state.value !is UsbTransportState.Connected) return
-        val audioInitFrames = CarLifeFrameCodec.createAudioMultiplexerInitFrames(timestampMs = 0L)
+        val ts = (SystemClock.uptimeMillis() and 0x7FFF_FFFFL).toInt()
+        val audioInitFrames = CarLifeFrameCodec.createAudioMultiplexerInitFrames(timestampMs = ts.toLong())
         for (audioFrame in audioInitFrames) {
             if (usbTransport.sendFrameImmediate(audioFrame)) {
                 BridgeTelemetryBus.recordFrame(
@@ -325,7 +328,7 @@ class BridgeForegroundService : Service() {
                     txBytesTotal = usbTransport.txBytes,
                     rxFramesTotal = usbTransport.rxFrames,
                     txFramesTotal = usbTransport.txFrames,
-                    protocolNote = "Mandatory Audio-Init (0x%04X): [12B HDR | size=0, ts=0]".format(audioFrame.channel.id),
+                    protocolNote = "Mandatory Audio-Init (0x%04X): [12B HDR | size=0, ts=${ts}ms]".format(audioFrame.channel.id),
                     serviceNameOverride = "AUDIO_INIT (0x%04X)".format(audioFrame.channel.id)
                 )
             }
@@ -470,12 +473,13 @@ class BridgeForegroundService : Service() {
                         return@launch
                     }
                     for (singleNal in singleNalUnits) {
-                        val nalType = if (singleNal.size > 4) (singleNal[4].toInt() and 0x1F) else 0
+                        val annexB4Nal = CarLifeFrameCodec.ensureAnnexBStartCode(singleNal)
+                        val nalType = if (annexB4Nal.size > 4) (annexB4Nal[4].toInt() and 0x1F) else 0
                         val isConfigNal = nalType == 7 || nalType == 8
                         val isIdr = !isConfigNal && (isKeyFrame || nalType == 5)
                         val pktIndex = videoPacketCounter.incrementAndGet()
                         val videoFrame = CarLifeFrameCodec.encodeAoAVideoFrame(
-                            h264Data = singleNal,
+                            h264Data = annexB4Nal,
                             timestampMs = timestampMs
                         )
                         val sentOk = usbTransport.sendFrameImmediate(videoFrame)

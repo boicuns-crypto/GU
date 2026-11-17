@@ -1083,7 +1083,7 @@ class CockpitProjectionManager(
     ): MediaCodec {
         val codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
 
-        // Stage 1: Strict Jetta VS7 format — AVCProfileBaseline + AVCLevel31 + BITRATE_MODE_CBR + KEY_I_FRAME_INTERVAL = 2
+        // Stage 1: Strict Jetta VS7 format — AVCProfileBaseline + AVCLevel31 + BITRATE_MODE_CBR + KEY_I_FRAME_INTERVAL = 1
         val baselineLevel31CbrFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
             setInteger(
                 MediaFormat.KEY_COLOR_FORMAT,
@@ -1091,7 +1091,7 @@ class CockpitProjectionManager(
             )
             setInteger(MediaFormat.KEY_BIT_RATE, bitRate)
             setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
             setInteger(
                 MediaFormat.KEY_PROFILE,
                 MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline
@@ -1118,7 +1118,7 @@ class CockpitProjectionManager(
             )
             setInteger(MediaFormat.KEY_BIT_RATE, bitRate)
             setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
             setInteger(
                 MediaFormat.KEY_PROFILE,
                 MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline
@@ -1133,7 +1133,7 @@ class CockpitProjectionManager(
             setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000L)
         }
 
-        // Stage 3: Generic AVC + BITRATE_MODE_CBR + KEY_I_FRAME_INTERVAL = 2
+        // Stage 3: Generic AVC + BITRATE_MODE_CBR + KEY_I_FRAME_INTERVAL = 1
         val genericCbrFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
             setInteger(
                 MediaFormat.KEY_COLOR_FORMAT,
@@ -1141,7 +1141,7 @@ class CockpitProjectionManager(
             )
             setInteger(MediaFormat.KEY_BIT_RATE, bitRate)
             setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
             setInteger(
                 MediaFormat.KEY_BITRATE_MODE,
                 MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR
@@ -1177,7 +1177,7 @@ class CockpitProjectionManager(
             )
             setInteger(MediaFormat.KEY_BIT_RATE, bitRate)
             setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
             }

@@ -313,6 +313,13 @@ class ExampleUnitTest {
             CarLifeFrameCodec.encodeFrame(audioInitFrames[1])
         )
 
+        // Verify non-zero uptime timestamp is encoded cleanly into Audio Init 12B headers (0x0003 & 0x0004)
+        val tsAudioInitFrames = CarLifeFrameCodec.createAudioMultiplexerInitFrames(timestampMs = 0x01020304L)
+        assertEquals(0x01020304L, tsAudioInitFrames[0].header.timestamp)
+        assertEquals(0x01020304L, tsAudioInitFrames[1].header.timestamp)
+        val encodedAudio0 = CarLifeFrameCodec.encodeFrame(tsAudioInitFrames[0])
+        assertArrayEquals(byteArrayOf(0x01, 0x02, 0x03, 0x04), encodedAudio0.copyOfRange(8, 12))
+
         // Verify multi-NAL MediaCodec buffer ([00 00 00 01 SPS][00 00 00 01 PPS][00 00 00 01 IDR])
         // is split into 3 SEPARATE 0x0002 AOA 20B frames, each with its own 20B header and 00 00 00 01 prefix
         val sps = byteArrayOf(0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1F)
@@ -330,6 +337,16 @@ class ExampleUnitTest {
         assertArrayEquals(sps, wire0.copyOfRange(20, wire0.size))
         assertArrayEquals(pps, wire1.copyOfRange(20, wire1.size))
         assertArrayEquals(idr, wire2.copyOfRange(20, wire2.size))
+
+        // Verify Samsung 3-byte start codes (00 00 01) are upgraded to strict 4-byte 00 00 00 01 in every packet
+        val sps3 = byteArrayOf(0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1F)
+        val pps3 = byteArrayOf(0x00, 0x00, 0x01, 0x68, 0xCE.toByte(), 0x3C, 0x80.toByte())
+        val idr3 = byteArrayOf(0x00, 0x00, 0x01, 0x65, 0x88.toByte(), 0x84.toByte(), 0x21)
+        val splitFrom3Byte = CarLifeFrameCodec.encodeAoAVideoFrames(sps3 + pps3 + idr3, timestampMs = 500L)
+        assertEquals(3, splitFrom3Byte.size)
+        assertArrayEquals(sps, CarLifeFrameCodec.encodeFrame(splitFrom3Byte[0]).let { it.copyOfRange(20, it.size) })
+        assertArrayEquals(pps, CarLifeFrameCodec.encodeFrame(splitFrom3Byte[1]).let { it.copyOfRange(20, it.size) })
+        assertArrayEquals(idr, CarLifeFrameCodec.encodeFrame(splitFrom3Byte[2]).let { it.copyOfRange(20, it.size) })
 
         // Verify AVCC length-prefixed NAL is converted cleanly to Annex-B 00 00 00 01 inside encodeAoAVideoFrame
         val avccIdr = byteArrayOf(0x00, 0x00, 0x00, 0x04, 0x65, 0x88.toByte(), 0x84.toByte(), 0x21)
