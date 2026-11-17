@@ -304,23 +304,70 @@ class UsbAccessoryTransport(
      * (Control `0x0001` / Touch `0x0006`) and `12 + payloadLen` (Video/Audio `0x0002..0x0005`).
      */
     private suspend fun CoroutineScope.runDirectReadLoop(fis: FileInputStream) {
-        val usbReadChunk = ByteArray(MAX_AOA_WRITE_SIZE)
+        val readBuffer = ByteArray(MAX_AOA_WRITE_SIZE)
         val streamAssembler = CarLifeStreamAssembler(initialCapacity = 65_536)
 
         try {
             while (isActive) {
-                val bytesRead = fis.read(usbReadChunk, 0, MAX_AOA_WRITE_SIZE)
+                val bytesRead = fis.read(readBuffer, 0, MAX_AOA_WRITE_SIZE)
                 if (bytesRead < 0) {
                     throw EOFException("USB AOA input stream reached EOF")
                 }
                 if (bytesRead == 0) continue
 
-                streamAssembler.append(usbReadChunk, 0, bytesRead)
+                val rawSnapshot = readBuffer.copyOf(bytesRead)
+                streamAssembler.append(readBuffer, 0, bytesRead)
                 val frames = streamAssembler.drainFrames()
+
+                if (frames.isEmpty() && bytesRead >= 8) {
+                    // Fallback if HU sent a raw packet with a header length larger than the single USB Bulk IN transfer
+                    // or a non-standard header: inspect rawSnapshot directly so it is never silently dropped
+                    val rawCh = ByteBuffer.wrap(rawSnapshot, 0, 4).order(ByteOrder.BIG_ENDIAN).int
+                    val rawLen = ByteBuffer.wrap(rawSnapshot, 4, 4).order(ByteOrder.BIG_ENDIAN).int
+                    if (rawCh !in 1..6 || rawLen == 0) {
+                        val rawHex = rawSnapshot.take(64).joinToString(" ") { "%02X".format(it) }
+                        Log.w(TAG, "USB AOA raw read ($bytesRead B, ch=$rawCh, len=$rawLen): $rawHex")
+                        streamAssembler.reset()
+                        val fallbackFrame = CarLifeFrame(
+                            header = com.example.protocol.carlife.CarLifeHeader(
+                                channel = com.example.protocol.carlife.CarLifeChannel.fromId(rawCh)
+                                    ?: com.example.protocol.carlife.CarLifeChannel.CONTROL,
+                                rawChannelId = if (rawCh in 1..6) rawCh else 1,
+                                payloadLength = rawSnapshot.size,
+                                timestamp = 0L,
+                                includeOuterTimestamp = false
+                            ),
+                            payload = rawSnapshot
+                        )
+                        _rxFrames.incrementAndGet()
+                        _rxBytes.addAndGet(bytesRead.toLong())
+                        _incomingFrames.emit(fallbackFrame)
+                        continue
+                    }
+                }
+
                 for (frame in frames) {
+                    val effectiveFrame = if (frame.payload.isEmpty()) {
+                        val rawHex = rawSnapshot.take(64).joinToString(" ") { "%02X".format(it) }
+                        Log.w(
+                            TAG,
+                            "USB AOA RX frame with payloadLen=0 (raw bytesRead=$bytesRead B): [$rawHex]"
+                        )
+                        if (bytesRead > 8) {
+                            // Ensure full readBuffer.copyOf(bytesRead) is visible in PAYLOAD[...] and parsed for serviceId at [8..11] or [12..15]
+                            frame.copy(
+                                header = frame.header.copy(payloadLength = rawSnapshot.size),
+                                payload = rawSnapshot
+                            )
+                        } else {
+                            frame
+                        }
+                    } else {
+                        frame
+                    }
                     _rxFrames.incrementAndGet()
-                    _rxBytes.addAndGet(frame.totalFrameBytes.toLong())
-                    _incomingFrames.emit(frame)
+                    _rxBytes.addAndGet(effectiveFrame.totalFrameBytes.toLong())
+                    _incomingFrames.emit(effectiveFrame)
                 }
             }
         } catch (ce: CancellationException) {

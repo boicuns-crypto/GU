@@ -74,6 +74,8 @@ data class BridgeRuntimeState(
     val projectionStats: ProjectionPipelineStats = ProjectionPipelineStats(),
     val isVideoChannelReadyForStreaming: Boolean = false,
     val useNestedVideoMsgHeader: Boolean = false,
+    val configuredWidth: Int = 800,
+    val configuredHeight: Int = 480,
     val configuredBitrateBps: Int = 800_000,
     val lastTouchOrKeyEvent: String = "None — Waiting for Touch/Hardkey Channel (0x0006)",
     val rxBytes: Long = 0L,
@@ -234,7 +236,18 @@ class BridgeForegroundService : Service() {
         private set
 
     @Volatile
+    private var activeWidth: Int = 800
+
+    @Volatile
+    private var activeHeight: Int = 480
+
+    @Volatile
     private var activeBitrateBps: Int = 800_000
+
+    @Volatile
+    private var hasSentMdInfoInSession: Boolean = false
+
+    private var mdInfoAutoStartJob: kotlinx.coroutines.Job? = null
 
     private fun setVideoStreamingReady(ready: Boolean) {
         isVideoChannelReadyForStreaming = ready
@@ -248,6 +261,57 @@ class BridgeForegroundService : Service() {
 
     private fun resetVideoLogFlags() {
         videoPacketCounter.set(0L)
+    }
+
+    /**
+     * Fix 2: Auto-starts `MSG_CMD_VIDEO_ENCODER_INIT_DONE (0x00018008)`,
+     * `MSG_CMD_VIDEO_ENCODER_START_DONE (0x0001800A)`, `MSG_CMD_FOREGROUND (0x00018025)`,
+     * and `MSG_CMD_SCREEN_ON (0x00018018)` on channel `0x0001`, immediately enables
+     * `isVideoChannelReadyForStreaming = true`, forces a `MediaCodec` `SYNC_FRAME`, and
+     * begins streaming `SPS/PPS` + `IDR` frames on channel `0x0002` in `Direct 12B` mode.
+     */
+    private suspend fun triggerAutoVideoEncoderStart(reason: String) {
+        if (usbTransport.state.value !is UsbTransportState.Connected) return
+
+        val targetW = activeWidth.coerceIn(480, 3840)
+        val targetH = activeHeight.coerceIn(272, 2160)
+        val targetFps = 30
+
+        controlStateMachine.setPreferredResolution(targetW, targetH)
+        val autoTransition = controlStateMachine.buildAutoVideoEncoderInitAndStartFrames(
+            width = targetW,
+            height = targetH,
+            fps = targetFps,
+            reason = reason
+        )
+
+        val projStats = projectionManager.stats.value
+        if (!projStats.isRunning || projStats.width != targetW || projStats.height != targetH) {
+            projectionManager.startProjection(
+                width = targetW,
+                height = targetH,
+                frameRate = targetFps,
+                bitRate = activeBitrateBps
+            )
+        }
+
+        for (reply in autoTransition.outboundFrames) {
+            if (usbTransport.sendFrameImmediate(reply)) {
+                BridgeTelemetryBus.recordFrame(
+                    direction = "TX (S26U -> HU)",
+                    frame = reply,
+                    rxBytesTotal = usbTransport.rxBytes,
+                    txBytesTotal = usbTransport.txBytes,
+                    rxFramesTotal = usbTransport.rxFrames,
+                    txFramesTotal = usbTransport.txFrames,
+                    protocolNote = "Auto-Start: ${reply.parseCommandMessageOrNull()?.serviceName ?: "Frame"} ($targetW×$targetH@${targetFps}fps)"
+                )
+            }
+        }
+
+        resetVideoLogFlags()
+        setVideoStreamingReady(true)
+        projectionManager.unlockVideoChannelAndRequestSyncFrame()
     }
 
     override fun onCreate() {
@@ -357,10 +421,14 @@ class BridgeForegroundService : Service() {
         serviceScope.launch {
             usbTransport.state.collect { newState ->
                 // On any new USB AOA connection or disconnect, lock 0x0002 streaming until 0x0001 handshake completes!
+                mdInfoAutoStartJob?.cancel()
+                mdInfoAutoStartJob = null
+                hasSentMdInfoInSession = false
                 setVideoStreamingReady(false)
                 resetVideoLogFlags()
                 if (newState is UsbTransportState.Disconnected || newState is UsbTransportState.Connecting) {
                     controlStateMachine.reset()
+                    controlStateMachine.setPreferredResolution(activeWidth, activeHeight)
                 }
                 BridgeTelemetryBus.updateState { current ->
                     current.copy(
@@ -432,23 +500,28 @@ class BridgeForegroundService : Service() {
                     @Suppress("DEPRECATION")
                     intent.getParcelableExtra(EXTRA_RESULT_DATA)
                 }
+                val requestedW = intent.getIntExtra(EXTRA_WIDTH, activeWidth).coerceIn(480, 3840)
+                val requestedH = intent.getIntExtra(EXTRA_HEIGHT, activeHeight).coerceIn(272, 2160)
+                val requestedBitrate = intent.getIntExtra(EXTRA_BITRATE, activeBitrateBps).coerceIn(400_000, 12_000_000)
+                activeWidth = requestedW
+                activeHeight = requestedH
+                activeBitrateBps = requestedBitrate
+                controlStateMachine.setPreferredResolution(requestedW, requestedH)
+
                 if (resultCode == Activity.RESULT_OK && resultData != null) {
                     MediaProjectionTokenStore.saveToken(resultCode, resultData)
                     promoteToForeground(usbTransport.state.value)
-                    val session = controlStateMachine.sessionState.value
-                    val targetW = session.negotiatedVideoWidth.coerceIn(480, 3840)
-                    val targetH = session.negotiatedVideoHeight.coerceIn(272, 2160)
-                    val targetFps = session.negotiatedFps.coerceIn(15, 60)
+                    val targetW = activeWidth
+                    val targetH = activeHeight
+                    val targetFps = 30
                     val wasHandshakeReady = (usbTransport.state.value is UsbTransportState.Connected) &&
-                        (session.phase == com.example.protocol.carlife.CarLifeSessionPhase.VIDEO_STREAMING)
+                        (isVideoChannelReadyForStreaming ||
+                            controlStateMachine.sessionState.value.phase == com.example.protocol.carlife.CarLifeSessionPhase.VIDEO_STREAMING)
                     if (!wasHandshakeReady) {
                         setVideoStreamingReady(false)
                     }
                     serviceScope.launch {
                         resetVideoLogFlags()
-                        if (projectionManager.stats.value.isRunning) {
-                            projectionManager.stopProjection()
-                        }
                         projectionManager.setVideoChannelReady(wasHandshakeReady)
                         projectionManager.startProjection(
                             width = targetW,
@@ -462,30 +535,73 @@ class BridgeForegroundService : Service() {
                     }
                     BridgeTelemetryBus.updateState {
                         it.copy(
+                            configuredWidth = targetW,
+                            configuredHeight = targetH,
+                            configuredBitrateBps = activeBitrateBps,
                             lastProtocolEvent = if (wasHandshakeReady) {
                                 "MediaProjection granted — Streaming 0x0002 ($targetW×$targetH @ ${activeBitrateBps / 1000} kbps)"
                             } else {
-                                "MediaProjection granted — SPS/PPS cached in memory (0x0002 waits for MSG_CMD_VIDEO_ENCODER_INIT)"
+                                "MediaProjection granted ($targetW×$targetH) — SPS/PPS cached in memory"
                             }
                         )
                     }
                 }
             }
 
+            ACTION_SET_VIDEO_CONFIG -> {
+                val width = intent.getIntExtra(EXTRA_WIDTH, activeWidth).coerceIn(480, 3840)
+                val height = intent.getIntExtra(EXTRA_HEIGHT, activeHeight).coerceIn(272, 2160)
+                val bitrate = intent.getIntExtra(EXTRA_BITRATE, activeBitrateBps).coerceIn(400_000, 12_000_000)
+                activeWidth = width
+                activeHeight = height
+                activeBitrateBps = bitrate
+                controlStateMachine.setPreferredResolution(width, height)
+                BridgeTelemetryBus.updateState {
+                    it.copy(
+                        configuredWidth = width,
+                        configuredHeight = height,
+                        configuredBitrateBps = bitrate,
+                        lastProtocolEvent = "Video Config Set: ${width}×${height} @ ${bitrate / 1000} kbps"
+                    )
+                }
+                if (projectionManager.stats.value.isRunning) {
+                    val wasReady = isVideoChannelReadyForStreaming
+                    serviceScope.launch {
+                        projectionManager.startProjection(
+                            width = width,
+                            height = height,
+                            frameRate = 30,
+                            bitRate = bitrate
+                        )
+                        if (wasReady && usbTransport.state.value is UsbTransportState.Connected) {
+                            triggerAutoVideoEncoderStart("Resolution/Bitrate Updated (${width}×${height})")
+                        }
+                    }
+                }
+            }
+
             ACTION_START_PROJECTION -> {
-                val width = intent.getIntExtra(EXTRA_WIDTH, 800)
-                val height = intent.getIntExtra(EXTRA_HEIGHT, 480)
+                val width = intent.getIntExtra(EXTRA_WIDTH, activeWidth).coerceIn(480, 3840)
+                val height = intent.getIntExtra(EXTRA_HEIGHT, activeHeight).coerceIn(272, 2160)
                 val fps = intent.getIntExtra(EXTRA_FPS, 30)
                 val bitrate = intent.getIntExtra(EXTRA_BITRATE, activeBitrateBps).coerceIn(400_000, 12_000_000)
+                activeWidth = width
+                activeHeight = height
                 activeBitrateBps = bitrate
-                controlStateMachine.preferredVideoWidth = width
-                controlStateMachine.preferredVideoHeight = height
+                controlStateMachine.setPreferredResolution(width, height)
                 val wasHandshakeReady = (usbTransport.state.value is UsbTransportState.Connected) &&
-                    (controlStateMachine.sessionState.value.phase == com.example.protocol.carlife.CarLifeSessionPhase.VIDEO_STREAMING)
+                    (isVideoChannelReadyForStreaming ||
+                        controlStateMachine.sessionState.value.phase == com.example.protocol.carlife.CarLifeSessionPhase.VIDEO_STREAMING)
                 if (!wasHandshakeReady) {
                     setVideoStreamingReady(false)
                 }
-                BridgeTelemetryBus.updateState { it.copy(configuredBitrateBps = bitrate) }
+                BridgeTelemetryBus.updateState {
+                    it.copy(
+                        configuredWidth = width,
+                        configuredHeight = height,
+                        configuredBitrateBps = bitrate
+                    )
+                }
                 serviceScope.launch {
                     resetVideoLogFlags()
                     projectionManager.setVideoChannelReady(wasHandshakeReady)
@@ -652,44 +768,70 @@ class BridgeForegroundService : Service() {
                 when (cmd?.serviceType) {
                     CarLifeMsgType.MSG_CMD_HU_PROTOCOL_VERSION,
                     CarLifeMsgType.MSG_CMD_HU_PROTOCOL_VERSION_ALT -> {
-                        // Handshake just started: keep 0x0002 strictly locked until MSG_CMD_VIDEO_ENCODER_INIT (0x00010007)
+                        // Handshake just started: lock 0x0002 for the initial 150ms MD_INFO window,
+                        // then auto-start VIDEO_ENCODER_INIT_DONE + START_DONE + H.264 stream!
                         setVideoStreamingReady(false)
+                        hasSentMdInfoInSession = true
+                        mdInfoAutoStartJob?.cancel()
+                        mdInfoAutoStartJob = serviceScope.launch {
+                            kotlinx.coroutines.delay(150L)
+                            if (usbTransport.state.value is UsbTransportState.Connected && !isVideoChannelReadyForStreaming) {
+                                triggerAutoVideoEncoderStart("Auto-Start 150ms after MSG_CMD_MD_INFO (0x00018003)")
+                            }
+                        }
+                    }
+
+                    CarLifeMsgType.MSG_CMD_HU_INFO,
+                    CarLifeMsgType.MSG_CMD_HU_INFO_ALT -> {
+                        hasSentMdInfoInSession = true
+                        mdInfoAutoStartJob?.cancel()
+                        if (!isVideoChannelReadyForStreaming) {
+                            triggerAutoVideoEncoderStart("Auto-Start after MSG_CMD_HU_INFO")
+                        } else {
+                            projectionManager.requestInstantIdrKeyFrame()
+                        }
                     }
 
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT,
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT_ALT,
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_RESET,
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_RESET_ALT -> {
-                        val s = transition.updatedState
+                        mdInfoAutoStartJob?.cancel()
+                        val targetW = activeWidth.coerceIn(480, 3840)
+                        val targetH = activeHeight.coerceIn(272, 2160)
+                        controlStateMachine.setPreferredResolution(targetW, targetH)
                         resetVideoLogFlags()
                         val projStats = projectionManager.stats.value
                         if (!projStats.isRunning ||
-                            projStats.width != s.negotiatedVideoWidth ||
-                            projStats.height != s.negotiatedVideoHeight
+                            projStats.width != targetW ||
+                            projStats.height != targetH
                         ) {
                             projectionManager.startProjection(
-                                width = s.negotiatedVideoWidth,
-                                height = s.negotiatedVideoHeight,
-                                frameRate = s.negotiatedFps,
+                                width = targetW,
+                                height = targetH,
+                                frameRate = 30,
                                 bitRate = activeBitrateBps
                             )
                         }
-                        // ONLY NOW, after MSG_CMD_VIDEO_ENCODER_INIT (0x00010007) was received and
-                        // MSG_CMD_VIDEO_ENCODER_INIT_DONE (0x00018008) was sent, unlock 0x0002 streaming,
-                        // force PARAMETER_KEY_REQUEST_SYNC_FRAME = 0, and send Packet #1 (SPS/PPS) + Packet #2 (SPS/PPS + IDR)!
                         setVideoStreamingReady(true)
                         projectionManager.unlockVideoChannelAndRequestSyncFrame()
                     }
 
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START,
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_ALT -> {
-                        val s = transition.updatedState
+                        mdInfoAutoStartJob?.cancel()
+                        val targetW = activeWidth.coerceIn(480, 3840)
+                        val targetH = activeHeight.coerceIn(272, 2160)
+                        controlStateMachine.setPreferredResolution(targetW, targetH)
                         resetVideoLogFlags()
-                        if (!projectionManager.stats.value.isRunning) {
+                        if (!projectionManager.stats.value.isRunning ||
+                            projectionManager.stats.value.width != targetW ||
+                            projectionManager.stats.value.height != targetH
+                        ) {
                             projectionManager.startProjection(
-                                width = s.negotiatedVideoWidth,
-                                height = s.negotiatedVideoHeight,
-                                frameRate = s.negotiatedFps,
+                                width = targetW,
+                                height = targetH,
+                                frameRate = 30,
                                 bitRate = activeBitrateBps
                             )
                         }
@@ -698,7 +840,47 @@ class BridgeForegroundService : Service() {
                     }
 
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_PAUSE -> {
+                        mdInfoAutoStartJob?.cancel()
                         setVideoStreamingReady(false)
+                    }
+
+                    else -> {
+                        // Fix 2: Upon ANY subsequent RX packet from the Head Unit after MD_INFO
+                        // (including Payload: 0B / cmd == null or any poll packet at 06:34:18):
+                        // 1) If 0x0002 is not yet streaming, immediately run triggerAutoVideoEncoderStart.
+                        // 2) If 0x0002 is already streaming, reply with INIT_DONE + START_DONE (0x0001800A)
+                        //    and emit an immediate SPS/PPS + IDR keyframe!
+                        if (hasSentMdInfoInSession) {
+                            mdInfoAutoStartJob?.cancel()
+                            if (!isVideoChannelReadyForStreaming) {
+                                triggerAutoVideoEncoderStart(
+                                    "Auto-Start on RX Control Packet (${cmd?.serviceName ?: "Payload:${frame.payload.size}B"})"
+                                )
+                            } else {
+                                if (transition.outboundFrames.isEmpty()) {
+                                    val extraReplies = controlStateMachine.buildStartDoneReplyFrames(
+                                        includeInitDone = true,
+                                        width = activeWidth,
+                                        height = activeHeight,
+                                        fps = 30
+                                    )
+                                    for (reply in extraReplies) {
+                                        if (usbTransport.sendFrameImmediate(reply)) {
+                                            BridgeTelemetryBus.recordFrame(
+                                                direction = "TX (S26U -> HU)",
+                                                frame = reply,
+                                                rxBytesTotal = usbTransport.rxBytes,
+                                                txBytesTotal = usbTransport.txBytes,
+                                                rxFramesTotal = usbTransport.rxFrames,
+                                                txFramesTotal = usbTransport.txFrames,
+                                                protocolNote = "RX Follow-Up Reply: ${reply.parseCommandMessageOrNull()?.serviceName ?: "Frame"}"
+                                            )
+                                        }
+                                    }
+                                }
+                                projectionManager.requestInstantIdrKeyFrame()
+                            }
+                        }
                     }
                 }
             }
@@ -913,6 +1095,7 @@ class BridgeForegroundService : Service() {
         const val ACTION_ATTACH_ACCESSORY = "com.example.core.usb.action.ATTACH_ACCESSORY"
         const val ACTION_SCAN_AND_CONNECT = "com.example.core.usb.action.SCAN_AND_CONNECT"
         const val ACTION_GRANT_MEDIA_PROJECTION = "com.example.core.usb.action.GRANT_MEDIA_PROJECTION"
+        const val ACTION_SET_VIDEO_CONFIG = "com.example.core.usb.action.SET_VIDEO_CONFIG"
         const val ACTION_START_PROJECTION = "com.example.core.usb.action.START_PROJECTION"
         const val ACTION_STOP_PROJECTION = "com.example.core.usb.action.STOP_PROJECTION"
         const val ACTION_INJECT_TEST_TOUCH = "com.example.core.usb.action.INJECT_TEST_TOUCH"
@@ -933,10 +1116,14 @@ class BridgeForegroundService : Service() {
 
         fun grantMediaProjection(context: Context, resultCode: Int, resultData: Intent) {
             MediaProjectionTokenStore.saveToken(resultCode, resultData)
+            val currentState = BridgeTelemetryBus.runtimeState.value
             val intent = Intent(context, BridgeForegroundService::class.java).apply {
                 action = ACTION_GRANT_MEDIA_PROJECTION
                 putExtra(EXTRA_RESULT_CODE, resultCode)
                 putExtra(EXTRA_RESULT_DATA, resultData)
+                putExtra(EXTRA_WIDTH, currentState.configuredWidth)
+                putExtra(EXTRA_HEIGHT, currentState.configuredHeight)
+                putExtra(EXTRA_BITRATE, currentState.configuredBitrateBps)
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 context.startForegroundService(intent)

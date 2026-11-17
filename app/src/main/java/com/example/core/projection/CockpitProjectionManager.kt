@@ -210,6 +210,8 @@ class CockpitProjectionManager(
         }
     }
 
+    private var presentationRefreshJob: Job? = null
+
     suspend fun startProjection(
         width: Int = 800,
         height: Int = 480,
@@ -217,7 +219,9 @@ class CockpitProjectionManager(
         bitRate: Int = 800_000,
         densityDpi: Int = DisplayMetrics.DENSITY_MEDIUM
     ): Boolean = projectionMutex.withLock {
-        stopProjectionLocked()
+        // Stop only the previous MediaCodec / Surface while preserving any live MediaProjection & VirtualDisplay
+        // so Android 14/15/16 single-use MediaProjection tokens are never invalidated on resolution switch!
+        stopEncoderOnlyLocked()
 
         val safeWidth = if (width in 480..3840) width else 800
         val safeHeight = if (height in 272..2160) height else 480
@@ -233,9 +237,9 @@ class CockpitProjectionManager(
 
         var codec: MediaCodec? = null
         var inputSurface: Surface? = null
-        var vDisplay: VirtualDisplay? = null
-        var activeMp: MediaProjection? = null
-        var usedMediaProjection = false
+        var vDisplay: VirtualDisplay? = virtualDisplay
+        var activeMp: MediaProjection? = mediaProjection
+        var usedMediaProjection = (vDisplay != null && activeMp != null)
 
         return@withLock try {
             codec = configureLowLatencyAvcEncoder(safeWidth, safeHeight, safeFps, safeBitRate)
@@ -251,40 +255,57 @@ class CockpitProjectionManager(
                 drainHardwareEncoderLoop(codec, safeBitRate)
             }
 
-            // Check if user granted MediaProjection (Step 5)
-            val tokenData = MediaProjectionTokenStore.resultData
-            val tokenCode = MediaProjectionTokenStore.resultCode
-            if (tokenCode == Activity.RESULT_OK && tokenData != null) {
+            if (usedMediaProjection && vDisplay != null) {
+                // Reuse existing VirtualDisplay on Android 14/15/16: resize to new resolution & swap Surface
                 runCatching {
-                    val mp = mediaProjectionManager.getMediaProjection(tokenCode, Intent(tokenData))
-                    if (mp != null) {
-                        val callback = object : MediaProjection.Callback() {
-                            override fun onStop() {
-                                Log.w(TAG, "MediaProjection stopped by system")
-                                MediaProjectionTokenStore.clearToken()
-                            }
-                        }
-                        mp.registerCallback(callback, mainHandler)
-                        mediaProjectionCallback = callback
-                        activeMp = mp
-
-                        vDisplay = mp.createVirtualDisplay(
-                            VIRTUAL_DISPLAY_NAME,
-                            safeWidth,
-                            safeHeight,
-                            effectiveDpi,
-                            DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR or
-                                DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or
-                                DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION,
-                            inputSurface,
-                            null,
-                            mainHandler
-                        )
-                        usedMediaProjection = true
-                    }
+                    vDisplay!!.resize(safeWidth, safeHeight, effectiveDpi)
+                    vDisplay!!.surface = inputSurface
                 }.onFailure { e ->
-                    Log.w(TAG, "MediaProjection VirtualDisplay creation failed, switching to Canvas Surface Feeder: ${e.message}")
-                    MediaProjectionTokenStore.clearToken()
+                    Log.w(TAG, "VirtualDisplay resize/setSurface failed (${e.message}), recreating")
+                    runCatching { vDisplay?.release() }
+                    vDisplay = null
+                    usedMediaProjection = false
+                }
+            }
+
+            // If no existing VirtualDisplay, check if user granted MediaProjection (Step 5)
+            if (!usedMediaProjection) {
+                val tokenData = MediaProjectionTokenStore.resultData
+                val tokenCode = MediaProjectionTokenStore.resultCode
+                if (tokenCode == Activity.RESULT_OK && tokenData != null) {
+                    runCatching {
+                        val mp = activeMp ?: mediaProjectionManager.getMediaProjection(tokenCode, Intent(tokenData))
+                        if (mp != null) {
+                            if (mediaProjectionCallback == null) {
+                                val callback = object : MediaProjection.Callback() {
+                                    override fun onStop() {
+                                        Log.w(TAG, "MediaProjection stopped by system")
+                                        MediaProjectionTokenStore.clearToken()
+                                    }
+                                }
+                                mp.registerCallback(callback, mainHandler)
+                                mediaProjectionCallback = callback
+                            }
+                            activeMp = mp
+
+                            vDisplay = mp.createVirtualDisplay(
+                                VIRTUAL_DISPLAY_NAME,
+                                safeWidth,
+                                safeHeight,
+                                effectiveDpi,
+                                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR or
+                                    DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or
+                                    DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION,
+                                inputSurface,
+                                null,
+                                mainHandler
+                            )
+                            usedMediaProjection = true
+                        }
+                    }.onFailure { e ->
+                        Log.w(TAG, "MediaProjection VirtualDisplay creation failed, switching to Canvas Surface Feeder: ${e.message}")
+                        MediaProjectionTokenStore.clearToken()
+                    }
                 }
             }
 
@@ -293,18 +314,32 @@ class CockpitProjectionManager(
                 awaitDisplayRegistered(createdDisplay.displayId)
 
                 // Immediately render CarLife Launcher UI onto the VirtualDisplay via CockpitPresentation
-                runCatching {
-                    val presentation = showPresentationWithRetry(createdDisplay)
-                    withContext(Dispatchers.Main.immediate) {
-                        cockpitPresentation = presentation
-                        presentation.window?.decorView?.postInvalidate()
+                if (cockpitPresentation == null || cockpitPresentation?.display?.displayId != createdDisplay.displayId) {
+                    runCatching {
+                        withContext(Dispatchers.Main.immediate) {
+                            runCatching { cockpitPresentation?.dismiss() }
+                            cockpitPresentation = null
+                        }
+                        val presentation = showPresentationWithRetry(createdDisplay)
+                        withContext(Dispatchers.Main.immediate) {
+                            cockpitPresentation = presentation
+                            presentation.window?.decorView?.postInvalidate()
+                        }
+                    }.onFailure { e ->
+                        Log.w(TAG, "Presentation overlay skipped (MediaProjection Auto-Mirror still active): ${e.message}")
                     }
-                }.onFailure { e ->
-                    Log.w(TAG, "Presentation overlay skipped (MediaProjection Auto-Mirror still active): ${e.message}")
+                } else {
+                    withContext(Dispatchers.Main.immediate) {
+                        cockpitPresentation?.window?.decorView?.requestLayout()
+                        cockpitPresentation?.window?.decorView?.postInvalidate()
+                    }
                 }
 
                 mediaProjection = activeMp
                 virtualDisplay = vDisplay
+
+                // Periodically invalidate CockpitPresentation so VirtualDisplay continuously feeds MediaCodec
+                startPresentationRefreshLoop()
 
                 CarLifeLauncherRepository.markLauncherActiveOnDisplay(
                     displayId = createdDisplay.displayId,
@@ -323,7 +358,7 @@ class CockpitProjectionManager(
                         fps = safeFps,
                         bitRateMbps = (safeBitRate / 1_000_000).coerceAtLeast(1),
                         bitRateKbps = safeBitRate / 1_000,
-                        activeCockpitWidget = "Лаунчер ГУ активен на VD #${createdDisplay.displayId}",
+                        activeCockpitWidget = "Лаунчер ГУ активен на VD #${createdDisplay.displayId} ($safeWidth×$safeHeight)",
                         statusMessage = "Лаунчер ГУ активен на VD #${createdDisplay.displayId} ($safeWidth×$safeHeight @ ${safeBitRate / 1000} кбит/с)"
                     )
                 }
@@ -360,7 +395,7 @@ class CockpitProjectionManager(
                         fps = safeFps,
                         bitRateMbps = (safeBitRate / 1_000_000).coerceAtLeast(1),
                         bitRateKbps = safeBitRate / 1_000,
-                        activeCockpitWidget = "Лаунчер ГУ активен (Direct Surface)",
+                        activeCockpitWidget = "Лаунчер ГУ активен ($safeWidth×$safeHeight)",
                         statusMessage = "Лаунчер ГУ активен ($safeWidth×$safeHeight @ ${safeBitRate / 1000} кбит/с)"
                     )
                 }
@@ -369,12 +404,10 @@ class CockpitProjectionManager(
             true
         } catch (t: Throwable) {
             Log.e(TAG, "Failed to initialize CockpitProjectionManager", t)
-            runCatching { vDisplay?.release() }
-            runCatching { activeMp?.stop() }
             runCatching { codec?.stop() }
             runCatching { codec?.release() }
             runCatching { inputSurface?.release() }
-            stopProjectionLocked(updateStatus = false)
+            stopEncoderOnlyLocked()
             _stats.update {
                 it.copy(
                     isRunning = false,
@@ -385,6 +418,16 @@ class CockpitProjectionManager(
                 )
             }
             false
+        }
+    }
+
+    private fun startPresentationRefreshLoop() {
+        presentationRefreshJob?.cancel()
+        presentationRefreshJob = externalScope.launch(Dispatchers.Main) {
+            while (isActive && isEncoding.get()) {
+                cockpitPresentation?.window?.decorView?.postInvalidate()
+                delay(100L)
+            }
         }
     }
 
@@ -730,6 +773,9 @@ class CockpitProjectionManager(
     fun unlockVideoChannelAndRequestSyncFrame() {
         awaitingFirstIdrAfterGateOpen.set(true)
         isVideoChannelReadyForStreaming = true
+        mainHandler.post {
+            cockpitPresentation?.window?.decorView?.postInvalidate()
+        }
 
         val codec = mediaCodec ?: return
         runCatching {
@@ -764,6 +810,9 @@ class CockpitProjectionManager(
      * ONLY if `isVideoChannelReadyForStreaming` is `true`.
      */
     fun requestInstantIdrKeyFrame() {
+        mainHandler.post {
+            cockpitPresentation?.window?.decorView?.postInvalidate()
+        }
         val codec = mediaCodec ?: return
         runCatching {
             val params = Bundle().apply {
@@ -776,12 +825,30 @@ class CockpitProjectionManager(
         val spsPps = cachedSpsPpsAnnexB?.let { CarLifeFrameCodec.ensureAnnexBStartCode(it) }
         val idr = lastKeyFrameAnnexB?.let { CarLifeFrameCodec.ensureAnnexBStartCode(it) }
         val tsMs = SystemClock.uptimeMillis() and 0x7FFF_FFFFL
+        var addedNals = 0L
+        var addedBytes = 0L
+        var lastIdrSize = 0
         if (spsPps != null) {
             onEncodedVideoNal(spsPps, tsMs, false)
+            addedNals += 1L
+            addedBytes += spsPps.size.toLong()
         }
         if (idr != null) {
             val combinedIdr = if (spsPps != null) spsPps + idr else idr
             onEncodedVideoNal(combinedIdr, tsMs + 1L, true)
+            addedNals += 1L
+            addedBytes += combinedIdr.size.toLong()
+            lastIdrSize = combinedIdr.size
+        }
+        if (addedNals > 0L) {
+            _stats.update {
+                it.copy(
+                    spsPpsConfigured = spsPps != null || it.spsPpsConfigured,
+                    encodedNalFrames = it.encodedNalFrames + addedNals,
+                    encodedBytes = it.encodedBytes + addedBytes,
+                    lastIdrBytes = if (lastIdrSize > 0) lastIdrSize else it.lastIdrBytes
+                )
+            }
         }
     }
 
@@ -939,12 +1006,29 @@ class CockpitProjectionManager(
         stopProjectionLocked(updateStatus = true)
     }
 
-    private suspend fun stopProjectionLocked(updateStatus: Boolean = true) {
+    private fun stopEncoderOnlyLocked() {
         isEncoding.set(false)
+        presentationRefreshJob?.cancel()
+        presentationRefreshJob = null
         canvasFeederJob?.cancel()
         canvasFeederJob = null
         encoderDrainJob?.cancel()
         encoderDrainJob = null
+
+        runCatching { virtualDisplay?.surface = null }
+
+        runCatching { mediaCodec?.stop() }
+        runCatching { mediaCodec?.release() }
+        mediaCodec = null
+
+        runCatching { encoderInputSurface?.release() }
+        encoderInputSurface = null
+        cachedSpsPpsAnnexB = null
+        lastKeyFrameAnnexB = null
+    }
+
+    private suspend fun stopProjectionLocked(updateStatus: Boolean = true) {
+        stopEncoderOnlyLocked()
 
         withContext(Dispatchers.Main.immediate) {
             runCatching { cockpitPresentation?.dismiss() }
@@ -962,15 +1046,6 @@ class CockpitProjectionManager(
         }
         mediaProjectionCallback = null
         mediaProjection = null
-
-        runCatching { mediaCodec?.stop() }
-        runCatching { mediaCodec?.release() }
-        mediaCodec = null
-
-        runCatching { encoderInputSurface?.release() }
-        encoderInputSurface = null
-        cachedSpsPpsAnnexB = null
-        lastKeyFrameAnnexB = null
 
         if (updateStatus) {
             _stats.update {

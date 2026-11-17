@@ -237,4 +237,47 @@ class ExampleUnitTest {
         assertEquals(CarLifeMsgType.MSG_VIDEO_DATA, cmd!!.serviceType)
         assertArrayEquals(h264Nal, cmd.body)
     }
+
+    @Test
+    fun streamAssembler_extractsServiceIdFrom16ByteZeroLengthFrame_andAutoStartsAfterMdInfo() {
+        val assembler = com.example.protocol.carlife.CarLifeStreamAssembler()
+        // Simulate 16-byte USB AOA read where bytes[4..7] == 00 00 00 00, bytes[8..11] == 00 00 00 00,
+        // and bytes[12..15] == 0x00010007 (MSG_CMD_VIDEO_ENCODER_INIT)
+        val raw16BytePacket = byteArrayOf(
+            0x00, 0x00, 0x00, 0x01, // Channel 1
+            0x00, 0x00, 0x00, 0x00, // Outer length = 0
+            0x00, 0x00, 0x00, 0x00, // Inner protoLen = 0, reserved = 0
+            0x00, 0x01, 0x00, 0x07  // serviceId = MSG_CMD_VIDEO_ENCODER_INIT (0x00010007)
+        )
+        assembler.append(raw16BytePacket, 0, raw16BytePacket.size)
+        val frames = assembler.drainFrames()
+        assertEquals(1, frames.size)
+        assertEquals(8, frames[0].payload.size)
+        val parsed = frames[0].parseCommandMessageOrNull()
+        assertNotNull(parsed)
+        assertEquals(CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT, parsed!!.serviceType)
+
+        // Verify auto-start after MD_INFO builds INIT_DONE + START_DONE + FOREGROUND + SCREEN_ON with synced resolution
+        val sm = CarLifeControlStateMachine()
+        sm.setPreferredResolution(800, 480)
+        val autoStart = sm.buildAutoVideoEncoderInitAndStartFrames(800, 480, 30)
+        assertEquals(4, autoStart.outboundFrames.size)
+        assertEquals(
+            CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT_DONE,
+            autoStart.outboundFrames[0].parseCommandMessageOrNull()?.serviceType
+        )
+        assertEquals(
+            CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_DONE,
+            autoStart.outboundFrames[1].parseCommandMessageOrNull()?.serviceType
+        )
+        assertEquals(
+            CarLifeMsgType.MSG_CMD_FOREGROUND,
+            autoStart.outboundFrames[2].parseCommandMessageOrNull()?.serviceType
+        )
+        assertEquals(
+            CarLifeMsgType.MSG_CMD_SCREEN_ON,
+            autoStart.outboundFrames[3].parseCommandMessageOrNull()?.serviceType
+        )
+    }
 }
+

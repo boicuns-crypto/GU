@@ -644,29 +644,65 @@ fun CarLifeBridgeApp(
                         state = runtimeState,
                         checklistStatus = checklistStatus,
                         lastLaunchStatus = lastLaunchStatus,
-                        configuredWidth = configuredWidth,
-                        configuredHeight = configuredHeight,
-                        configuredBitrateKbps = configuredBitrateKbps,
+                        configuredWidth = runtimeState.configuredWidth,
+                        configuredHeight = runtimeState.configuredHeight,
+                        configuredBitrateKbps = runtimeState.configuredBitrateBps / 1_000,
                         onSelectResolution = { w, h ->
                             configuredWidth = w
                             configuredHeight = h
-                            if (runtimeState.projectionStats.isRunning) {
-                                onStartProjection(w, h, 30)
+                            val currentBitrate = runtimeState.configuredBitrateBps
+                            BridgeTelemetryBus.updateState {
+                                it.copy(
+                                    configuredWidth = w,
+                                    configuredHeight = h,
+                                    projectionStats = it.projectionStats.copy(width = w, height = h),
+                                    controlSession = it.controlSession.copy(
+                                        negotiatedVideoWidth = w,
+                                        negotiatedVideoHeight = h
+                                    )
+                                )
                             }
+                            CarLifeLauncherRepository.markLauncherActiveOnDisplay(
+                                displayId = runtimeState.projectionStats.virtualDisplayId,
+                                width = w,
+                                height = h,
+                                bitrateBps = currentBitrate
+                            )
+                            val cfgIntent = Intent(context, BridgeForegroundService::class.java).apply {
+                                action = BridgeForegroundService.ACTION_SET_VIDEO_CONFIG
+                                putExtra(BridgeForegroundService.EXTRA_WIDTH, w)
+                                putExtra(BridgeForegroundService.EXTRA_HEIGHT, h)
+                                putExtra(BridgeForegroundService.EXTRA_BITRATE, currentBitrate)
+                            }
+                            context.startService(cfgIntent)
                         },
                         onSelectBitrate = { kbps ->
                             configuredBitrateKbps = kbps
                             val bps = kbps * 1_000
-                            BridgeTelemetryBus.updateState { it.copy(configuredBitrateBps = bps) }
-                            if (runtimeState.projectionStats.isRunning) {
-                                onStartProjection(configuredWidth, configuredHeight, 30)
+                            val w = runtimeState.configuredWidth
+                            val h = runtimeState.configuredHeight
+                            BridgeTelemetryBus.updateState {
+                                it.copy(configuredBitrateBps = bps)
                             }
+                            CarLifeLauncherRepository.markLauncherActiveOnDisplay(
+                                displayId = runtimeState.projectionStats.virtualDisplayId,
+                                width = w,
+                                height = h,
+                                bitrateBps = bps
+                            )
+                            val cfgIntent = Intent(context, BridgeForegroundService::class.java).apply {
+                                action = BridgeForegroundService.ACTION_SET_VIDEO_CONFIG
+                                putExtra(BridgeForegroundService.EXTRA_WIDTH, w)
+                                putExtra(BridgeForegroundService.EXTRA_HEIGHT, h)
+                                putExtra(BridgeForegroundService.EXTRA_BITRATE, bps)
+                            }
+                            context.startService(cfgIntent)
                         },
                         onToggleProjection = {
                             if (runtimeState.projectionStats.isRunning) {
                                 onStopProjection()
                             } else {
-                                onStartProjection(configuredWidth, configuredHeight, 30)
+                                onStartProjection(runtimeState.configuredWidth, runtimeState.configuredHeight, 30)
                             }
                         },
                         onOpenAccessibilitySettings = {
@@ -1395,7 +1431,9 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                         border = BorderStroke(1.dp, ObsidianBorder)
                     ) {
                         val vdStatusLine = if (state.projectionStats.isRunning && !lastLaunchStatus.startsWith("Запущено:")) {
-                            "Лаунчер ГУ активен на VD #${state.projectionStats.virtualDisplayId} (${state.projectionStats.width}×${state.projectionStats.height} @ ${state.configuredBitrateBps / 1000} кбит/с)"
+                            "Лаунчер ГУ активен на VD #${state.projectionStats.virtualDisplayId} (${state.configuredWidth}×${state.configuredHeight} @ ${state.configuredBitrateBps / 1000} кбит/с)"
+                        } else if (!state.projectionStats.isRunning) {
+                            "Готов к трансляции: выбрано разрешение ${state.configuredWidth}×${state.configuredHeight} @ ${state.configuredBitrateBps / 1000} кбит/с"
                         } else {
                             lastLaunchStatus
                         }
@@ -2006,7 +2044,7 @@ private fun ProjectionEngineCard(
                 )
                 MetricPill(
                     label = "SURFACE",
-                    value = "${proj.width}×${proj.height}",
+                    value = "${state.configuredWidth}×${state.configuredHeight}",
                     subValue = "${proj.fps} FPS",
                     modifier = Modifier.weight(1f)
                 )
@@ -2018,7 +2056,7 @@ private fun ProjectionEngineCard(
             ) {
                 if (!proj.isRunning) {
                     Button(
-                        onClick = { onStartProjection(800, 480, 30) },
+                        onClick = { onStartProjection(state.configuredWidth, state.configuredHeight, 30) },
                         modifier = Modifier
                             .weight(1f)
                             .testTag("start_projection_btn"),

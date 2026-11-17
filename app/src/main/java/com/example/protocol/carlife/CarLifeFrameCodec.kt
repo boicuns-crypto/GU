@@ -346,6 +346,8 @@ data class CarLifeFrame(
         val word0IsService = CarLifeMsgType.isCarLifeServiceId(word0) && u16MsgLen == 0x0001
         val word1IsService = CarLifeMsgType.isCarLifeServiceId(word1)
         val word2IsService = payload.size >= 12 && CarLifeMsgType.isCarLifeServiceId(word2)
+        val word3 = if (payload.size >= 16) buf.getInt(12) else 0
+        val word3IsService = payload.size >= 16 && CarLifeMsgType.isCarLifeServiceId(word3)
 
         return when {
             // Subcase 2A (Standard CarLife Inner Header): bytes[8..9]=u16MsgLen, bytes[10..11]=00 00, bytes[12..15]=serviceId
@@ -392,9 +394,26 @@ data class CarLifeFrame(
                 )
             }
 
+            // Subcase 2D: Full raw USB buffer captured in payload where bytes[12..15] (word3) is serviceId
+            word3IsService -> {
+                val avail = payload.size - 16
+                val innerU16Len = buf.getShort(8).toInt() and 0xFFFF
+                val safeLen = if (innerU16Len in 0..avail) innerU16Len else avail
+                val body = if (safeLen > 0) payload.copyOfRange(16, 16 + safeLen) else ByteArray(0)
+                CarLifeCommandMessage(
+                    serviceType = word3,
+                    body = body
+                )
+            }
+
             // Fallback: never drop any Control/Touch frame as malformed
             else -> {
-                val chosenService = if (word1 != 0) word1 else word0
+                val chosenService = when {
+                    word1 != 0 -> word1
+                    word2 != 0 -> word2
+                    word3 != 0 -> word3
+                    else -> word0
+                }
                 val avail = payload.size - 8
                 val safeLen = if (u16MsgLen in 0..avail) u16MsgLen else avail
                 val body = if (safeLen > 0) payload.copyOfRange(8, 8 + safeLen) else ByteArray(0)
@@ -1077,13 +1096,44 @@ class CarLifeStreamAssembler(initialCapacity: Int = 65_536) {
             val headerSize = channel.headerSizeBytes // 8 for 0x0001 & 0x0006; 12 for 0x0002..0x0005
             var effectivePayloadLen = rawLength
 
-            // Special handling for 12-byte Control (0x0001) & Touch (0x0006) frames from MQB Head Unit:
-            if (!channel.hasTimestampHeader && availableBytes >= 12) {
-                val wordAt8 = peekIntBigEndian(readPos + 8)
-                val wordAt8IsServiceId = CarLifeMsgType.isCarLifeServiceId(wordAt8)
-                if (rawLength == 0 && wordAt8IsServiceId) {
-                    // [00 00 00 01][00 00 00 00][00 01 xx xx] -> 12-byte frame with 4B serviceId at [8..11]
-                    effectivePayloadLen = 4
+            // Special handling for 12-byte and 16-byte Control (0x0001) & Touch (0x0006) frames from MQB Head Unit,
+            // including firmwares where bytes[4..7] == 00 00 00 00 (or bytes[4..7] == protoLen) followed by
+            // [protoLen:2B][00 00:2B][serviceId:4B][protoBytes]!
+            if (!channel.hasTimestampHeader && availableBytes > 8) {
+                val wordAt8 = if (availableBytes >= 12) peekIntBigEndian(readPos + 8) else 0
+                val wordAt8IsServiceId = availableBytes >= 12 && CarLifeMsgType.isCarLifeServiceId(wordAt8)
+                val u16ProtoLen = if (availableBytes >= 10) peekUInt16BigEndian(readPos + 8) else 0
+                val u16Reserved = if (availableBytes >= 12) peekUInt16BigEndian(readPos + 10) else 0
+                val wordAt12 = if (availableBytes >= 16) peekIntBigEndian(readPos + 12) else 0
+                val wordAt12IsServiceId = availableBytes >= 16 && CarLifeMsgType.isCarLifeServiceId(wordAt12)
+
+                if (rawLength == 0) {
+                    when {
+                        // Case A: [00 00 00 01][00 00 00 00][u16ProtoLen:2B][00 00:2B][serviceId:4B][proto...]
+                        availableBytes >= 16 && (wordAt12IsServiceId || (u16Reserved == 0 && wordAt12 != 0)) -> {
+                            val protoCount = if (u16Reserved == 0 && u16ProtoLen in 0..(availableBytes - 16)) {
+                                u16ProtoLen
+                            } else {
+                                (availableBytes - 16).coerceAtLeast(0)
+                            }
+                            effectivePayloadLen = 8 + protoCount
+                        }
+                        // Case B: [00 00 00 01][00 00 00 00][serviceId:4B] (12-byte frame)
+                        availableBytes >= 12 && wordAt8IsServiceId -> {
+                            effectivePayloadLen = 4
+                        }
+                        // Case C: Any other non-header trailing bytes in the same USB read when bytes[4..7] == 0
+                        wordAt8 !in 1..6 -> {
+                            effectivePayloadLen = availableBytes - 8
+                        }
+                    }
+                } else if (availableBytes >= 16 && wordAt12IsServiceId && u16Reserved == 0) {
+                    // Check if HU wrote protoLen (instead of 8 + protoLen) or totalFrameLen (16 + protoLen) in bytes[4..7]
+                    if (rawLength == u16ProtoLen && availableBytes >= 16 + u16ProtoLen) {
+                        effectivePayloadLen = 8 + u16ProtoLen
+                    } else if (rawLength == 16 + u16ProtoLen && availableBytes == 16 + u16ProtoLen) {
+                        effectivePayloadLen = 8 + u16ProtoLen
+                    }
                 } else if (rawLength == 12 && wordAt8IsServiceId) {
                     // Check if HU wrote total packet length (12) instead of payload length (4)
                     val nextHeaderStartsAt12 = availableBytes >= 20 &&
@@ -1159,6 +1209,11 @@ class CarLifeStreamAssembler(initialCapacity: Int = 65_536) {
         }
 
         return out
+    }
+
+    private fun peekUInt16BigEndian(offset: Int): Int {
+        return ((buf[offset].toInt() and 0xFF) shl 8) or
+            (buf[offset + 1].toInt() and 0xFF)
     }
 
     private fun peekIntBigEndian(offset: Int): Int {
