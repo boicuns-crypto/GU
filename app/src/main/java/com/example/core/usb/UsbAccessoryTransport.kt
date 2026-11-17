@@ -386,6 +386,35 @@ class UsbAccessoryTransport(
                         _incomingFrames.emit(fallbackFrame)
                         continue
                     }
+                } else if (frames.isEmpty() && bytesRead in 4..8 && rawCh !in 1..6) {
+                    // Recover split USB AOA transfer (4..8B) carrying [00 00 00 00][serviceId] or [serviceId]
+                    val word0 = ByteBuffer.wrap(rawSnapshot, 0, 4).order(ByteOrder.BIG_ENDIAN).int
+                    val word4 = if (bytesRead == 8) {
+                        ByteBuffer.wrap(rawSnapshot, 4, 4).order(ByteOrder.BIG_ENDIAN).int
+                    } else {
+                        0
+                    }
+                    val hasServiceAt4 = bytesRead == 8 && com.example.protocol.carlife.CarLifeMsgType.isCarLifeServiceId(word4)
+                    val hasServiceAt0 = com.example.protocol.carlife.CarLifeMsgType.isCarLifeServiceId(word0)
+                    if (hasServiceAt4 || hasServiceAt0) {
+                        val rawHex = rawSnapshot.joinToString(" ") { "%02X".format(it) }
+                        Log.w(TAG, "USB AOA split tail read ($bytesRead B): $rawHex")
+                        streamAssembler.reset()
+                        val recoveredFrame = CarLifeFrame(
+                            header = com.example.protocol.carlife.CarLifeHeader(
+                                channel = com.example.protocol.carlife.CarLifeChannel.CONTROL,
+                                rawChannelId = 1,
+                                payloadLength = rawSnapshot.size,
+                                timestamp = 0L,
+                                includeOuterTimestamp = false
+                            ),
+                            payload = rawSnapshot
+                        )
+                        _rxFrames.incrementAndGet()
+                        _rxBytes.addAndGet(bytesRead.toLong())
+                        _incomingFrames.emit(recoveredFrame)
+                        continue
+                    }
                 }
 
                 for (frame in frames) {

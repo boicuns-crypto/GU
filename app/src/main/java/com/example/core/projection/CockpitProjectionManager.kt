@@ -366,12 +366,12 @@ class CockpitProjectionManager(
                     )
                 }
 
-                // Watchdog: if MediaProjection hasn't pushed any frame within 120ms,
+                // Watchdog: if MediaProjection hasn't pushed any frame within 350ms,
                 // detach VirtualDisplay from inputSurface and start Canvas Feeder so 90% never hangs!
                 externalScope.launch(Dispatchers.IO) {
-                    delay(120L)
+                    delay(350L)
                     if (isEncoding.get() && cachedSpsAnnexB == null && cachedPpsAnnexB == null && lastKeyFrameAnnexB == null) {
-                        Log.w(TAG, "MediaProjection produced 0 frames in 120ms; activating Canvas Surface Feeder fallback")
+                        Log.w(TAG, "MediaProjection produced 0 frames in 350ms; activating Canvas Surface Feeder fallback")
                         runCatching { vDisplay?.surface = null }
                         startCanvasFeederLoopIfNeeded(inputSurface, safeWidth, safeHeight, safeFps)
                     }
@@ -789,7 +789,8 @@ class CockpitProjectionManager(
         }
 
         val idr = lastKeyFrameAnnexB
-        if ((cachedSpsAnnexB != null || cachedPpsAnnexB != null) &&
+        if (cachedSpsAnnexB != null &&
+            cachedPpsAnnexB != null &&
             idr != null &&
             awaitingFirstIdrAfterGateOpen.compareAndSet(true, false)
         ) {
@@ -1107,6 +1108,7 @@ class CockpitProjectionManager(
             )
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
+                setInteger(MediaFormat.KEY_PREPEND_HEADER_TO_SYNC_FRAMES, 1)
             }
             setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000L)
         }

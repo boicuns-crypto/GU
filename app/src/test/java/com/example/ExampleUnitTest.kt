@@ -145,7 +145,12 @@ class ExampleUnitTest {
         assertEquals(800, step2.updatedState.negotiatedVideoWidth)
         assertEquals(480, step2.updatedState.negotiatedVideoHeight)
         assertEquals(30, step2.updatedState.negotiatedFps)
-        assertEquals(4, step2.outboundFrames.size)
+        assertEquals(3, step2.outboundFrames.size)
+        assertTrue(
+            step2.outboundFrames.none {
+                it.parseCommandMessageOrNull()?.serviceType == CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_PAUSE_ALT
+            }
+        )
 
         // Verify Module Control, Authen Request, and AES Key Request replies
         val modCtrl = CarLifeFrameCodec.createCommandFrame(
@@ -261,27 +266,25 @@ class ExampleUnitTest {
         assertNotNull(parsed)
         assertEquals(CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT, parsed!!.serviceType)
 
-        // Verify auto-start after MD_INFO builds INIT_DONE + START_DONE + FOREGROUND + SCREEN_ON with synced resolution
+        // Verify auto-start after MD_INFO builds INIT_DONE + FOREGROUND + SCREEN_ON (never 0x0001800A PAUSE!)
+        assertEquals("MSG_CMD_VIDEO_ENCODER_PAUSE", CarLifeMsgType.nameOf(0x0001800A))
         val sm = CarLifeControlStateMachine()
         sm.setPreferredResolution(800, 480)
         val autoStart = sm.buildAutoVideoEncoderInitAndStartFrames(800, 480, 30)
-        assertEquals(4, autoStart.outboundFrames.size)
+        assertEquals(3, autoStart.outboundFrames.size)
         assertEquals(
             CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT_DONE,
             autoStart.outboundFrames[0].parseCommandMessageOrNull()?.serviceType
         )
         assertEquals(
-            CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_DONE,
+            CarLifeMsgType.MSG_CMD_FOREGROUND,
             autoStart.outboundFrames[1].parseCommandMessageOrNull()?.serviceType
         )
         assertEquals(
-            CarLifeMsgType.MSG_CMD_FOREGROUND,
+            CarLifeMsgType.MSG_CMD_SCREEN_ON,
             autoStart.outboundFrames[2].parseCommandMessageOrNull()?.serviceType
         )
-        assertEquals(
-            CarLifeMsgType.MSG_CMD_SCREEN_ON,
-            autoStart.outboundFrames[3].parseCommandMessageOrNull()?.serviceType
-        )
+        assertEquals(CarLifeChannel.VIDEO, sm.createHeartbeatFrame().channel)
     }
 
     @Test

@@ -299,6 +299,9 @@ class BridgeForegroundService : Service() {
     @Volatile
     private var lastHuConfirmationSource: String = ""
 
+    @Volatile
+    private var lastVideoTxElapsedMs: Long = 0L
+
     private var mdInfoAutoStartJob: kotlinx.coroutines.Job? = null
     private var autoTestJob: kotlinx.coroutines.Job? = null
 
@@ -351,6 +354,7 @@ class BridgeForegroundService : Service() {
         )
         val sentOk = usbTransport.sendFrameImmediate(videoFrame)
         if (!sentOk) return false
+        lastVideoTxElapsedMs = SystemClock.elapsedRealtime()
 
         // Log all SPS/PPS, all IDR keyframes, and every 15th Slice to the dedicated Video Tab (0x0002)
         val shouldLogToVideoTab = isConfigNal || isIdr || pktIndex <= 6L || (pktIndex % 15L == 0L)
@@ -411,11 +415,22 @@ class BridgeForegroundService : Service() {
         hasSentAudioInitInSession = true
     }
 
+    private fun scheduleMdInfoAutoStartWatchdog(reason: String) {
+        mdInfoAutoStartJob?.cancel()
+        mdInfoAutoStartJob = serviceScope.launch {
+            kotlinx.coroutines.delay(1_500L)
+            if (usbTransport.state.value is UsbTransportState.Connected && !isVideoChannelReadyForStreaming) {
+                triggerAutoVideoEncoderStart(reason)
+            }
+        }
+    }
+
     /**
-     * Sends mandatory `AUDIO_INIT (0x0003 & 0x0004)` if not yet sent, followed by
-     * `MSG_CMD_VIDEO_ENCODER_INIT_DONE (0x00018008)`, `MSG_CMD_VIDEO_ENCODER_START_DONE (0x0001800A)`,
-     * `MSG_CMD_FOREGROUND (0x00018025)`, and `MSG_CMD_SCREEN_ON (0x00018018)` on channel `0x0001`,
-     * then unlocks `0x0002` and streams `SPS/PPS` + `IDR` via `encodeAoAVideoFrame` (`AOA 20B`).
+     * Fallback auto-start after `MSG_CMD_MD_INFO (0x00018003)`:
+     * sends mandatory `AUDIO_INIT (0x0003 & 0x0004)` if not yet sent, followed by
+     * `MSG_CMD_VIDEO_ENCODER_INIT_DONE (0x00018008)`, `MSG_CMD_FOREGROUND (0x00018025)`,
+     * and `MSG_CMD_SCREEN_ON (0x00018018)` on channel `0x0001`,
+     * then unlocks `0x0002` and streams separate `[SPS]`, `[PPS]`, `[IDR]` packets (`AOA 20B`).
      */
     private suspend fun triggerAutoVideoEncoderStart(reason: String) {
         if (usbTransport.state.value !is UsbTransportState.Connected) return
@@ -660,11 +675,16 @@ class BridgeForegroundService : Service() {
             }
         }
 
-        // Periodic 1,000ms Heartbeat loop ONLY after 0x0001 handshake has unlocked video streaming
+        // Periodic 1,000ms Heartbeat check ONLY when 0x0002 is unlocked and idle (>=2s since last video NAL TX)
         serviceScope.launch {
             while (isActive) {
                 kotlinx.coroutines.delay(1_000L)
-                if (usbTransport.state.value is UsbTransportState.Connected && isVideoChannelReadyForStreaming) {
+                val nowElapsed = SystemClock.elapsedRealtime()
+                val isVideoIdle = lastVideoTxElapsedMs == 0L || (nowElapsed - lastVideoTxElapsedMs) >= 2_000L
+                if (usbTransport.state.value is UsbTransportState.Connected &&
+                    isVideoChannelReadyForStreaming &&
+                    isVideoIdle
+                ) {
                     val hb = controlStateMachine.createHeartbeatFrame()
                     usbTransport.sendFrameImmediate(hb)
                 }
@@ -1007,25 +1027,18 @@ class BridgeForegroundService : Service() {
                 when (cmd?.serviceType) {
                     CarLifeMsgType.MSG_CMD_HU_PROTOCOL_VERSION,
                     CarLifeMsgType.MSG_CMD_HU_PROTOCOL_VERSION_ALT -> {
-                        // Handshake just started: lock 0x0002 for the initial 150ms MD_INFO window,
-                        // then auto-start VIDEO_ENCODER_INIT_DONE + START_DONE + H.264 stream!
+                        // Lock 0x0002 during handshake and give the HU 1.5s to exchange HU_INFO / Auth / AES / ModuleControl / VIDEO_ENCODER_INIT.
                         setVideoStreamingReady(false)
                         hasSentMdInfoInSession = true
-                        mdInfoAutoStartJob?.cancel()
-                        mdInfoAutoStartJob = serviceScope.launch {
-                            kotlinx.coroutines.delay(150L)
-                            if (usbTransport.state.value is UsbTransportState.Connected && !isVideoChannelReadyForStreaming) {
-                                triggerAutoVideoEncoderStart("Auto-Start 150ms after MSG_CMD_MD_INFO (0x00018003)")
-                            }
-                        }
+                        scheduleMdInfoAutoStartWatchdog("Auto-Start fallback 1500ms after HU_PROTOCOL_VERSION")
                     }
 
                     CarLifeMsgType.MSG_CMD_HU_INFO,
                     CarLifeMsgType.MSG_CMD_HU_INFO_ALT -> {
                         hasSentMdInfoInSession = true
-                        mdInfoAutoStartJob?.cancel()
                         if (!isVideoChannelReadyForStreaming) {
-                            triggerAutoVideoEncoderStart("Auto-Start after MSG_CMD_HU_INFO")
+                            // Do NOT flood 0x0002 immediately on HU_INFO while Auth/AES/FeatureConfig/VIDEO_ENCODER_INIT are still pending!
+                            scheduleMdInfoAutoStartWatchdog("Auto-Start fallback 1500ms after HU_INFO")
                         } else {
                             projectionManager.requestInstantIdrKeyFrame()
                         }
@@ -1036,6 +1049,7 @@ class BridgeForegroundService : Service() {
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_RESET,
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_RESET_ALT -> {
                         mdInfoAutoStartJob?.cancel()
+                        mdInfoAutoStartJob = null
                         val targetW = activeWidth.coerceIn(480, 3840)
                         val targetH = activeHeight.coerceIn(272, 2160)
                         controlStateMachine.setPreferredResolution(targetW, targetH)
@@ -1059,10 +1073,11 @@ class BridgeForegroundService : Service() {
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START,
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_ALT -> {
                         mdInfoAutoStartJob?.cancel()
+                        mdInfoAutoStartJob = null
                         val targetW = activeWidth.coerceIn(480, 3840)
                         val targetH = activeHeight.coerceIn(272, 2160)
                         controlStateMachine.setPreferredResolution(targetW, targetH)
-                        resetVideoLogFlags()
+                        // Do NOT clear pending videoTxQueue here: VIDEO_ENCODER_INIT may have just queued [SPS][PPS][IDR]!
                         if (!projectionManager.stats.value.isRunning ||
                             projectionManager.stats.value.width != targetW ||
                             projectionManager.stats.value.height != targetH
@@ -1074,51 +1089,70 @@ class BridgeForegroundService : Service() {
                                 bitRate = activeBitrateBps
                             )
                         }
-                        setVideoStreamingReady(true)
-                        projectionManager.unlockVideoChannelAndRequestSyncFrame()
+                        if (!isVideoChannelReadyForStreaming) {
+                            setVideoStreamingReady(true)
+                            projectionManager.unlockVideoChannelAndRequestSyncFrame()
+                        } else {
+                            projectionManager.requestInstantIdrKeyFrame()
+                        }
                     }
 
-                    CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_PAUSE -> {
+                    CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_PAUSE,
+                    CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_PAUSE_ALT -> {
                         mdInfoAutoStartJob?.cancel()
+                        mdInfoAutoStartJob = null
                         setVideoStreamingReady(false)
                     }
 
+                    CarLifeMsgType.MSG_CMD_HU_AUTHEN_REQUEST,
+                    CarLifeMsgType.MSG_CMD_HU_AUTHEN_REQUEST_ALT,
+                    CarLifeMsgType.MSG_CMD_HU_AUTHEN_REQUEST_LEGACY,
+                    CarLifeMsgType.MSG_CMD_HU_AUTHEN_RESULT,
+                    CarLifeMsgType.MSG_CMD_HU_AUTHEN_RESULT_ALT,
+                    CarLifeMsgType.MSG_CMD_MD_AES_KEY_REQUEST,
+                    CarLifeMsgType.MSG_CMD_MD_AES_KEY_REQUEST_ALT,
+                    CarLifeMsgType.MSG_CMD_HU_AES_KEY_REQUEST,
+                    CarLifeMsgType.MSG_CMD_HU_FEATURE_CONFIG_REQUEST,
+                    CarLifeMsgType.MSG_CMD_MD_FEATURE_CONFIG_REQUEST,
+                    CarLifeMsgType.MSG_CMD_MODULE_CONTROL,
+                    CarLifeMsgType.MSG_CMD_MODULE_CONTROL_ALT,
+                    CarLifeMsgType.MSG_CMD_HU_BT_OOB_INFO,
+                    CarLifeMsgType.MSG_CMD_HU_BT_OOB_INFO_ALT -> {
+                        // Recognized handshake / auth / module negotiation step: keep waiting cleanly for VIDEO_ENCODER_INIT
+                        if (!isVideoChannelReadyForStreaming && hasSentMdInfoInSession) {
+                            scheduleMdInfoAutoStartWatchdog("Auto-Start fallback 1500ms after ${cmd.serviceName}")
+                        }
+                    }
+
+                    CarLifeMsgType.MSG_CMD_MODULE_STATUS,
+                    CarLifeMsgType.MSG_CMD_MODULE_STATUS_ALT,
+                    CarLifeMsgType.MSG_CMD_SCREEN_ON,
+                    CarLifeMsgType.MSG_CMD_SCREEN_OFF,
+                    CarLifeMsgType.MSG_CMD_SCREEN_USER_PRESENT,
+                    CarLifeMsgType.MSG_CMD_FOREGROUND,
+                    CarLifeMsgType.MSG_CMD_FOREGROUND_ALT,
+                    CarLifeMsgType.MSG_CMD_FOREGROUND_LEGACY,
+                    CarLifeMsgType.MSG_CMD_BACKGROUND,
+                    CarLifeMsgType.MSG_CMD_GO_TO_DESKTOP,
+                    CarLifeMsgType.MSG_CMD_GO_TO_FOREGROUND,
+                    CarLifeMsgType.MSG_CMD_STATISTIC_INFO,
+                    CarLifeMsgType.MSG_CMD_CAR_VELOCITY,
+                    CarLifeMsgType.MSG_CMD_CAR_GPS,
+                    CarLifeMsgType.MSG_CMD_CAR_GYROSCOPE,
+                    CarLifeMsgType.MSG_CMD_CAR_ACCELERATION,
+                    CarLifeMsgType.MSG_CMD_CAR_OIL -> {
+                        // Passive status / lifecycle notification from HU: never re-send INIT_DONE/FOREGROUND/SCREEN_ON feedback loops!
+                    }
+
                     else -> {
-                        // Fix 2: Upon ANY subsequent RX packet from the Head Unit after MD_INFO
-                        // (including Payload: 0B / cmd == null or any poll packet at 06:34:18):
-                        // 1) If 0x0002 is not yet streaming, immediately run triggerAutoVideoEncoderStart.
-                        // 2) If 0x0002 is already streaming, reply with INIT_DONE + START_DONE (0x0001800A)
-                        //    and emit an immediate SPS/PPS + IDR keyframe!
-                        if (hasSentMdInfoInSession) {
+                        // Unrecognized control frame / split Payload: 0B poll after MD_INFO:
+                        // Trigger fallback start ONLY if 0x0002 is still locked; never loop INIT_DONE when already streaming.
+                        if (hasSentMdInfoInSession && !isVideoChannelReadyForStreaming) {
                             mdInfoAutoStartJob?.cancel()
-                            if (!isVideoChannelReadyForStreaming) {
-                                triggerAutoVideoEncoderStart(
-                                    "Auto-Start on RX Control Packet (${cmd?.serviceName ?: "Payload:${frame.payload.size}B"})"
-                                )
-                            } else {
-                                if (transition.outboundFrames.isEmpty()) {
-                                    val extraReplies = controlStateMachine.buildStartDoneReplyFrames(
-                                        includeInitDone = true,
-                                        width = activeWidth,
-                                        height = activeHeight,
-                                        fps = 30
-                                    )
-                                    for (reply in extraReplies) {
-                                        if (usbTransport.sendFrameImmediate(reply)) {
-                                            BridgeTelemetryBus.recordFrame(
-                                                direction = "TX (S26U -> HU)",
-                                                frame = reply,
-                                                rxBytesTotal = usbTransport.rxBytes,
-                                                txBytesTotal = usbTransport.txBytes,
-                                                rxFramesTotal = usbTransport.rxFrames,
-                                                txFramesTotal = usbTransport.txFrames,
-                                                protocolNote = "RX Follow-Up Reply: ${reply.parseCommandMessageOrNull()?.serviceName ?: "Frame"}"
-                                            )
-                                        }
-                                    }
-                                }
-                                projectionManager.requestInstantIdrKeyFrame()
-                            }
+                            mdInfoAutoStartJob = null
+                            triggerAutoVideoEncoderStart(
+                                "Auto-Start on RX Control Packet (${cmd?.serviceName ?: "Payload:${frame.payload.size}B"})"
+                            )
                         }
                     }
                 }

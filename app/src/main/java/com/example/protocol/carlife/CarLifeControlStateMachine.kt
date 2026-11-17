@@ -109,11 +109,6 @@ class CarLifeControlStateMachine(
             serviceType = CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT_DONE, // 0x00018008
             commandBody = negotiatedProto.encode()
         )
-        val startDoneFrame = CarLifeFrameCodec.createCommandFrame(
-            channel = CarLifeChannel.CONTROL,
-            serviceType = CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_DONE, // 0x0001800A
-            commandBody = ByteArray(0)
-        )
         val foregroundFrame = CarLifeFrameCodec.createCommandFrame(
             channel = CarLifeChannel.CONTROL,
             serviceType = CarLifeMsgType.MSG_CMD_FOREGROUND, // 0x00018025
@@ -125,7 +120,7 @@ class CarLifeControlStateMachine(
             commandBody = ByteArray(0)
         )
 
-        val summary = "$reason (${safeW}x${safeH}@${safeFps}fps) -> TX INIT_DONE (0x00018008) + START_DONE (0x0001800A) + FOREGROUND + SCREEN_ON"
+        val summary = "$reason (${safeW}x${safeH}@${safeFps}fps) -> TX INIT_DONE (0x00018008) + FOREGROUND + SCREEN_ON"
         _sessionState.update {
             it.copy(
                 phase = CarLifeSessionPhase.VIDEO_STREAMING,
@@ -139,15 +134,14 @@ class CarLifeControlStateMachine(
         }
         return ControlTransitionResult(
             updatedState = _sessionState.value,
-            outboundFrames = listOf(initDoneFrame, startDoneFrame, foregroundFrame, screenOnFrame),
+            outboundFrames = listOf(initDoneFrame, foregroundFrame, screenOnFrame),
             summary = summary
         )
     }
 
     /**
-     * Builds immediate `MSG_CMD_VIDEO_ENCODER_START_DONE (0x0001800A)` (and optional `INIT_DONE`)
-     * reply frames for any subsequent RX packets arriving from the Head Unit after `MD_INFO`
-     * (including `Payload: 0B` packets).
+     * Builds `MSG_CMD_VIDEO_ENCODER_INIT_DONE (0x00018008)` + `FOREGROUND` + `SCREEN_ON`
+     * without transmitting `0x0001800A` (`VIDEO_ENCODER_PAUSE`).
      */
     fun buildStartDoneReplyFrames(
         includeInitDone: Boolean = true,
@@ -158,7 +152,7 @@ class CarLifeControlStateMachine(
         val safeW = width.coerceIn(480, 3840)
         val safeH = height.coerceIn(272, 2160)
         val safeFps = fps.coerceIn(15, 60)
-        val out = ArrayList<CarLifeFrame>(4)
+        val out = ArrayList<CarLifeFrame>(3)
         if (includeInitDone) {
             val negotiatedProto = CarlifeVideoEncoderInfoProto(
                 width = safeW,
@@ -173,13 +167,6 @@ class CarLifeControlStateMachine(
                 )
             )
         }
-        out.add(
-            CarLifeFrameCodec.createCommandFrame(
-                channel = CarLifeChannel.CONTROL,
-                serviceType = CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_DONE, // 0x0001800A
-                commandBody = ByteArray(0)
-            )
-        )
         out.add(
             CarLifeFrameCodec.createCommandFrame(
                 channel = CarLifeChannel.CONTROL,
@@ -235,7 +222,8 @@ class CarLifeControlStateMachine(
             CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT_ALT -> handleVideoEncoderInit(cmd.body)
             CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START,
             CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_ALT -> handleVideoEncoderStart(frame.totalFrameBytes)
-            CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_PAUSE -> handleVideoEncoderPause()
+            CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_PAUSE,
+            CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_PAUSE_ALT -> handleVideoEncoderPause()
             CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_RESET,
             CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_RESET_ALT -> handleVideoEncoderReset()
             CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_FRAME_RATE_CHANGE,
@@ -285,20 +273,31 @@ class CarLifeControlStateMachine(
     }
 
     /**
-     * Builds a periodic Heartbeat frame (`MSG_VIDEO_HEARTBEAT = 0x00020002` or Control keep-alive)
-     * to prevent Jetta VS7 Head Unit watchdog disconnects.
+     * Builds a Video Channel (`0x0002`) Heartbeat frame (`MSG_VIDEO_HEARTBEAT = 0x00028002`)
+     * rather than sending a `0x0002xxxx` message ID inside Control Channel `0x0001`.
      */
     fun createHeartbeatFrame(): CarLifeFrame {
         _sessionState.update {
             it.copy(
                 heartbeatCount = it.heartbeatCount + 1L,
-                lastControlAction = "TX Heartbeat #${it.heartbeatCount + 1L}"
+                lastControlAction = "TX Video Heartbeat #${it.heartbeatCount + 1L}"
             )
         }
-        return CarLifeFrameCodec.createCommandFrame(
-            channel = CarLifeChannel.CONTROL,
-            serviceType = CarLifeMsgType.MSG_VIDEO_HEARTBEAT,
-            commandBody = ByteArray(0)
+        val innerHeartbeat = java.nio.ByteBuffer.allocate(12)
+            .order(java.nio.ByteOrder.BIG_ENDIAN)
+            .putInt(0)
+            .putInt((System.currentTimeMillis() and 0x7FFF_FFFFL).toInt())
+            .putInt(CarLifeMsgType.MSG_VIDEO_HEARTBEAT)
+            .array()
+        return CarLifeFrame(
+            header = CarLifeHeader(
+                channel = CarLifeChannel.VIDEO,
+                rawChannelId = CarLifeChannel.VIDEO.id,
+                payloadLength = innerHeartbeat.size,
+                timestamp = System.currentTimeMillis() and 0x7FFF_FFFFL,
+                includeOuterTimestamp = false
+            ),
+            payload = innerHeartbeat
         )
     }
 
@@ -493,26 +492,20 @@ class CarLifeControlStateMachine(
             serviceType = CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT_DONE, // 0x00018008
             commandBody = encodedNegotiated
         )
-        // 2. MSG_CMD_VIDEO_ENCODER_START_DONE (0x0001800A)
-        val startDoneFrame = CarLifeFrameCodec.createCommandFrame(
-            channel = CarLifeChannel.CONTROL,
-            serviceType = CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_DONE, // 0x0001800A
-            commandBody = ByteArray(0)
-        )
-        // 3. MSG_CMD_FOREGROUND (0x00018025)
+        // 2. MSG_CMD_FOREGROUND (0x00018025)
         val foregroundFrame = CarLifeFrameCodec.createCommandFrame(
             channel = CarLifeChannel.CONTROL,
             serviceType = CarLifeMsgType.MSG_CMD_FOREGROUND, // 0x00018025
             commandBody = ByteArray(0)
         )
-        // 4. MSG_CMD_SCREEN_ON (0x00018018)
+        // 3. MSG_CMD_SCREEN_ON (0x00018018)
         val screenOnFrame = CarLifeFrameCodec.createCommandFrame(
             channel = CarLifeChannel.CONTROL,
             serviceType = CarLifeMsgType.MSG_CMD_SCREEN_ON, // 0x00018018
             commandBody = ByteArray(0)
         )
 
-        val summary = "Video Init: ${negotiatedProto.width}x${negotiatedProto.height}@${negotiatedProto.frameRate}fps -> TX INIT_DONE + START_DONE + FOREGROUND + SCREEN_ON"
+        val summary = "Video Init: ${negotiatedProto.width}x${negotiatedProto.height}@${negotiatedProto.frameRate}fps -> TX INIT_DONE (0x00018008) + FOREGROUND + SCREEN_ON"
         _sessionState.update {
             it.copy(
                 phase = CarLifeSessionPhase.VIDEO_STREAMING,
@@ -526,7 +519,7 @@ class CarLifeControlStateMachine(
         }
         return ControlTransitionResult(
             updatedState = _sessionState.value,
-            outboundFrames = listOf(initDoneFrame, startDoneFrame, foregroundFrame, screenOnFrame),
+            outboundFrames = listOf(initDoneFrame, foregroundFrame, screenOnFrame),
             summary = summary
         )
     }
@@ -549,12 +542,8 @@ class CarLifeControlStateMachine(
     }
 
     private fun handleVideoEncoderStart(wireBytes: Int = 12): ControlTransitionResult {
-        // Send 0x0001800A (MSG_CMD_VIDEO_ENCODER_START_DONE) + 0x00018025 (MSG_CMD_FOREGROUND) + 0x00018018 (MSG_CMD_SCREEN_ON)
-        val startDoneFrame = CarLifeFrameCodec.createCommandFrame(
-            channel = CarLifeChannel.CONTROL,
-            serviceType = CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_DONE, // 0x0001800A
-            commandBody = ByteArray(0)
-        )
+        // Confirm FOREGROUND (0x00018025) + SCREEN_ON (0x00018018) and begin H.264 stream on 0x0002;
+        // NEVER emit 0x0001800A (which is MSG_CMD_VIDEO_ENCODER_PAUSE in CarLife)!
         val foregroundFrame = CarLifeFrameCodec.createCommandFrame(
             channel = CarLifeChannel.CONTROL,
             serviceType = CarLifeMsgType.MSG_CMD_FOREGROUND, // 0x00018025
@@ -565,7 +554,7 @@ class CarLifeControlStateMachine(
             serviceType = CarLifeMsgType.MSG_CMD_SCREEN_ON, // 0x00018018
             commandBody = ByteArray(0)
         )
-        val summary = "RX MSG_CMD_VIDEO_ENCODER_START (${wireBytes}B) -> TX START_DONE (0x0001800A) + SPS/PPS + IDR"
+        val summary = "RX MSG_CMD_VIDEO_ENCODER_START (${wireBytes}B) -> TX FOREGROUND + SCREEN_ON + H.264 0x0002"
         _sessionState.update {
             it.copy(
                 phase = CarLifeSessionPhase.VIDEO_STREAMING,
@@ -576,7 +565,7 @@ class CarLifeControlStateMachine(
         }
         return ControlTransitionResult(
             updatedState = _sessionState.value,
-            outboundFrames = listOf(startDoneFrame, foregroundFrame, screenOnFrame),
+            outboundFrames = listOf(foregroundFrame, screenOnFrame),
             summary = summary
         )
     }
