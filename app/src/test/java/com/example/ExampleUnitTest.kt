@@ -72,13 +72,17 @@ class ExampleUnitTest {
         val h264Nal = byteArrayOf(0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x2A)
         val timestamp = 0x12345678L
 
-        // Verify Direct 12B is the default framing mode for 0x0002
+        // Verify AOA 20B (8B AOA + 12B 0x00028001 + Annex-B) is the default framing mode for 0x0002
         val defaultFrame = CarLifeFrameCodec.createVideoFrame(
             nalData = h264Nal,
             timestampMs = timestamp
         )
-        assertEquals(12, CarLifeFrameCodec.encodeHeader(defaultFrame.header).size)
-        assertArrayEquals(h264Nal, defaultFrame.payload)
+        assertEquals(8, CarLifeFrameCodec.encodeHeader(defaultFrame.header).size)
+        assertEquals(12 + h264Nal.size, defaultFrame.payload.size)
+        assertArrayEquals(
+            CarLifeFrameCodec.encodeFrame(CarLifeFrameCodec.encodeAoAVideoFrame(h264Nal, timestamp)),
+            CarLifeFrameCodec.encodeFrame(defaultFrame)
+        )
 
         // 1. Optional Mode: AOA 20B (8B AOA + 12B 0x00028001)
         val aoa20Frame = CarLifeFrameCodec.createVideoFrame(
@@ -134,12 +138,12 @@ class ExampleUnitTest {
         val videoInitFrame = CarLifeFrameCodec.createCommandFrame(
             channel = CarLifeChannel.CONTROL,
             serviceType = CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT,
-            commandBody = CarlifeVideoEncoderInfoProto(width = 800, height = 480, frameRate = 30).encode()
+            commandBody = CarlifeVideoEncoderInfoProto(width = 1024, height = 600, frameRate = 30).encode()
         )
         val step2 = sm.onControlFrame(videoInitFrame)
         assertEquals(CarLifeSessionPhase.VIDEO_STREAMING, step2.updatedState.phase)
-        assertEquals(800, step2.updatedState.negotiatedVideoWidth)
-        assertEquals(480, step2.updatedState.negotiatedVideoHeight)
+        assertEquals(1024, step2.updatedState.negotiatedVideoWidth)
+        assertEquals(600, step2.updatedState.negotiatedVideoHeight)
         assertEquals(30, step2.updatedState.negotiatedFps)
         assertEquals(4, step2.outboundFrames.size)
 
@@ -281,42 +285,50 @@ class ExampleUnitTest {
     }
 
     @Test
-    fun autoTester_profilesAndAudioMultiplexerInitAndModuleStatus_verifySpec() {
+    fun jettaVs7LockedProfile_audioInitBytesAndAoA20BVideo_verifySpec() {
         val profiles = com.example.core.usb.BridgeForegroundService.AUTO_TEST_PROFILES
-        assertEquals(4, profiles.size)
+        assertEquals(1, profiles.size)
+        assertEquals(1024, profiles[0].width)
+        assertEquals(600, profiles[0].height)
+        assertEquals(1_200_000, profiles[0].bitrateBps)
+        assertEquals(true, profiles[0].useNestedVideoHeader)
+        assertEquals(true, profiles[0].forceAudioMultiplexerInit)
 
-        assertEquals(800, profiles[0].width)
-        assertEquals(480, profiles[0].height)
-        assertEquals(800_000, profiles[0].bitrateBps)
-        assertEquals(false, profiles[0].useNestedVideoHeader)
-        assertEquals(false, profiles[0].forceAudioMultiplexerInit)
-
-        assertEquals(1024, profiles[1].width)
-        assertEquals(600, profiles[1].height)
-        assertEquals(1_200_000, profiles[1].bitrateBps)
-        assertEquals(false, profiles[1].useNestedVideoHeader)
-        assertEquals(false, profiles[1].forceAudioMultiplexerInit)
-
-        assertEquals(1280, profiles[2].width)
-        assertEquals(720, profiles[2].height)
-        assertEquals(1_800_000, profiles[2].bitrateBps)
-        assertEquals(false, profiles[2].useNestedVideoHeader)
-        assertEquals(false, profiles[2].forceAudioMultiplexerInit)
-
-        assertEquals(800, profiles[3].width)
-        assertEquals(480, profiles[3].height)
-        assertEquals(800_000, profiles[3].bitrateBps)
-        assertEquals(false, profiles[3].useNestedVideoHeader)
-        assertEquals(true, profiles[3].forceAudioMultiplexerInit)
-
-        val audioInitFrames = CarLifeFrameCodec.createAudioMultiplexerInitFrames(timestampMs = 42L)
+        val audioInitFrames = CarLifeFrameCodec.createAudioMultiplexerInitFrames()
         assertEquals(2, audioInitFrames.size)
-        assertEquals(CarLifeChannel.MEDIA_AUDIO, audioInitFrames[0].channel)
-        assertEquals(12, audioInitFrames[0].header.headerSizeBytes)
-        assertEquals(0, audioInitFrames[0].payload.size)
-        assertEquals(CarLifeChannel.TTS_AUDIO, audioInitFrames[1].channel)
-        assertEquals(12, audioInitFrames[1].header.headerSizeBytes)
-        assertEquals(0, audioInitFrames[1].payload.size)
+        assertArrayEquals(
+            byteArrayOf(
+                0x00, 0x00, 0x00, 0x03,
+                0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00
+            ),
+            CarLifeFrameCodec.encodeFrame(audioInitFrames[0])
+        )
+        assertArrayEquals(
+            byteArrayOf(
+                0x00, 0x00, 0x00, 0x04,
+                0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00
+            ),
+            CarLifeFrameCodec.encodeFrame(audioInitFrames[1])
+        )
+
+        // Verify AVCC length-prefixed NAL is converted cleanly to Annex-B 00 00 00 01 inside encodeAoAVideoFrame
+        val avccIdr = byteArrayOf(0x00, 0x00, 0x00, 0x04, 0x65, 0x88.toByte(), 0x84.toByte(), 0x21)
+        val aoaFrame = CarLifeFrameCodec.encodeAoAVideoFrame(avccIdr, timestampMs = 500L)
+        val wireBytes = CarLifeFrameCodec.encodeFrame(aoaFrame)
+        assertEquals(20 + 8, wireBytes.size)
+        // Outer 8B: ch=2, len=20 (8+12)
+        assertEquals(0x02, wireBytes[3].toInt())
+        assertEquals(20, wireBytes[7].toInt())
+        // Inner 12B: len=8, ts=500, service=0x00028001
+        assertEquals(8, wireBytes[11].toInt())
+        assertEquals(0x00, wireBytes[16].toInt())
+        assertEquals(0x02, wireBytes[17].toInt())
+        assertEquals(0x80.toByte(), wireBytes[18])
+        assertEquals(0x01, wireBytes[19].toInt())
+        // Annex-B start code at bytes [20..23]
+        assertArrayEquals(byteArrayOf(0x00, 0x00, 0x00, 0x01), wireBytes.copyOfRange(20, 24))
 
         val sm = CarLifeControlStateMachine()
         val moduleStatusFrame = CarLifeFrameCodec.createCommandFrame(

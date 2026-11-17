@@ -82,11 +82,11 @@ data class AutoTestProfile(
 data class AutoTestState(
     val isRunning: Boolean = false,
     val currentStep: Int = 0,
-    val totalSteps: Int = 4,
-    val activeProfileLabel: String = "",
-    val statusMessage: String = "Готов к автоподбору профиля ГУ (Шаги 1–4)",
-    val matchedProfileLabel: String? = null,
-    val audioInitForced: Boolean = false
+    val totalSteps: Int = 0,
+    val activeProfileLabel: String = "1024×600 • 1.2 Мбит/с • AOA 20B + Audio Init",
+    val statusMessage: String = "Авто-тестер отключён: зафиксирован профиль Jetta VS7 (1024×600 • 1.2 Мбит/с • AOA 20B + Audio Init)",
+    val matchedProfileLabel: String? = "1024×600 • 1.2 Мбит/с • AOA 20B + Audio Init",
+    val audioInitForced: Boolean = true
 )
 
 /**
@@ -99,10 +99,10 @@ data class BridgeRuntimeState(
     val controlSession: CarLifeControlSessionState = CarLifeControlSessionState(),
     val projectionStats: ProjectionPipelineStats = ProjectionPipelineStats(),
     val isVideoChannelReadyForStreaming: Boolean = false,
-    val useNestedVideoMsgHeader: Boolean = false,
-    val configuredWidth: Int = 800,
-    val configuredHeight: Int = 480,
-    val configuredBitrateBps: Int = 800_000,
+    val useNestedVideoMsgHeader: Boolean = true,
+    val configuredWidth: Int = 1024,
+    val configuredHeight: Int = 600,
+    val configuredBitrateBps: Int = 1_200_000,
     val autoTestState: AutoTestState = AutoTestState(),
     val lastTouchOrKeyEvent: String = "None — Waiting for Touch/Hardkey Channel (0x0006)",
     val rxBytes: Long = 0L,
@@ -263,19 +263,22 @@ class BridgeForegroundService : Service() {
         private set
 
     @Volatile
-    private var activeWidth: Int = 800
+    private var activeWidth: Int = 1024
 
     @Volatile
-    private var activeHeight: Int = 480
+    private var activeHeight: Int = 600
 
     @Volatile
-    private var activeBitrateBps: Int = 800_000
+    private var activeBitrateBps: Int = 1_200_000
 
     @Volatile
     private var hasSentMdInfoInSession: Boolean = false
 
     @Volatile
-    private var forceAudioInitForSession: Boolean = false
+    private var hasSentAudioInitInSession: Boolean = false
+
+    @Volatile
+    private var forceAudioInitForSession: Boolean = true
 
     private val huConfirmationSeq = java.util.concurrent.atomic.AtomicLong(0L)
 
@@ -300,13 +303,14 @@ class BridgeForegroundService : Service() {
     }
 
     /**
-     * Step 4 fallback: Force-sends empty 12-byte initialization packets (`12B header + empty PCM buffer`)
-     * into `0x0003 (Media Audio)` and `0x0004 (TTS Audio)` BEFORE video packets start, waking up
-     * Jetta VS7 firmwares that require the audio multiplexer to be initialized to clear the 90% screen.
+     * Mandatory Jetta VS7 Audio-Init before video streaming:
+     * Immediately after `MSG_CMD_MD_INFO (0x00018003)`, sends empty 12-byte audio frames:
+     * - `0x0003` (Media Audio): `[00 00 00 03][00 00 00 00][00 00 00 00]`
+     * - `0x0004` (TTS Audio): `[00 00 00 04][00 00 00 00][00 00 00 00]`
      */
     private suspend fun sendAudioMultiplexerInitPackets() {
         if (usbTransport.state.value !is UsbTransportState.Connected) return
-        val audioInitFrames = CarLifeFrameCodec.createAudioMultiplexerInitFrames()
+        val audioInitFrames = CarLifeFrameCodec.createAudioMultiplexerInitFrames(timestampMs = 0L)
         for (audioFrame in audioInitFrames) {
             if (usbTransport.sendFrameImmediate(audioFrame)) {
                 BridgeTelemetryBus.recordFrame(
@@ -316,19 +320,19 @@ class BridgeForegroundService : Service() {
                     txBytesTotal = usbTransport.txBytes,
                     rxFramesTotal = usbTransport.rxFrames,
                     txFramesTotal = usbTransport.txFrames,
-                    protocolNote = "Audio Multiplexer Init (0x%04X): 12B HDR + Empty PCM (0B)".format(audioFrame.channel.id),
+                    protocolNote = "Mandatory Audio-Init (0x%04X): [12B HDR | size=0, ts=0]".format(audioFrame.channel.id),
                     serviceNameOverride = "AUDIO_INIT (0x%04X)".format(audioFrame.channel.id)
                 )
             }
         }
+        hasSentAudioInitInSession = true
     }
 
     /**
-     * Fix 2: Auto-starts `MSG_CMD_VIDEO_ENCODER_INIT_DONE (0x00018008)`,
-     * `MSG_CMD_VIDEO_ENCODER_START_DONE (0x0001800A)`, `MSG_CMD_FOREGROUND (0x00018025)`,
-     * and `MSG_CMD_SCREEN_ON (0x00018018)` on channel `0x0001`, immediately enables
-     * `isVideoChannelReadyForStreaming = true`, forces a `MediaCodec` `SYNC_FRAME`, and
-     * begins streaming `SPS/PPS` + `IDR` frames on channel `0x0002` in `Direct 12B` mode.
+     * Sends mandatory `AUDIO_INIT (0x0003 & 0x0004)` if not yet sent, followed by
+     * `MSG_CMD_VIDEO_ENCODER_INIT_DONE (0x00018008)`, `MSG_CMD_VIDEO_ENCODER_START_DONE (0x0001800A)`,
+     * `MSG_CMD_FOREGROUND (0x00018025)`, and `MSG_CMD_SCREEN_ON (0x00018018)` on channel `0x0001`,
+     * then unlocks `0x0002` and streams `SPS/PPS` + `IDR` via `encodeAoAVideoFrame` (`AOA 20B`).
      */
     private suspend fun triggerAutoVideoEncoderStart(reason: String) {
         if (usbTransport.state.value !is UsbTransportState.Connected) return
@@ -355,7 +359,7 @@ class BridgeForegroundService : Service() {
             )
         }
 
-        if (forceAudioInitForSession) {
+        if (!hasSentAudioInitInSession || forceAudioInitForSession) {
             sendAudioMultiplexerInitPackets()
         }
 
@@ -379,177 +383,50 @@ class BridgeForegroundService : Service() {
     }
 
     /**
-     * Auto-Tester (`Автоподбор параметров ГУ`):
-     * Cycles through the 4 profiles with a 1.5s confirmation window per step until the Head Unit
-     * sends an acknowledgement packet on channel `0x0001` (e.g. `MSG_CMD_MODULE_STATUS`) / `0x0006`
-     * or socket state changes to `Connected`:
-     * - Step 1: 800x480, 800 kbps, Direct 12B
-     * - Step 2: 1024x600, 1.2 Mbps, Direct 12B
-     * - Step 3: 1280x720, 1.8 Mbps, Direct 12B
-     * - Step 4: 800x480, 800 kbps, Direct 12B + Forced Audio Multiplexer Init (`0x0003` & `0x0004`)
+     * Auto-Tester loop is disabled: enforces the verified Jetta VS7 working profile
+     * (`1024×600`, `30fps`, `1.2 Mbps`, `AOA 20B` + mandatory Audio Init `0x0003`/`0x0004`)
+     * without cycling or overriding settings.
      */
     private fun startAutoTestCycle() {
         autoTestJob?.cancel()
+        autoTestJob = null
         mdInfoAutoStartJob?.cancel()
-        autoTestJob = serviceScope.launch {
-            val profiles = AUTO_TEST_PROFILES
-            var matchedProfile: AutoTestProfile? = null
-            var confirmationReason = ""
 
-            for (profile in profiles) {
-                if (!isActive) break
+        CarLifeFrameCodec.useNestedVideoMsgHeader = true
+        activeWidth = 1024
+        activeHeight = 600
+        activeBitrateBps = 1_200_000
+        forceAudioInitForSession = true
+        controlStateMachine.setPreferredResolution(1024, 600)
 
-                val stepStartConfirmSeq = huConfirmationSeq.get()
-                val wasConnectedAtStepStart = usbTransport.state.value is UsbTransportState.Connected
+        BridgeTelemetryBus.updateState { current ->
+            current.copy(
+                configuredWidth = 1024,
+                configuredHeight = 600,
+                configuredBitrateBps = 1_200_000,
+                useNestedVideoMsgHeader = true,
+                autoTestState = AutoTestState(
+                    isRunning = false,
+                    currentStep = 0,
+                    totalSteps = 0,
+                    activeProfileLabel = "1024×600 • 1.2 Мбит/с • AOA 20B + Audio Init",
+                    statusMessage = "Авто-тестер отключён: зафиксирован профиль Jetta VS7 (1024×600 • 1.2 Мбит/с • AOA 20B + Audio Init)",
+                    matchedProfileLabel = "1024×600 • 1.2 Мбит/с • AOA 20B + Audio Init",
+                    audioInitForced = true
+                ),
+                lastProtocolEvent = "Locked Jetta VS7 Profile: 1024×600 @ 1.2 Mbps, AOA 20B + Audio Init"
+            )
+        }
 
-                if (!wasConnectedAtStepStart) {
-                    val accessory = usbTransport.findCarLifeAccessory()
-                    if (accessory != null) {
-                        usbTransport.connect(accessory)
-                    }
-                }
-
-                setVideoStreamingReady(false)
-                CarLifeFrameCodec.useNestedVideoMsgHeader = profile.useNestedVideoHeader
-                activeWidth = profile.width
-                activeHeight = profile.height
-                activeBitrateBps = profile.bitrateBps
-                forceAudioInitForSession = profile.forceAudioMultiplexerInit
-                controlStateMachine.setPreferredResolution(profile.width, profile.height)
-
-                BridgeTelemetryBus.updateState { current ->
-                    current.copy(
-                        configuredWidth = profile.width,
-                        configuredHeight = profile.height,
-                        configuredBitrateBps = profile.bitrateBps,
-                        useNestedVideoMsgHeader = profile.useNestedVideoHeader,
-                        autoTestState = AutoTestState(
-                            isRunning = true,
-                            currentStep = profile.stepNumber,
-                            totalSteps = profiles.size,
-                            activeProfileLabel = profile.label,
-                            statusMessage = "Шаг ${profile.stepNumber}/${profiles.size}: тест ${profile.label} (пауза 1.5с)...",
-                            matchedProfileLabel = null,
-                            audioInitForced = profile.forceAudioMultiplexerInit
-                        ),
-                        lastProtocolEvent = "Auto-Tester Шаг ${profile.stepNumber}/${profiles.size}: ${profile.label}"
-                    )
-                }
-
-                com.example.feature.cockpit.CarLifeLauncherRepository.markLauncherActiveOnDisplay(
-                    displayId = projectionManager.stats.value.virtualDisplayId,
-                    width = profile.width,
-                    height = profile.height,
-                    bitrateBps = profile.bitrateBps
-                )
-
-                projectionManager.startProjection(
-                    width = profile.width,
-                    height = profile.height,
-                    frameRate = 30,
-                    bitRate = profile.bitrateBps
-                )
-
-                if (usbTransport.state.value is UsbTransportState.Connected) {
-                    if (profile.forceAudioMultiplexerInit) {
-                        // Step 4: Force-send empty 12B initialization frames on 0x0003 & 0x0004 BEFORE video starts
-                        sendAudioMultiplexerInitPackets()
-                    }
-
-                    val autoTransition = controlStateMachine.buildAutoVideoEncoderInitAndStartFrames(
-                        width = profile.width,
-                        height = profile.height,
-                        fps = 30,
-                        reason = "Auto-Tester Шаг ${profile.stepNumber}"
-                    )
-                    for (reply in autoTransition.outboundFrames) {
-                        if (usbTransport.sendFrameImmediate(reply)) {
-                            BridgeTelemetryBus.recordFrame(
-                                direction = "TX (S26U -> HU)",
-                                frame = reply,
-                                rxBytesTotal = usbTransport.rxBytes,
-                                txBytesTotal = usbTransport.txBytes,
-                                rxFramesTotal = usbTransport.rxFrames,
-                                txFramesTotal = usbTransport.txFrames,
-                                protocolNote = "Auto-Test #${profile.stepNumber}: ${reply.parseCommandMessageOrNull()?.serviceName ?: "Frame"}"
-                            )
-                        }
-                    }
-
-                    resetVideoLogFlags()
-                    setVideoStreamingReady(true)
-                    projectionManager.unlockVideoChannelAndRequestSyncFrame()
-                }
-
-                // Wait up to 1.5s (30 × 50ms) for HU confirmation packet on 0x0001 / 0x0006 or socket connection change
-                var stepConfirmed = false
-                repeat(AUTO_TEST_STEP_POLL_COUNT) {
-                    if (!isActive) return@repeat
-                    val gotConfirmPacket = huConfirmationSeq.get() > stepStartConfirmSeq
-                    val socketStateChangedToConnected =
-                        !wasConnectedAtStepStart && (usbTransport.state.value is UsbTransportState.Connected)
-
-                    if (gotConfirmPacket || socketStateChangedToConnected) {
-                        stepConfirmed = true
-                        confirmationReason = if (gotConfirmPacket) {
-                            lastHuConfirmationSource.ifBlank { "RX 0x0001 ACK" }
-                        } else {
-                            "USB AOA Сокет подключен"
-                        }
-                        return@repeat
-                    }
-                    kotlinx.coroutines.delay(AUTO_TEST_STEP_POLL_MS)
-                }
-
-                if (stepConfirmed) {
-                    matchedProfile = profile
-                    break
-                }
-            }
-
-            if (matchedProfile != null) {
-                val winner = matchedProfile!!
-                BridgeTelemetryBus.updateState { current ->
-                    current.copy(
-                        configuredWidth = winner.width,
-                        configuredHeight = winner.height,
-                        configuredBitrateBps = winner.bitrateBps,
-                        useNestedVideoMsgHeader = winner.useNestedVideoHeader,
-                        autoTestState = AutoTestState(
-                            isRunning = false,
-                            currentStep = winner.stepNumber,
-                            totalSteps = profiles.size,
-                            activeProfileLabel = winner.label,
-                            statusMessage = "Рабочий профиль найден (Шаг ${winner.stepNumber}): ${winner.label} [$confirmationReason]. Стриминг зафиксирован!",
-                            matchedProfileLabel = winner.label,
-                            audioInitForced = winner.forceAudioMultiplexerInit
-                        ),
-                        lastProtocolEvent = "Auto-Tester SUCCESS (Шаг ${winner.stepNumber}): ${winner.label} ($confirmationReason)"
-                    )
-                }
-                if (isVideoChannelReadyForStreaming) {
-                    projectionManager.requestInstantIdrKeyFrame()
-                }
-            } else {
-                val fallback = profiles.last()
-                BridgeTelemetryBus.updateState { current ->
-                    current.copy(
-                        configuredWidth = fallback.width,
-                        configuredHeight = fallback.height,
-                        configuredBitrateBps = fallback.bitrateBps,
-                        useNestedVideoMsgHeader = fallback.useNestedVideoHeader,
-                        autoTestState = AutoTestState(
-                            isRunning = false,
-                            currentStep = fallback.stepNumber,
-                            totalSteps = profiles.size,
-                            activeProfileLabel = fallback.label,
-                            statusMessage = "Таймаут 90% на шагах 1–4. Зафиксирован профиль Шага 4: ${fallback.label}",
-                            matchedProfileLabel = null,
-                            audioInitForced = true
-                        ),
-                        lastProtocolEvent = "Auto-Tester завершил перебор (1–4): удержан безопасный профиль 800×480 + Audio Init"
-                    )
-                }
+        serviceScope.launch {
+            projectionManager.startProjection(
+                width = 1024,
+                height = 600,
+                frameRate = 30,
+                bitRate = 1_200_000
+            )
+            if (usbTransport.state.value is UsbTransportState.Connected) {
+                sendAudioMultiplexerInitPackets()
             }
         }
     }
@@ -559,8 +436,8 @@ class BridgeForegroundService : Service() {
         createNotificationChannel()
         acquireWakeLock()
 
-        // Default Mode 2: Direct 12B ([00 00 00 02][nalSize][timestampMs] + 00 00 00 01...)
-        CarLifeFrameCodec.useNestedVideoMsgHeader = false
+        // Hard-locked Jetta VS7 Mode 1: AOA 20B ([8B AOA][12B 0x00028001] + [00 00 00 01 Annex-B])
+        CarLifeFrameCodec.useNestedVideoMsgHeader = true
         isVideoChannelReadyForStreaming = false
 
         usbTransport = UsbAccessoryTransport(
@@ -578,9 +455,12 @@ class BridgeForegroundService : Service() {
                     return@CockpitProjectionManager
                 }
 
-                // Forward H.264 NAL units directly into the active USB AOA transport on channel 0x0002
+                // STRICT: Both SPS/PPS and IDR/P-slice frames use encodeAoAVideoFrame() (AOA 20B + 0x00028001 + Annex-B)
                 val pktIndex = videoPacketCounter.incrementAndGet()
-                val videoFrame = CarLifeFrameCodec.createVideoFrame(nalBytes, timestampMs)
+                val videoFrame = CarLifeFrameCodec.encodeAoAVideoFrame(
+                    h264Data = nalBytes,
+                    timestampMs = timestampMs
+                )
                 val nalType = if (nalBytes.size > 4) (nalBytes[4].toInt() and 0x1F) else 0
                 val isIdr = isKeyFrame || nalType == 5
                 val isStandaloneSpsPps = !isIdr && (nalType == 7 || nalType == 8)
@@ -634,8 +514,22 @@ class BridgeForegroundService : Service() {
                 isServiceRunning = true,
                 wakeLockHeld = wakeLock?.isHeld == true,
                 isVideoChannelReadyForStreaming = false,
-                useNestedVideoMsgHeader = CarLifeFrameCodec.useNestedVideoMsgHeader,
-                lastProtocolEvent = "BridgeForegroundService active (0x0002 locked until MSG_CMD_VIDEO_ENCODER_INIT)"
+                useNestedVideoMsgHeader = true,
+                configuredWidth = activeWidth,
+                configuredHeight = activeHeight,
+                configuredBitrateBps = activeBitrateBps,
+                lastProtocolEvent = "BridgeForegroundService active (1024×600 @ 1.2Mbps, AOA 20B; 0x0002 gated until MD_INFO+AudioInit)"
+            )
+        }
+
+        // Immediately start VirtualDisplay + H.264 MediaCodec (1024x600, 30fps, 1.2 Mbps, AVCProfileBaseline)
+        // while keeping 0x0002 streaming locked until USB AOA handshake completes.
+        serviceScope.launch {
+            projectionManager.startProjection(
+                width = activeWidth,
+                height = activeHeight,
+                frameRate = 30,
+                bitRate = activeBitrateBps
             )
         }
 
@@ -660,10 +554,11 @@ class BridgeForegroundService : Service() {
         // Observe USB transport state changes
         serviceScope.launch {
             usbTransport.state.collect { newState ->
-                // On any new USB AOA connection or disconnect, lock 0x0002 streaming until 0x0001 handshake completes!
+                // On any new USB AOA connection or disconnect, lock 0x0002 streaming until 0x0001 handshake + AudioInit complete!
                 mdInfoAutoStartJob?.cancel()
                 mdInfoAutoStartJob = null
                 hasSentMdInfoInSession = false
+                hasSentAudioInitInSession = false
                 setVideoStreamingReady(false)
                 resetVideoLogFlags()
                 if (newState is UsbTransportState.Disconnected || newState is UsbTransportState.Connecting) {
@@ -999,6 +894,7 @@ class BridgeForegroundService : Service() {
     private suspend fun handleIncomingCarLifeFrame(frame: CarLifeFrame) {
         when (frame.channel) {
             CarLifeChannel.CONTROL -> {
+                val cmd = frame.parseCommandMessageOrNull()
                 val transition = controlStateMachine.onControlFrame(frame)
                 BridgeTelemetryBus.recordFrame(
                     direction = "RX (HU -> S26U)",
@@ -1009,8 +905,21 @@ class BridgeForegroundService : Service() {
                     txFramesTotal = usbTransport.txFrames,
                     protocolNote = transition.summary
                 )
+
+                // If HU requested video encoder init/start before MD_INFO/Audio-Init ran,
+                // force-send mandatory Audio-Init (0x0003 & 0x0004) BEFORE INIT_DONE/START_DONE/FOREGROUND/SCREEN_ON!
+                if ((cmd?.serviceType == CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT ||
+                        cmd?.serviceType == CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT_ALT ||
+                        cmd?.serviceType == CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START ||
+                        cmd?.serviceType == CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_ALT) &&
+                    !hasSentAudioInitInSession
+                ) {
+                    sendAudioMultiplexerInitPackets()
+                }
+
                 for (reply in transition.outboundFrames) {
                     if (usbTransport.sendFrameImmediate(reply)) {
+                        val replyService = reply.parseCommandMessageOrNull()?.serviceType
                         BridgeTelemetryBus.recordFrame(
                             direction = "TX (S26U -> HU)",
                             frame = reply,
@@ -1020,10 +929,14 @@ class BridgeForegroundService : Service() {
                             txFramesTotal = usbTransport.txFrames,
                             protocolNote = "Auto-Reply: ${reply.parseCommandMessageOrNull()?.serviceName ?: "Frame"}"
                         )
+                        // Requirement 1: Immediately after MSG_CMD_MD_INFO (0x00018003), send empty 12B Audio-Init
+                        // packets on 0x0003 (Media Audio) & 0x0004 (TTS Audio) BEFORE VIDEO_ENCODER_INIT_DONE/START_DONE/SCREEN_ON
+                        if (replyService == CarLifeMsgType.MSG_CMD_MD_INFO_03 && !hasSentAudioInitInSession) {
+                            sendAudioMultiplexerInitPackets()
+                        }
                     }
                 }
 
-                val cmd = frame.parseCommandMessageOrNull()
                 val cmdName = cmd?.serviceName ?: "Control(${frame.payload.size}B)"
                 lastHuConfirmationSource = "0x0001 $cmdName"
                 huConfirmationSeq.incrementAndGet()
@@ -1387,41 +1300,29 @@ class BridgeForegroundService : Service() {
         val AUTO_TEST_PROFILES: List<AutoTestProfile> = listOf(
             AutoTestProfile(
                 stepNumber = 1,
-                label = "800×480 • 800 кбит/с • Direct 12B",
-                width = 800,
-                height = 480,
-                bitrateBps = 800_000,
-                useNestedVideoHeader = false,
-                forceAudioMultiplexerInit = false
-            ),
-            AutoTestProfile(
-                stepNumber = 2,
-                label = "1024×600 • 1.2 Мбит/с • Direct 12B",
+                label = "1024×600 • 1.2 Мбит/с • AOA 20B + Audio Init (0x0003/0x0004)",
                 width = 1024,
                 height = 600,
                 bitrateBps = 1_200_000,
-                useNestedVideoHeader = false,
-                forceAudioMultiplexerInit = false
-            ),
-            AutoTestProfile(
-                stepNumber = 3,
-                label = "1280×720 • 1.8 Мбит/с • Direct 12B",
-                width = 1280,
-                height = 720,
-                bitrateBps = 1_800_000,
-                useNestedVideoHeader = false,
-                forceAudioMultiplexerInit = false
-            ),
-            AutoTestProfile(
-                stepNumber = 4,
-                label = "800×480 • 800 кбит/с • Direct 12B + Audio Init (0x0003/0x0004)",
-                width = 800,
-                height = 480,
-                bitrateBps = 800_000,
-                useNestedVideoHeader = false,
+                useNestedVideoHeader = true,
                 forceAudioMultiplexerInit = true
             )
         )
+
+        fun startDefaultProjection(context: Context) {
+            val intent = Intent(context, BridgeForegroundService::class.java).apply {
+                action = ACTION_START_PROJECTION
+                putExtra(EXTRA_WIDTH, 1024)
+                putExtra(EXTRA_HEIGHT, 600)
+                putExtra(EXTRA_FPS, 30)
+                putExtra(EXTRA_BITRATE, 1_200_000)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                context.startForegroundService(intent)
+            } else {
+                context.startService(intent)
+            }
+        }
 
         fun grantMediaProjection(context: Context, resultCode: Int, resultData: Intent) {
             MediaProjectionTokenStore.saveToken(resultCode, resultData)

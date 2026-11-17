@@ -26,8 +26,8 @@ data class CarLifeControlSessionState(
     val huProtocolMajor: Int = 0,
     val huProtocolMinor: Int = 0,
     val huDeviceInfo: CarlifeDeviceInfoProto? = null,
-    val negotiatedVideoWidth: Int = 800,
-    val negotiatedVideoHeight: Int = 480,
+    val negotiatedVideoWidth: Int = 1024,
+    val negotiatedVideoHeight: Int = 600,
     val negotiatedFps: Int = 30,
     val isHuScreenOn: Boolean = true,
     val isHuForeground: Boolean = true,
@@ -50,8 +50,8 @@ data class ControlTransitionResult(
 class CarLifeControlStateMachine(
     private val force60FpsOnMqb: Boolean = false,
     private val mobileDeviceInfo: CarlifeDeviceInfoProto = CarlifeDeviceInfoProto(),
-    @Volatile var preferredVideoWidth: Int = 800,
-    @Volatile var preferredVideoHeight: Int = 480
+    @Volatile var preferredVideoWidth: Int = 1024,
+    @Volatile var preferredVideoHeight: Int = 600
 ) {
     private val _sessionState = MutableStateFlow(
         CarLifeControlSessionState(

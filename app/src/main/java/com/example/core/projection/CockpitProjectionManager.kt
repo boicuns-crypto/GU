@@ -131,11 +131,11 @@ data class ProjectionPipelineStats(
     val isRunning: Boolean = false,
     val usingMediaProjection: Boolean = false,
     val virtualDisplayId: Int = Display.DEFAULT_DISPLAY,
-    val width: Int = 800,
-    val height: Int = 480,
+    val width: Int = 1024,
+    val height: Int = 600,
     val fps: Int = 30,
     val bitRateMbps: Int = 1,
-    val bitRateKbps: Int = 800,
+    val bitRateKbps: Int = 1200,
     val encodedNalFrames: Long = 0L,
     val encodedBytes: Long = 0L,
     val lastIdrBytes: Int = 0,
@@ -143,7 +143,7 @@ data class ProjectionPipelineStats(
     val injectedTouches: Long = 0L,
     val lastTouchPoint: Pair<Float, Float>? = null,
     val activeCockpitWidget: String = "Лаунчер ГУ CarLife активен",
-    val statusMessage: String = "Лаунчер ГУ готов (800×480 @ 800 кбит/с)"
+    val statusMessage: String = "Лаунчер ГУ готов (1024×600 @ 1200 кбит/с)"
 )
 
 /**
@@ -213,18 +213,18 @@ class CockpitProjectionManager(
     private var presentationRefreshJob: Job? = null
 
     suspend fun startProjection(
-        width: Int = 800,
-        height: Int = 480,
+        width: Int = 1024,
+        height: Int = 600,
         frameRate: Int = 30,
-        bitRate: Int = 800_000,
+        bitRate: Int = 1_200_000,
         densityDpi: Int = DisplayMetrics.DENSITY_MEDIUM
     ): Boolean = projectionMutex.withLock {
         // Stop only the previous MediaCodec / Surface while preserving any live MediaProjection & VirtualDisplay
         // so Android 14/15/16 single-use MediaProjection tokens are never invalidated on resolution switch!
         stopEncoderOnlyLocked()
 
-        val safeWidth = if (width in 480..3840) width else 800
-        val safeHeight = if (height in 272..2160) height else 480
+        val safeWidth = if (width in 480..3840) width else 1024
+        val safeHeight = if (height in 272..2160) height else 600
         val safeFps = if (frameRate in 15..60) frameRate else 30
         val safeBitRate = bitRate.coerceIn(400_000, 12_000_000)
         val effectiveDpi = if (safeWidth <= 1024) DisplayMetrics.DENSITY_MEDIUM else densityDpi
@@ -1347,9 +1347,9 @@ class CockpitProjectionManager(
                                     val idrWithSpsPps = if (spsPps != null) spsPps + pureSliceBytes else pureSliceBytes
                                     onEncodedVideoNal(idrWithSpsPps, timestampMs, true)
 
-                                    // If hardware rate-controller produced an IDR > 22 KB, dynamically lower target bitrate to keep IDR < 25 KB
-                                    if (idrWithSpsPps.size > 22_000 && currentDynamicBitrate > 450_000) {
-                                        currentDynamicBitrate = (currentDynamicBitrate * 70 / 100).coerceAtLeast(450_000)
+                                    // If hardware rate-controller produced an IDR > 45 KB, dynamically lower target bitrate smoothly (floor 800 kbps)
+                                    if (idrWithSpsPps.size > 45_000 && currentDynamicBitrate > 800_000) {
+                                        currentDynamicBitrate = (currentDynamicBitrate * 80 / 100).coerceAtLeast(800_000)
                                         runCatching {
                                             val b = Bundle().apply {
                                                 putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, currentDynamicBitrate)

@@ -871,16 +871,17 @@ object CarLifeFrameCodec {
 
     /**
      * Runtime toggle for Baidu CarLife Video Channel (`0x0002`) payload framing (applied identically to SPS/PPS and IDR):
-     * - `false` (**Direct 12B — default**):
+     * - `true` (**AOA 20B — Jetta VS7 default**):
+     *   Outer AOA 8B (`[00 00 00 02][12 + h264.size]`) + Inner 12B (`[h264.size (4B)][timestampMs (4B)][0x00028001 (4B)]`) + `[00 00 00 01 ... h264Bytes]`.
+     * - `false` (**Direct 12B**):
      *   12B Header (`[00 00 00 02 (4B)][nalSize (4B)][timestamp (4B)]`) + `[00 00 00 01... h264Bytes]`.
-     * - `true` (**AOA 20B**):
-     *   Outer AOA 8B (`[00 00 00 02][12 + h264.size]`) + Inner 12B (`[h264.size (4B)][timestampMs (4B)][0x00028001 (4B)]`) + `[h264Bytes]`.
      */
     @Volatile
-    var useNestedVideoMsgHeader: Boolean = false
+    var useNestedVideoMsgHeader: Boolean = true
 
     /**
      * Ensures an H.264 buffer starts with the 4-byte Annex-B start code `00 00 00 01`.
+     * Also converts a single AVCC length-prefixed NAL (`[4B length][NAL...]`) to Annex-B if encountered.
      */
     fun ensureAnnexBStartCode(nalData: ByteArray): ByteArray {
         if (nalData.size >= 4 &&
@@ -904,6 +905,23 @@ object CarLifeFrameCodec {
             System.arraycopy(nalData, 3, fixed, 4, nalData.size - 3)
             return fixed
         }
+        // Check if encoder emitted a 4-byte AVCC length prefix: [nalSize (4B)][NAL byte...]
+        if (nalData.size > 4) {
+            val avccLen = ((nalData[0].toInt() and 0xFF) shl 24) or
+                ((nalData[1].toInt() and 0xFF) shl 16) or
+                ((nalData[2].toInt() and 0xFF) shl 8) or
+                (nalData[3].toInt() and 0xFF)
+            val nalHdr = nalData[4].toInt() and 0xFF
+            val nalType = nalHdr and 0x1F
+            if (avccLen == nalData.size - 4 && (nalHdr and 0x80) == 0 && nalType in 1..12) {
+                val fixed = nalData.copyOf()
+                fixed[0] = 0x00
+                fixed[1] = 0x00
+                fixed[2] = 0x00
+                fixed[3] = 0x01
+                return fixed
+            }
+        }
         val prefixed = ByteArray(4 + nalData.size)
         prefixed[0] = 0x00
         prefixed[1] = 0x00
@@ -913,33 +931,48 @@ object CarLifeFrameCodec {
         return prefixed
     }
 
+    /**
+     * Canonical Jetta VS7 USB AOA `0x0002` Video frame encoder (`AOA 20B` + `0x00028001` + `Annex-B`):
+     * - Outer 8B AOA Header: `[00 00 00 02][len + 12]`
+     * - Inner 12B Video Header: `[len][timestampMs][00 02 80 01]`
+     * - Payload: `[00 00 00 01 ... (H.264 Annex-B)]`
+     * Used strictly for BOTH `SPS/PPS` and `IDR` / `P-slice` NAL units.
+     */
+    fun encodeAoAVideoFrame(
+        h264Data: ByteArray,
+        timestampMs: Long = (android.os.SystemClock.uptimeMillis().takeIf { it > 0L } ?: System.currentTimeMillis()) and 0x7FFF_FFFFL
+    ): CarLifeFrame {
+        val annexBData = ensureAnnexBStartCode(h264Data)
+        val safeTs = timestampMs and 0x7FFF_FFFFL
+        val innerVideoMsg = ByteBuffer.allocate(12 + annexBData.size)
+            .order(ByteOrder.BIG_ENDIAN)
+            .putInt(annexBData.size)
+            .putInt(safeTs.toInt())
+            .putInt(CarLifeMsgType.MSG_VIDEO_DATA)
+            .put(annexBData)
+            .array()
+        return CarLifeFrame(
+            header = CarLifeHeader(
+                channel = CarLifeChannel.VIDEO,
+                rawChannelId = CarLifeChannel.VIDEO.id,
+                payloadLength = innerVideoMsg.size,
+                timestamp = safeTs,
+                includeOuterTimestamp = false
+            ),
+            payload = innerVideoMsg
+        )
+    }
+
     fun createVideoFrame(
         nalData: ByteArray,
         timestampMs: Long = (android.os.SystemClock.uptimeMillis().takeIf { it > 0L } ?: System.currentTimeMillis()) and 0x7FFF_FFFFL,
         nestedVideoMsgHeader: Boolean = useNestedVideoMsgHeader
     ): CarLifeFrame {
-        val annexBData = ensureAnnexBStartCode(nalData)
-        val safeTs = timestampMs and 0x7FFF_FFFFL
         return if (nestedVideoMsgHeader) {
-            // Mode 1 (AOA 20B): 8B Outer AOA Header + 12B Inner Video Header ([h264.size][ts][0x00028001]) + [annexBData]
-            val innerVideoMsg = ByteBuffer.allocate(12 + annexBData.size)
-                .order(ByteOrder.BIG_ENDIAN)
-                .putInt(annexBData.size)
-                .putInt(safeTs.toInt())
-                .putInt(CarLifeMsgType.MSG_VIDEO_DATA)
-                .put(annexBData)
-                .array()
-            CarLifeFrame(
-                header = CarLifeHeader(
-                    channel = CarLifeChannel.VIDEO,
-                    rawChannelId = CarLifeChannel.VIDEO.id,
-                    payloadLength = innerVideoMsg.size,
-                    timestamp = safeTs,
-                    includeOuterTimestamp = false
-                ),
-                payload = innerVideoMsg
-            )
+            encodeAoAVideoFrame(h264Data = nalData, timestampMs = timestampMs)
         } else {
+            val annexBData = ensureAnnexBStartCode(nalData)
+            val safeTs = timestampMs and 0x7FFF_FFFFL
             // Mode 2 (Direct 12B): 12B Header ([0x00000002][annexBData.size][ts]) + [annexBData]
             CarLifeFrame(
                 header = CarLifeHeader(
@@ -975,11 +1008,12 @@ object CarLifeFrameCodec {
 
     /**
      * Builds empty 12-byte initialization packets (`12B header + empty PCM buffer`) for
-     * `0x0003 (Media Audio)` and `0x0004 (TTS Audio)` to wake up the Jetta VS7 audio multiplexer
-     * on firmwares that block the 90% screen until audio channels are initialized.
+     * `0x0003 (Media Audio)` and `0x0004 (TTS Audio)`:
+     * - `[00 00 00 03][00 00 00 00 (size)][00 00 00 00 (timestamp)]`
+     * - `[00 00 00 04][00 00 00 00 (size)][00 00 00 00 (timestamp)]`
      */
     fun createAudioMultiplexerInitFrames(
-        timestampMs: Long = (android.os.SystemClock.uptimeMillis().takeIf { it > 0L } ?: System.currentTimeMillis()) and 0x7FFF_FFFFL
+        timestampMs: Long = 0L
     ): List<CarLifeFrame> {
         val safeTs = timestampMs and 0x7FFF_FFFFL
         return listOf(
@@ -991,7 +1025,7 @@ object CarLifeFrameCodec {
             createAudioFrame(
                 audioChannel = CarLifeChannel.TTS_AUDIO,
                 pcmData = ByteArray(0),
-                timestampMs = safeTs + 1L
+                timestampMs = safeTs
             )
         )
     }

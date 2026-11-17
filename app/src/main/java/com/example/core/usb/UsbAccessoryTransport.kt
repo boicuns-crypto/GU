@@ -316,28 +316,70 @@ class UsbAccessoryTransport(
                 if (bytesRead == 0) continue
 
                 val rawSnapshot = readBuffer.copyOf(bytesRead)
+                val rawCh = if (bytesRead >= 8) {
+                    ByteBuffer.wrap(rawSnapshot, 0, 4).order(ByteOrder.BIG_ENDIAN).int
+                } else {
+                    0
+                }
+                val rawLen = if (bytesRead >= 8) {
+                    ByteBuffer.wrap(rawSnapshot, 4, 4).order(ByteOrder.BIG_ENDIAN).int
+                } else {
+                    0
+                }
+                val hasZeroInnerLenPrefix = bytesRead > 8 &&
+                    bytesRead >= 12 &&
+                    rawSnapshot[8] == 0.toByte() &&
+                    rawSnapshot[9] == 0.toByte() &&
+                    rawSnapshot[10] == 0.toByte() &&
+                    rawSnapshot[11] == 0.toByte()
+
+                // Fast-path guard against "Payload: 0B" on >8-byte reads where HU sends a no-Protobuf command:
+                // bytes[0..3]=ch, bytes[4..7]=0, bytes[8..11]=[00 00 00 00], bytes[12..15]=serviceId
+                if (bytesRead > 8 && rawCh in 1..6 && rawLen == 0 && hasZeroInnerLenPrefix && bytesRead >= 16) {
+                    streamAssembler.reset()
+                    val resolvedChannel = com.example.protocol.carlife.CarLifeChannel.fromId(rawCh)
+                        ?: com.example.protocol.carlife.CarLifeChannel.CONTROL
+                    val extractedPayload = rawSnapshot.copyOfRange(8, rawSnapshot.size)
+                    val noProtoFrame = CarLifeFrame(
+                        header = com.example.protocol.carlife.CarLifeHeader(
+                            channel = resolvedChannel,
+                            rawChannelId = rawCh,
+                            payloadLength = extractedPayload.size,
+                            timestamp = 0L,
+                            includeOuterTimestamp = false
+                        ),
+                        payload = extractedPayload
+                    )
+                    _rxFrames.incrementAndGet()
+                    _rxBytes.addAndGet(noProtoFrame.totalFrameBytes.toLong())
+                    _incomingFrames.emit(noProtoFrame)
+                    continue
+                }
+
                 streamAssembler.append(readBuffer, 0, bytesRead)
                 val frames = streamAssembler.drainFrames()
 
-                if (frames.isEmpty() && bytesRead >= 8) {
-                    // Fallback if HU sent a raw packet with a header length larger than the single USB Bulk IN transfer
-                    // or a non-standard header: inspect rawSnapshot directly so it is never silently dropped
-                    val rawCh = ByteBuffer.wrap(rawSnapshot, 0, 4).order(ByteOrder.BIG_ENDIAN).int
-                    val rawLen = ByteBuffer.wrap(rawSnapshot, 4, 4).order(ByteOrder.BIG_ENDIAN).int
-                    if (rawCh !in 1..6 || rawLen == 0) {
+                if (frames.isEmpty() && bytesRead > 8) {
+                    // Fallback if HU sent a raw packet >8B that didn't match standard outer length (e.g. rawLen == 0 or non-standard header)
+                    if (rawCh !in 1..6 || rawLen == 0 || hasZeroInnerLenPrefix) {
                         val rawHex = rawSnapshot.take(64).joinToString(" ") { "%02X".format(it) }
                         Log.w(TAG, "USB AOA raw read ($bytesRead B, ch=$rawCh, len=$rawLen): $rawHex")
                         streamAssembler.reset()
+                        val fallbackPayload = if (rawCh in 1..6) {
+                            rawSnapshot.copyOfRange(8, rawSnapshot.size)
+                        } else {
+                            rawSnapshot
+                        }
                         val fallbackFrame = CarLifeFrame(
                             header = com.example.protocol.carlife.CarLifeHeader(
                                 channel = com.example.protocol.carlife.CarLifeChannel.fromId(rawCh)
                                     ?: com.example.protocol.carlife.CarLifeChannel.CONTROL,
                                 rawChannelId = if (rawCh in 1..6) rawCh else 1,
-                                payloadLength = rawSnapshot.size,
+                                payloadLength = fallbackPayload.size,
                                 timestamp = 0L,
                                 includeOuterTimestamp = false
                             ),
-                            payload = rawSnapshot
+                            payload = fallbackPayload
                         )
                         _rxFrames.incrementAndGet()
                         _rxBytes.addAndGet(bytesRead.toLong())
@@ -347,21 +389,21 @@ class UsbAccessoryTransport(
                 }
 
                 for (frame in frames) {
-                    val effectiveFrame = if (frame.payload.isEmpty()) {
+                    val effectiveFrame = if (frame.payload.isEmpty() && bytesRead > 8) {
                         val rawHex = rawSnapshot.take(64).joinToString(" ") { "%02X".format(it) }
                         Log.w(
                             TAG,
                             "USB AOA RX frame with payloadLen=0 (raw bytesRead=$bytesRead B): [$rawHex]"
                         )
-                        if (bytesRead > 8) {
-                            // Ensure full readBuffer.copyOf(bytesRead) is visible in PAYLOAD[...] and parsed for serviceId at [8..11] or [12..15]
-                            frame.copy(
-                                header = frame.header.copy(payloadLength = rawSnapshot.size),
-                                payload = rawSnapshot
-                            )
+                        val extractedPayload = if (rawCh in 1..6) {
+                            rawSnapshot.copyOfRange(8, rawSnapshot.size)
                         } else {
-                            frame
+                            rawSnapshot
                         }
+                        frame.copy(
+                            header = frame.header.copy(payloadLength = extractedPayload.size),
+                            payload = extractedPayload
+                        )
                     } else {
                         frame
                     }
