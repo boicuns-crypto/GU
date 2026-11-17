@@ -131,11 +131,11 @@ data class ProjectionPipelineStats(
     val isRunning: Boolean = false,
     val usingMediaProjection: Boolean = false,
     val virtualDisplayId: Int = Display.DEFAULT_DISPLAY,
-    val width: Int = 1024,
-    val height: Int = 600,
+    val width: Int = 800,
+    val height: Int = 480,
     val fps: Int = 30,
     val bitRateMbps: Int = 1,
-    val bitRateKbps: Int = 1200,
+    val bitRateKbps: Int = 800,
     val encodedNalFrames: Long = 0L,
     val encodedBytes: Long = 0L,
     val lastIdrBytes: Int = 0,
@@ -143,7 +143,7 @@ data class ProjectionPipelineStats(
     val injectedTouches: Long = 0L,
     val lastTouchPoint: Pair<Float, Float>? = null,
     val activeCockpitWidget: String = "Лаунчер ГУ CarLife активен",
-    val statusMessage: String = "Лаунчер ГУ готов (1024×600 @ 1200 кбит/с)"
+    val statusMessage: String = "Лаунчер ГУ готов (800×480 @ 800 кбит/с, CBR 30fps)"
 )
 
 /**
@@ -213,18 +213,18 @@ class CockpitProjectionManager(
     private var presentationRefreshJob: Job? = null
 
     suspend fun startProjection(
-        width: Int = 1024,
-        height: Int = 600,
+        width: Int = 800,
+        height: Int = 480,
         frameRate: Int = 30,
-        bitRate: Int = 1_200_000,
+        bitRate: Int = 800_000,
         densityDpi: Int = DisplayMetrics.DENSITY_MEDIUM
     ): Boolean = projectionMutex.withLock {
         // Stop only the previous MediaCodec / Surface while preserving any live MediaProjection & VirtualDisplay
         // so Android 14/15/16 single-use MediaProjection tokens are never invalidated on resolution switch!
         stopEncoderOnlyLocked()
 
-        val safeWidth = if (width in 480..3840) width else 1024
-        val safeHeight = if (height in 272..2160) height else 600
+        val safeWidth = if (width in 480..3840) width else 800
+        val safeHeight = if (height in 272..2160) height else 480
         val safeFps = if (frameRate in 15..60) frameRate else 30
         val safeBitRate = bitRate.coerceIn(400_000, 12_000_000)
         val effectiveDpi = if (safeWidth <= 1024) DisplayMetrics.DENSITY_MEDIUM else densityDpi
@@ -789,16 +789,14 @@ class CockpitProjectionManager(
         val idr = lastKeyFrameAnnexB?.let { CarLifeFrameCodec.ensureAnnexBStartCode(it) }
         if (spsPps != null && idr != null && awaitingFirstIdrAfterGateOpen.compareAndSet(true, false)) {
             val tsMs = SystemClock.uptimeMillis() and 0x7FFF_FFFFL
-            // Packet #1 on 0x0002: standalone SPS/PPS
-            onEncodedVideoNal(spsPps, tsMs, false)
-            // Packet #2 on 0x0002: concatenated SPS/PPS + IDR
+            // Send concatenated SPS/PPS + IDR in a SINGLE 0x0002 packet for Jetta VS7 hardware decoder
             val combinedIdr = spsPps + idr
-            onEncodedVideoNal(combinedIdr, tsMs + 1L, true)
+            onEncodedVideoNal(combinedIdr, tsMs, true)
             _stats.update {
                 it.copy(
                     spsPpsConfigured = true,
-                    encodedNalFrames = it.encodedNalFrames + 2L,
-                    encodedBytes = it.encodedBytes + spsPps.size + combinedIdr.size,
+                    encodedNalFrames = it.encodedNalFrames + 1L,
+                    encodedBytes = it.encodedBytes + combinedIdr.size,
                     lastIdrBytes = combinedIdr.size
                 )
             }
@@ -806,8 +804,8 @@ class CockpitProjectionManager(
     }
 
     /**
-     * Requests a fresh `IDR` sync frame from `MediaCodec` and sends `SPS/PPS` + `SPS/PPS+IDR`
-     * ONLY if `isVideoChannelReadyForStreaming` is `true`.
+     * Requests a fresh `IDR` sync frame from `MediaCodec` and sends `SPS/PPS+IDR`
+     * in a single `0x0002` packet ONLY if `isVideoChannelReadyForStreaming` is `true`.
      */
     fun requestInstantIdrKeyFrame() {
         mainHandler.post {
@@ -824,29 +822,16 @@ class CockpitProjectionManager(
 
         val spsPps = cachedSpsPpsAnnexB?.let { CarLifeFrameCodec.ensureAnnexBStartCode(it) }
         val idr = lastKeyFrameAnnexB?.let { CarLifeFrameCodec.ensureAnnexBStartCode(it) }
-        val tsMs = SystemClock.uptimeMillis() and 0x7FFF_FFFFL
-        var addedNals = 0L
-        var addedBytes = 0L
-        var lastIdrSize = 0
-        if (spsPps != null) {
-            onEncodedVideoNal(spsPps, tsMs, false)
-            addedNals += 1L
-            addedBytes += spsPps.size.toLong()
-        }
         if (idr != null) {
+            val tsMs = SystemClock.uptimeMillis() and 0x7FFF_FFFFL
             val combinedIdr = if (spsPps != null) spsPps + idr else idr
-            onEncodedVideoNal(combinedIdr, tsMs + 1L, true)
-            addedNals += 1L
-            addedBytes += combinedIdr.size.toLong()
-            lastIdrSize = combinedIdr.size
-        }
-        if (addedNals > 0L) {
+            onEncodedVideoNal(combinedIdr, tsMs, true)
             _stats.update {
                 it.copy(
                     spsPpsConfigured = spsPps != null || it.spsPpsConfigured,
-                    encodedNalFrames = it.encodedNalFrames + addedNals,
-                    encodedBytes = it.encodedBytes + addedBytes,
-                    lastIdrBytes = if (lastIdrSize > 0) lastIdrSize else it.lastIdrBytes
+                    encodedNalFrames = it.encodedNalFrames + 1L,
+                    encodedBytes = it.encodedBytes + combinedIdr.size,
+                    lastIdrBytes = combinedIdr.size
                 )
             }
         }
@@ -1068,8 +1053,8 @@ class CockpitProjectionManager(
     ): MediaCodec {
         val codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
 
-        // Stage 1: Pure AVCProfileBaseline (0x01) + AVCLevel31 + BITRATE_MODE_VBR + KEY_I_FRAME_INTERVAL = 2 + QP bounds (IDR < 25 KB)
-        val baselineQpBoundedFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
+        // Stage 1: Strict Jetta VS7 format — AVCProfileBaseline + AVCLevel31 + BITRATE_MODE_CBR + KEY_I_FRAME_INTERVAL = 2
+        val baselineLevel31CbrFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
             setInteger(
                 MediaFormat.KEY_COLOR_FORMAT,
                 MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
@@ -1087,23 +1072,16 @@ class CockpitProjectionManager(
             )
             setInteger(
                 MediaFormat.KEY_BITRATE_MODE,
-                MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR
+                MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR
             )
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
             }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                // Prevent initial IDR keyframe spikes > 25 KB on Qualcomm/Exynos hardware encoders
-                setInteger(MediaFormat.KEY_VIDEO_QP_I_MIN, 28)
-                setInteger(MediaFormat.KEY_VIDEO_QP_I_MAX, 46)
-                setInteger(MediaFormat.KEY_VIDEO_QP_P_MIN, 26)
-                setInteger(MediaFormat.KEY_VIDEO_QP_P_MAX, 46)
-            }
             setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000L)
         }
 
-        // Stage 2: Pure AVCProfileBaseline (0x01) + AVCLevel31 + BITRATE_MODE_VBR + KEY_I_FRAME_INTERVAL = 2
-        val baselineLevel31Format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
+        // Stage 2: AVCProfileBaseline + BITRATE_MODE_CBR (without explicit level)
+        val baselineCbrFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
             setInteger(
                 MediaFormat.KEY_COLOR_FORMAT,
                 MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
@@ -1114,14 +1092,10 @@ class CockpitProjectionManager(
             setInteger(
                 MediaFormat.KEY_PROFILE,
                 MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline
-            )
-            setInteger(
-                MediaFormat.KEY_LEVEL,
-                MediaCodecInfo.CodecProfileLevel.AVCLevel31
             )
             setInteger(
                 MediaFormat.KEY_BITRATE_MODE,
-                MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR
+                MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR
             )
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
@@ -1129,8 +1103,8 @@ class CockpitProjectionManager(
             setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000L)
         }
 
-        // Stage 3: Strict AVCProfileBaseline + Level 3.1 + KEY_I_FRAME_INTERVAL = 2
-        val baselineMinimalLevelFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
+        // Stage 3: Generic AVC + BITRATE_MODE_CBR + KEY_I_FRAME_INTERVAL = 2
+        val genericCbrFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
             setInteger(
                 MediaFormat.KEY_COLOR_FORMAT,
                 MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
@@ -1139,34 +1113,33 @@ class CockpitProjectionManager(
             setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
             setInteger(
-                MediaFormat.KEY_PROFILE,
-                MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline
+                MediaFormat.KEY_BITRATE_MODE,
+                MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR
             )
-            setInteger(
-                MediaFormat.KEY_LEVEL,
-                MediaCodecInfo.CodecProfileLevel.AVCLevel31
-            )
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
+            }
             setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000L)
         }
 
         val candidates = listOf(
-            "AVCProfileBaseline+Level31+VBR+QPBounded" to baselineQpBoundedFormat,
-            "AVCProfileBaseline+Level31+VBR" to baselineLevel31Format,
-            "AVCProfileBaseline+Level31" to baselineMinimalLevelFormat
+            "AVCProfileBaseline+Level31+CBR" to baselineLevel31CbrFormat,
+            "AVCProfileBaseline+CBR" to baselineCbrFormat,
+            "GenericAVC+CBR" to genericCbrFormat
         )
 
         for ((label, candidate) in candidates) {
             try {
                 codec.reset()
                 codec.configure(candidate, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-                Log.i(TAG, "Configured H.264 encoder in $label ($width×$height @ ${frameRate}fps, ${bitRate / 1000}kbps)")
+                Log.i(TAG, "Configured H.264 encoder in $label ($width×$height @ ${frameRate}fps, ${bitRate / 1000}kbps CBR)")
                 return codec
             } catch (e: Exception) {
                 Log.w(TAG, "H.264 config candidate $label rejected (${e.message}), trying next...")
             }
         }
 
-        // Final fallback if running on a software codec that refuses explicit profile keys
+        // Final fallback if running on a software codec that rejects BITRATE_MODE_CBR
         val fallbackFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
             setInteger(
                 MediaFormat.KEY_COLOR_FORMAT,
@@ -1332,18 +1305,7 @@ class CockpitProjectionManager(
                                 if (containsIdrNal) {
                                     awaitingFirstIdrAfterGateOpen.set(false)
                                     val spsPps = cachedSpsPpsAnnexB?.let { CarLifeFrameCodec.ensureAnnexBStartCode(it) }
-                                    if (spsPps != null) {
-                                        // 1. First packet on 0x0002 before IDR: standalone spsPpsBytes
-                                        onEncodedVideoNal(spsPps, timestampMs, false)
-                                        _stats.update {
-                                            it.copy(
-                                                spsPpsConfigured = true,
-                                                encodedNalFrames = it.encodedNalFrames + 1L,
-                                                encodedBytes = it.encodedBytes + spsPps.size
-                                            )
-                                        }
-                                    }
-                                    // 2. Second packet on 0x0002: concatenated spsPpsBytes + idrBytes
+                                    // Send concatenated spsPpsBytes + idrBytes in ONE single 0x0002 packet
                                     val idrWithSpsPps = if (spsPps != null) spsPps + pureSliceBytes else pureSliceBytes
                                     onEncodedVideoNal(idrWithSpsPps, timestampMs, true)
 
@@ -1360,6 +1322,7 @@ class CockpitProjectionManager(
 
                                     _stats.update {
                                         it.copy(
+                                            spsPpsConfigured = (spsPps != null) || it.spsPpsConfigured,
                                             encodedNalFrames = it.encodedNalFrames + 1L,
                                             encodedBytes = it.encodedBytes + idrWithSpsPps.size,
                                             lastIdrBytes = idrWithSpsPps.size

@@ -138,12 +138,12 @@ class ExampleUnitTest {
         val videoInitFrame = CarLifeFrameCodec.createCommandFrame(
             channel = CarLifeChannel.CONTROL,
             serviceType = CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT,
-            commandBody = CarlifeVideoEncoderInfoProto(width = 1024, height = 600, frameRate = 30).encode()
+            commandBody = CarlifeVideoEncoderInfoProto(width = 800, height = 480, frameRate = 30).encode()
         )
         val step2 = sm.onControlFrame(videoInitFrame)
         assertEquals(CarLifeSessionPhase.VIDEO_STREAMING, step2.updatedState.phase)
-        assertEquals(1024, step2.updatedState.negotiatedVideoWidth)
-        assertEquals(600, step2.updatedState.negotiatedVideoHeight)
+        assertEquals(800, step2.updatedState.negotiatedVideoWidth)
+        assertEquals(480, step2.updatedState.negotiatedVideoHeight)
         assertEquals(30, step2.updatedState.negotiatedFps)
         assertEquals(4, step2.outboundFrames.size)
 
@@ -288,9 +288,9 @@ class ExampleUnitTest {
     fun jettaVs7LockedProfile_audioInitBytesAndAoA20BVideo_verifySpec() {
         val profiles = com.example.core.usb.BridgeForegroundService.AUTO_TEST_PROFILES
         assertEquals(1, profiles.size)
-        assertEquals(1024, profiles[0].width)
-        assertEquals(600, profiles[0].height)
-        assertEquals(1_200_000, profiles[0].bitrateBps)
+        assertEquals(800, profiles[0].width)
+        assertEquals(480, profiles[0].height)
+        assertEquals(800_000, profiles[0].bitrateBps)
         assertEquals(true, profiles[0].useNestedVideoHeader)
         assertEquals(true, profiles[0].forceAudioMultiplexerInit)
 
@@ -312,6 +312,15 @@ class ExampleUnitTest {
             ),
             CarLifeFrameCodec.encodeFrame(audioInitFrames[1])
         )
+
+        // Verify concatenated SPS/PPS + IDR fits into a SINGLE 0x0002 AOA 20B frame
+        val spsPps = byteArrayOf(0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1F, 0x00, 0x00, 0x00, 0x01, 0x68, 0xCE.toByte(), 0x3C, 0x80.toByte())
+        val idr = byteArrayOf(0x00, 0x00, 0x00, 0x01, 0x65, 0x88.toByte(), 0x84.toByte(), 0x21)
+        val combined = spsPps + idr
+        val combinedFrame = CarLifeFrameCodec.encodeAoAVideoFrame(combined, timestampMs = 500L)
+        val combinedWire = CarLifeFrameCodec.encodeFrame(combinedFrame)
+        assertEquals(20 + combined.size, combinedWire.size)
+        assertArrayEquals(combined, combinedWire.copyOfRange(20, combinedWire.size))
 
         // Verify AVCC length-prefixed NAL is converted cleanly to Annex-B 00 00 00 01 inside encodeAoAVideoFrame
         val avccIdr = byteArrayOf(0x00, 0x00, 0x00, 0x04, 0x65, 0x88.toByte(), 0x84.toByte(), 0x21)

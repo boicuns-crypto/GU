@@ -362,9 +362,9 @@ fun CarLifeBridgeApp(
     // 2 = «Настройки» (Settings — VD Controls, H.264 Stream Config & Expandable AOA/Protocol Lab)
     var selectedTab by rememberSaveable { mutableIntStateOf(0) }
 
-    var configuredWidth by rememberSaveable { mutableIntStateOf(1024) }
-    var configuredHeight by rememberSaveable { mutableIntStateOf(600) }
-    var configuredBitrateKbps by rememberSaveable { mutableIntStateOf(1200) }
+    var configuredWidth by rememberSaveable { mutableIntStateOf(800) }
+    var configuredHeight by rememberSaveable { mutableIntStateOf(480) }
+    var configuredBitrateKbps by rememberSaveable { mutableIntStateOf(800) }
 
     var checklistStatus by remember {
         mutableStateOf(
@@ -1456,7 +1456,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
             }
         }
 
-        // 2. Настройки H.264 видеопотока (разрешение 800x480 / 1024x600 / 1280x720, битрейт 800 кбит/с VBR, Direct 12B по умолчанию)
+        // 2. Настройки H.264 видеопотока (разрешение 800x480 / 1024x600 / 1280x720, битрейт 800 кбит/с CBR 30fps, AOA 20B по умолчанию)
         item {
             Card(
                 modifier = Modifier.fillMaxWidth(),
@@ -1488,7 +1488,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                             border = BorderStroke(1.dp, ObsidianBorder)
                         ) {
                             Text(
-                                text = "Baseline VBR • I=2s",
+                                text = "Baseline CBR • 30fps • I=2s",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = ElectricCyan,
                                 softWrap = false,
@@ -1499,7 +1499,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                     }
 
                     Text(
-                        text = "Разрешение виртуального дисплея и кодека (1024×600 по умолчанию для Jetta VS7)",
+                        text = "Разрешение виртуального дисплея и кодека (800×480 по умолчанию для Jetta VS7)",
                         style = MaterialTheme.typography.labelMedium,
                         color = TextSecondary
                     )
@@ -1532,7 +1532,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                     }
 
                     Text(
-                        text = "Битрейт кодека (AVCProfileBaseline VBR, 30fps, 1.2 Мбит/с по умолчанию)",
+                        text = "Битрейт кодека (AVCProfileBaseline CBR, 30fps, 800 кбит/с по умолчанию)",
                         style = MaterialTheme.typography.labelMedium,
                         color = TextSecondary
                     )
@@ -1704,7 +1704,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
-                            text = "Стартовать VD (1024×600 • 1.2 Мбит/с)",
+                            text = "Стартовать VD (800×480 • CBR • 30fps)",
                             fontWeight = FontWeight.SemiBold,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
