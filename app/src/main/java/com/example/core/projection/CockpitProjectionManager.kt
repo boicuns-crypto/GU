@@ -832,6 +832,7 @@ class CockpitProjectionManager(
         idrNals: List<ByteArray>,
         timestampMs: Long
     ): Int {
+        if (idrNals.isEmpty()) return 0
         var addedFrames = 0L
         var addedBytes = 0L
         var totalIdrPayloadBytes = 0
@@ -1257,98 +1258,101 @@ class CockpitProjectionManager(
 
                             val timestampMs = SystemClock.uptimeMillis() and 0x7FFF_FFFFL
 
-                            if (isCodecConfig) {
-                                // Parse and store SPS and PPS separately, each prefixed with 00 00 00 01
-                                cacheConfigNalUnits(rawNal)
-                            } else {
-                                // Split any multi-NAL MediaCodec output by 00 00 00 01 into individual NAL units
-                                val nals = CarLifeFrameCodec.splitAnnexBNalUnits(rawNal)
-                                val sliceNals = ArrayList<ByteArray>(nals.size)
-                                var containsIdrNal = isKeyFrameFlag
+                            // ALWAYS manually scan MediaCodec output for Annex-B start codes (00 00 00 01 and 00 00 01),
+                            // expanding any 3-byte 00 00 01 start code into strict 4-byte 00 00 00 01 per NAL unit.
+                            val nals = CarLifeFrameCodec.splitAnnexBNalUnits(rawNal)
+                            val sliceNals = ArrayList<ByteArray>(nals.size)
+                            var containsIdrNal = isKeyFrameFlag
 
-                                for (nal in nals) {
-                                    val nalType = if (nal.size > 4) (nal[4].toInt() and 0x1F) else 0
-                                    when (nalType) {
-                                        7 -> {
-                                            cachedSpsAnnexB = nal
-                                            _stats.update { it.copy(spsPpsConfigured = true) }
-                                        }
-                                        8 -> {
-                                            cachedPpsAnnexB = nal
-                                            _stats.update { it.copy(spsPpsConfigured = true) }
-                                        }
-                                        5 -> {
-                                            containsIdrNal = true
-                                            sliceNals.add(nal)
-                                        }
-                                        6 -> {
-                                            // Drop optional SEI metadata NALs to keep keyframes compact & clean for MQB HU
-                                        }
-                                        else -> sliceNals.add(nal)
+                            for (nal in nals) {
+                                val nalType = if (nal.size > 4) (nal[4].toInt() and 0x1F) else 0
+                                when (nalType) {
+                                    7 -> {
+                                        cachedSpsAnnexB = nal
+                                        _stats.update { it.copy(spsPpsConfigured = true) }
                                     }
+                                    8 -> {
+                                        cachedPpsAnnexB = nal
+                                        _stats.update { it.copy(spsPpsConfigured = true) }
+                                    }
+                                    5 -> {
+                                        containsIdrNal = true
+                                        sliceNals.add(nal)
+                                    }
+                                    6 -> {
+                                        // Drop optional SEI metadata NALs to keep keyframes compact & clean for MQB HU
+                                    }
+                                    else -> sliceNals.add(nal)
                                 }
+                            }
 
-                                if (containsIdrNal && sliceNals.isNotEmpty()) {
-                                    val joinedIdr = if (sliceNals.size == 1) {
-                                        sliceNals[0]
-                                    } else {
-                                        val baos = ByteArrayOutputStream(rawNal.size)
-                                        for (s in sliceNals) baos.write(s)
-                                        baos.toByteArray()
-                                    }
-                                    lastKeyFrameAnnexB = joinedIdr
-                                }
-
-                                // STRICT GATE: Do NOT send any 0x0002 packets or increment counters
-                                // while isVideoChannelReadyForStreaming == false (only cache SPS, PPS, and last IDR).
-                                if (!isVideoChannelReadyForStreaming) {
-                                    codec.releaseOutputBuffer(outIndex, false)
-                                    continue
-                                }
-
-                                if (containsIdrNal) {
-                                    awaitingFirstIdrAfterGateOpen.set(false)
-                                    // Send 3 separate 0x0002 packets: [Header 20B][SPS], [Header 20B][PPS], [Header 20B][IDR]
-                                    val totalIdrSize = emitSeparateSpsPpsAndIdr(
-                                        idrNals = sliceNals,
-                                        timestampMs = timestampMs
-                                    )
-
-                                    // If hardware rate-controller produced an IDR > 45 KB, dynamically lower target bitrate smoothly (floor 800 kbps)
-                                    if (totalIdrSize > 45_000 && currentDynamicBitrate > 800_000) {
-                                        currentDynamicBitrate = (currentDynamicBitrate * 80 / 100).coerceAtLeast(800_000)
-                                        runCatching {
-                                            val b = Bundle().apply {
-                                                putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, currentDynamicBitrate)
-                                            }
-                                            codec.setParameters(b)
-                                        }
-                                    }
-                                } else if (!awaitingFirstIdrAfterGateOpen.get()) {
-                                    // Non-keyframe P-slice(s) emitted individually after the initial SPS -> PPS -> IDR sequence
-                                    var sliceBytes = 0L
-                                    var sliceCount = 0L
-                                    for (sliceNal in sliceNals) {
-                                        onEncodedVideoNal(sliceNal, timestampMs, false)
-                                        sliceBytes += sliceNal.size.toLong()
-                                        sliceCount += 1L
-                                    }
-                                    if (sliceCount > 0L) {
-                                        _stats.update {
-                                            it.copy(
-                                                encodedNalFrames = it.encodedNalFrames + sliceCount,
-                                                encodedBytes = it.encodedBytes + sliceBytes
-                                            )
-                                        }
-                                    }
+                            if (containsIdrNal && sliceNals.isNotEmpty()) {
+                                val joinedIdr = if (sliceNals.size == 1) {
+                                    sliceNals[0]
                                 } else {
-                                    // Waiting for initial IDR after gate open: request sync frame and skip stale P-slice
+                                    val baos = ByteArrayOutputStream(rawNal.size)
+                                    for (s in sliceNals) baos.write(s)
+                                    baos.toByteArray()
+                                }
+                                lastKeyFrameAnnexB = joinedIdr
+                            }
+
+                            // Pure CODEC_CONFIG buffer (SPS/PPS only): already cached separately above.
+                            if (isCodecConfig && sliceNals.isEmpty()) {
+                                codec.releaseOutputBuffer(outIndex, false)
+                                continue
+                            }
+
+                            // STRICT GATE: Do NOT send any 0x0002 packets or increment counters
+                            // while isVideoChannelReadyForStreaming == false (only cache SPS, PPS, and last IDR).
+                            if (!isVideoChannelReadyForStreaming) {
+                                codec.releaseOutputBuffer(outIndex, false)
+                                continue
+                            }
+
+                            if (containsIdrNal && sliceNals.isNotEmpty()) {
+                                awaitingFirstIdrAfterGateOpen.set(false)
+                                // Send separate 0x0002 packets in strict order:
+                                // [20B Header][00 00 00 01 SPS], [20B Header][00 00 00 01 PPS], [20B Header][00 00 00 01 IDR]
+                                val totalIdrSize = emitSeparateSpsPpsAndIdr(
+                                    idrNals = sliceNals,
+                                    timestampMs = timestampMs
+                                )
+
+                                // If hardware rate-controller produced an IDR > 45 KB, dynamically lower target bitrate smoothly (floor 800 kbps)
+                                if (totalIdrSize > 45_000 && currentDynamicBitrate > 800_000) {
+                                    currentDynamicBitrate = (currentDynamicBitrate * 80 / 100).coerceAtLeast(800_000)
                                     runCatching {
                                         val b = Bundle().apply {
-                                            putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
+                                            putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, currentDynamicBitrate)
                                         }
                                         codec.setParameters(b)
                                     }
+                                }
+                            } else if (!awaitingFirstIdrAfterGateOpen.get() && sliceNals.isNotEmpty()) {
+                                // Non-keyframe P-slice(s) emitted individually after the initial SPS -> PPS -> IDR sequence
+                                var sliceBytes = 0L
+                                var sliceCount = 0L
+                                for (sliceNal in sliceNals) {
+                                    onEncodedVideoNal(sliceNal, timestampMs, false)
+                                    sliceBytes += sliceNal.size.toLong()
+                                    sliceCount += 1L
+                                }
+                                if (sliceCount > 0L) {
+                                    _stats.update {
+                                        it.copy(
+                                            encodedNalFrames = it.encodedNalFrames + sliceCount,
+                                            encodedBytes = it.encodedBytes + sliceBytes
+                                        )
+                                    }
+                                }
+                            } else if (awaitingFirstIdrAfterGateOpen.get()) {
+                                // Waiting for initial IDR after gate open: request sync frame and skip stale P-slice
+                                runCatching {
+                                    val b = Bundle().apply {
+                                        putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
+                                    }
+                                    codec.setParameters(b)
                                 }
                             }
                         }

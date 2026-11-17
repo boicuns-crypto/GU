@@ -338,7 +338,8 @@ class ExampleUnitTest {
         assertArrayEquals(pps, wire1.copyOfRange(20, wire1.size))
         assertArrayEquals(idr, wire2.copyOfRange(20, wire2.size))
 
-        // Verify Samsung 3-byte start codes (00 00 01) are upgraded to strict 4-byte 00 00 00 01 in every packet
+        // Verify Samsung 3-byte start codes (00 00 01) and zero-padded start codes (00 00 00 00 01)
+        // are normalized to strict 4-byte 00 00 00 01 in separate 20B AOA packets
         val sps3 = byteArrayOf(0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1F)
         val pps3 = byteArrayOf(0x00, 0x00, 0x01, 0x68, 0xCE.toByte(), 0x3C, 0x80.toByte())
         val idr3 = byteArrayOf(0x00, 0x00, 0x01, 0x65, 0x88.toByte(), 0x84.toByte(), 0x21)
@@ -347,6 +348,15 @@ class ExampleUnitTest {
         assertArrayEquals(sps, CarLifeFrameCodec.encodeFrame(splitFrom3Byte[0]).let { it.copyOfRange(20, it.size) })
         assertArrayEquals(pps, CarLifeFrameCodec.encodeFrame(splitFrom3Byte[1]).let { it.copyOfRange(20, it.size) })
         assertArrayEquals(idr, CarLifeFrameCodec.encodeFrame(splitFrom3Byte[2]).let { it.copyOfRange(20, it.size) })
+
+        val mixedPaddedBuffer = byteArrayOf(0x00, 0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1F) +
+            byteArrayOf(0x00, 0x00, 0x01, 0x68, 0xCE.toByte(), 0x3C, 0x80.toByte()) +
+            byteArrayOf(0x00, 0x00, 0x00, 0x00, 0x01, 0x65, 0x88.toByte(), 0x84.toByte(), 0x21)
+        val splitFromMixed = CarLifeFrameCodec.encodeAoAVideoFrames(mixedPaddedBuffer, timestampMs = 501L)
+        assertEquals(3, splitFromMixed.size)
+        assertArrayEquals(sps, CarLifeFrameCodec.encodeFrame(splitFromMixed[0]).let { it.copyOfRange(20, it.size) })
+        assertArrayEquals(pps, CarLifeFrameCodec.encodeFrame(splitFromMixed[1]).let { it.copyOfRange(20, it.size) })
+        assertArrayEquals(idr, CarLifeFrameCodec.encodeFrame(splitFromMixed[2]).let { it.copyOfRange(20, it.size) })
 
         // Verify AVCC length-prefixed NAL is converted cleanly to Annex-B 00 00 00 01 inside encodeAoAVideoFrame
         val avccIdr = byteArrayOf(0x00, 0x00, 0x00, 0x04, 0x65, 0x88.toByte(), 0x84.toByte(), 0x21)

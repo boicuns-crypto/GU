@@ -944,17 +944,25 @@ object CarLifeFrameCodec {
         var i = 0
         while (i <= h264Buffer.size - 3) {
             if (h264Buffer[i] == 0x00.toByte() && h264Buffer[i + 1] == 0x00.toByte()) {
-                if (i + 3 < h264Buffer.size &&
-                    h264Buffer[i + 2] == 0x00.toByte() &&
-                    h264Buffer[i + 3] == 0x01.toByte()
-                ) {
-                    starts.add(i to (i + 4))
-                    i += 4
-                    continue
-                } else if (h264Buffer[i + 2] == 0x01.toByte()) {
+                if (h264Buffer[i + 2] == 0x01.toByte()) {
+                    // 3-byte Annex-B start code: 00 00 01 (forcibly expanded to 00 00 00 01 below)
                     starts.add(i to (i + 3))
                     i += 3
                     continue
+                } else if (h264Buffer[i + 2] == 0x00.toByte()) {
+                    // 4-byte (00 00 00 01) or zero-padded Annex-B start code (00 00 00+ 01)
+                    var j = i + 3
+                    while (j < h264Buffer.size && h264Buffer[j] == 0x00.toByte()) {
+                        j++
+                    }
+                    if (j < h264Buffer.size && h264Buffer[j] == 0x01.toByte()) {
+                        starts.add(i to (j + 1))
+                        i = j + 1
+                        continue
+                    } else {
+                        i = j
+                        continue
+                    }
                 }
             }
             i++
