@@ -131,17 +131,19 @@ data class ProjectionPipelineStats(
     val isRunning: Boolean = false,
     val usingMediaProjection: Boolean = false,
     val virtualDisplayId: Int = Display.DEFAULT_DISPLAY,
-    val width: Int = 1280,
-    val height: Int = 720,
+    val width: Int = 800,
+    val height: Int = 480,
     val fps: Int = 30,
-    val bitRateMbps: Int = 2,
+    val bitRateMbps: Int = 1,
+    val bitRateKbps: Int = 800,
     val encodedNalFrames: Long = 0L,
     val encodedBytes: Long = 0L,
+    val lastIdrBytes: Int = 0,
     val spsPpsConfigured: Boolean = false,
     val injectedTouches: Long = 0L,
     val lastTouchPoint: Pair<Float, Float>? = null,
-    val activeCockpitWidget: String = "CarLife App Launcher & Dock",
-    val statusMessage: String = "Standby — Ready to start H.264 Surface Encoder"
+    val activeCockpitWidget: String = "Лаунчер ГУ CarLife активен",
+    val statusMessage: String = "Лаунчер ГУ готов (800×480 @ 800 кбит/с)"
 )
 
 /**
@@ -175,6 +177,18 @@ class CockpitProjectionManager(
     private val projectionMutex = Mutex()
     private val isEncoding = AtomicBoolean(false)
 
+    /**
+     * Strict gate for channel `0x0002` video streaming:
+     * Remains `false` when `VirtualDisplay` starts or USB AOA connects.
+     * Switched to `true` ONLY after `MSG_CMD_VIDEO_ENCODER_INIT (0x00010007)` is received on `0x0001`
+     * and `MSG_CMD_VIDEO_ENCODER_INIT_DONE (0x00018008)` has been transmitted.
+     */
+    @Volatile
+    var isVideoChannelReadyForStreaming: Boolean = false
+        private set
+
+    private val awaitingFirstIdrAfterGateOpen = AtomicBoolean(true)
+
     @Volatile
     private var cachedSpsPpsAnnexB: ByteArray? = null
 
@@ -186,18 +200,36 @@ class CockpitProjectionManager(
     private val _stats = MutableStateFlow(ProjectionPipelineStats())
     val stats: StateFlow<ProjectionPipelineStats> = _stats.asStateFlow()
 
+    fun setVideoChannelReady(ready: Boolean) {
+        if (!ready) {
+            isVideoChannelReadyForStreaming = false
+            awaitingFirstIdrAfterGateOpen.set(true)
+        } else {
+            awaitingFirstIdrAfterGateOpen.set(true)
+            isVideoChannelReadyForStreaming = true
+        }
+    }
+
     suspend fun startProjection(
-        width: Int = 1280,
-        height: Int = 720,
+        width: Int = 800,
+        height: Int = 480,
         frameRate: Int = 30,
-        bitRate: Int = 1_800_000,
-        densityDpi: Int = DisplayMetrics.DENSITY_XHIGH
+        bitRate: Int = 800_000,
+        densityDpi: Int = DisplayMetrics.DENSITY_MEDIUM
     ): Boolean = projectionMutex.withLock {
         stopProjectionLocked()
 
-        val safeWidth = if (width in 480..3840) width else 1280
-        val safeHeight = if (height in 272..2160) height else 720
+        val safeWidth = if (width in 480..3840) width else 800
+        val safeHeight = if (height in 272..2160) height else 480
         val safeFps = if (frameRate in 15..60) frameRate else 30
+        val safeBitRate = bitRate.coerceIn(400_000, 12_000_000)
+        val effectiveDpi = if (safeWidth <= 1024) DisplayMetrics.DENSITY_MEDIUM else densityDpi
+
+        if (CarLifeLauncherRepository.installedApps.value.isEmpty()) {
+            externalScope.launch(Dispatchers.IO) {
+                CarLifeLauncherRepository.loadInstalledApps(appContext)
+            }
+        }
 
         var codec: MediaCodec? = null
         var inputSurface: Surface? = null
@@ -206,7 +238,7 @@ class CockpitProjectionManager(
         var usedMediaProjection = false
 
         return@withLock try {
-            codec = configureLowLatencyAvcEncoder(safeWidth, safeHeight, safeFps, bitRate)
+            codec = configureLowLatencyAvcEncoder(safeWidth, safeHeight, safeFps, safeBitRate)
             inputSurface = codec.createInputSurface()
             codec.start()
 
@@ -216,7 +248,7 @@ class CockpitProjectionManager(
 
             // Start draining MediaCodec immediately so SPS/PPS + IDR are captured as soon as the first frame lands
             encoderDrainJob = externalScope.launch(Dispatchers.IO) {
-                drainHardwareEncoderLoop(codec)
+                drainHardwareEncoderLoop(codec, safeBitRate)
             }
 
             // Check if user granted MediaProjection (Step 5)
@@ -240,7 +272,7 @@ class CockpitProjectionManager(
                             VIRTUAL_DISPLAY_NAME,
                             safeWidth,
                             safeHeight,
-                            densityDpi,
+                            effectiveDpi,
                             DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR or
                                 DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or
                                 DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION,
@@ -260,11 +292,12 @@ class CockpitProjectionManager(
                 val createdDisplay = vDisplay!!.display
                 awaitDisplayRegistered(createdDisplay.displayId)
 
-                // Best-effort Presentation on VirtualDisplay; never abort encoding if WindowManager rejects it
+                // Immediately render CarLife Launcher UI onto the VirtualDisplay via CockpitPresentation
                 runCatching {
                     val presentation = showPresentationWithRetry(createdDisplay)
                     withContext(Dispatchers.Main.immediate) {
                         cockpitPresentation = presentation
+                        presentation.window?.decorView?.postInvalidate()
                     }
                 }.onFailure { e ->
                     Log.w(TAG, "Presentation overlay skipped (MediaProjection Auto-Mirror still active): ${e.message}")
@@ -272,6 +305,13 @@ class CockpitProjectionManager(
 
                 mediaProjection = activeMp
                 virtualDisplay = vDisplay
+
+                CarLifeLauncherRepository.markLauncherActiveOnDisplay(
+                    displayId = createdDisplay.displayId,
+                    width = safeWidth,
+                    height = safeHeight,
+                    bitrateBps = safeBitRate
+                )
 
                 _stats.update {
                     it.copy(
@@ -281,26 +321,34 @@ class CockpitProjectionManager(
                         width = safeWidth,
                         height = safeHeight,
                         fps = safeFps,
-                        bitRateMbps = bitRate / 1_000_000,
-                        statusMessage = "MediaProjection #${createdDisplay.displayId} ($safeWidth×$safeHeight @ ${safeFps}fps) Active"
+                        bitRateMbps = (safeBitRate / 1_000_000).coerceAtLeast(1),
+                        bitRateKbps = safeBitRate / 1_000,
+                        activeCockpitWidget = "Лаунчер ГУ активен на VD #${createdDisplay.displayId}",
+                        statusMessage = "Лаунчер ГУ активен на VD #${createdDisplay.displayId} ($safeWidth×$safeHeight @ ${safeBitRate / 1000} кбит/с)"
                     )
                 }
 
-                // Watchdog: if MediaProjection hasn't pushed any frame within 200ms (e.g., static screen),
+                // Watchdog: if MediaProjection hasn't pushed any frame within 120ms,
                 // detach VirtualDisplay from inputSurface and start Canvas Feeder so 90% never hangs!
                 externalScope.launch(Dispatchers.IO) {
-                    delay(200L)
-                    if (isEncoding.get() && _stats.value.encodedNalFrames == 0L) {
-                        Log.w(TAG, "MediaProjection produced 0 frames in 200ms; activating Canvas Surface Feeder fallback")
+                    delay(120L)
+                    if (isEncoding.get() && cachedSpsPpsAnnexB == null && lastKeyFrameAnnexB == null) {
+                        Log.w(TAG, "MediaProjection produced 0 frames in 120ms; activating Canvas Surface Feeder fallback")
                         runCatching { vDisplay?.surface = null }
                         startCanvasFeederLoopIfNeeded(inputSurface, safeWidth, safeHeight, safeFps)
                     }
                 }
             } else {
                 // Guaranteed 30fps Canvas-to-Surface H.264 generator:
-                // Draws the CarLife Launcher directly into MediaCodec's inputSurface every 33ms
-                // so SPS/PPS and IDR frames immediately flow over USB AOA channel 0x0002!
+                // Immediately draws the CarLife Launcher directly into MediaCodec's inputSurface
                 startCanvasFeederLoopIfNeeded(inputSurface, safeWidth, safeHeight, safeFps)
+
+                CarLifeLauncherRepository.markLauncherActiveOnDisplay(
+                    displayId = Display.DEFAULT_DISPLAY,
+                    width = safeWidth,
+                    height = safeHeight,
+                    bitrateBps = safeBitRate
+                )
 
                 _stats.update {
                     it.copy(
@@ -310,8 +358,10 @@ class CockpitProjectionManager(
                         width = safeWidth,
                         height = safeHeight,
                         fps = safeFps,
-                        bitRateMbps = bitRate / 1_000_000,
-                        statusMessage = "Direct Surface H.264 Generator ($safeWidth×$safeHeight @ ${safeFps}fps) Active"
+                        bitRateMbps = (safeBitRate / 1_000_000).coerceAtLeast(1),
+                        bitRateKbps = safeBitRate / 1_000,
+                        activeCockpitWidget = "Лаунчер ГУ активен (Direct Surface)",
+                        statusMessage = "Лаунчер ГУ активен ($safeWidth×$safeHeight @ ${safeBitRate / 1000} кбит/с)"
                     )
                 }
             }
@@ -467,79 +517,98 @@ class CockpitProjectionManager(
     ) {
         val w = width.toFloat()
         val h = height.toFloat()
+        val scale = (h / 720f).coerceIn(0.62f, 1.2f)
+        clockPaint.textSize = 44f * scale
+        titlePaint.textSize = 23f * scale
+        subtitlePaint.textSize = 17f * scale
+        appLabelPaint.textSize = 17f * scale
+        emeraldTextPaint.textSize = 18f * scale
 
         // 1. Background (#0B0E14)
         canvas.drawRect(0f, 0f, w, h, bgPaint)
 
-        // 2. Left Dock Card (width = 300px scaled to 1280x720)
-        val dockRight = (w * 0.24f).coerceIn(260f, 340f)
-        val dockRect = RectF(16f, 16f, dockRight, h - 16f)
-        canvas.drawRoundRect(dockRect, 24f, 24f, cardPaint)
-        canvas.drawRoundRect(dockRect, 24f, 24f, borderPaint)
+        // 2. Left Dock Card
+        val dockRight = (w * 0.25f).coerceIn(190f, 320f)
+        val margin = 12f * scale
+        val dockRect = RectF(margin, margin, dockRight, h - margin)
+        canvas.drawRoundRect(dockRect, 20f * scale, 20f * scale, cardPaint)
+        canvas.drawRoundRect(dockRect, 20f * scale, 20f * scale, borderPaint)
 
         // Clock & Live H.264 Badge
-        canvas.drawText(timeString, 36f, 74f, clockPaint)
-        val badgeRect = RectF(dockRight - 118f, 40f, dockRight - 20f, 76f)
-        canvas.drawRoundRect(badgeRect, 12f, 12f, emeraldBadgeBgPaint)
-        canvas.drawText("LIVE", badgeRect.left + 26f, badgeRect.top + 25f, emeraldTextPaint)
+        val clockBaseline = margin + 48f * scale
+        canvas.drawText(timeString, dockRect.left + 16f * scale, clockBaseline, clockPaint)
+        val badgeW = 78f * scale
+        val badgeH = 30f * scale
+        val badgeRect = RectF(
+            dockRight - badgeW - 12f * scale,
+            margin + 18f * scale,
+            dockRight - 12f * scale,
+            margin + 18f * scale + badgeH
+        )
+        canvas.drawRoundRect(badgeRect, 10f * scale, 10f * scale, emeraldBadgeBgPaint)
+        canvas.drawText("LIVE", badgeRect.left + 18f * scale, badgeRect.centerY() + 6f * scale, emeraldTextPaint)
 
         // Home & Back buttons in Dock
-        val btnWidth = (dockRect.width() - 48f) / 2f
-        val homeRect = RectF(32f, 100f, 32f + btnWidth, 164f)
-        val backRect = RectF(homeRect.right + 16f, 100f, dockRight - 16f, 164f)
-        canvas.drawRoundRect(homeRect, 16f, 16f, tilePaint)
-        canvas.drawRoundRect(homeRect, 16f, 16f, borderPaint)
-        canvas.drawRoundRect(backRect, 16f, 16f, tilePaint)
-        canvas.drawRoundRect(backRect, 16f, 16f, borderPaint)
-        canvas.drawText("Домой", homeRect.centerX(), homeRect.centerY() + 7f, appLabelPaint)
-        canvas.drawText("Назад", backRect.centerX(), backRect.centerY() + 7f, appLabelPaint)
+        val btnTop = margin + 68f * scale
+        val btnHeight = 52f * scale
+        val btnGap = 10f * scale
+        val btnWidth = (dockRect.width() - 24f * scale - btnGap) / 2f
+        val homeRect = RectF(dockRect.left + 12f * scale, btnTop, dockRect.left + 12f * scale + btnWidth, btnTop + btnHeight)
+        val backRect = RectF(homeRect.right + btnGap, btnTop, dockRight - 12f * scale, btnTop + btnHeight)
+        canvas.drawRoundRect(homeRect, 12f * scale, 12f * scale, tilePaint)
+        canvas.drawRoundRect(homeRect, 12f * scale, 12f * scale, borderPaint)
+        canvas.drawRoundRect(backRect, 12f * scale, 12f * scale, tilePaint)
+        canvas.drawRoundRect(backRect, 12f * scale, 12f * scale, borderPaint)
+        canvas.drawText("Домой", homeRect.centerX(), homeRect.centerY() + 6f * scale, appLabelPaint)
+        canvas.drawText("Назад", backRect.centerX(), backRect.centerY() + 6f * scale, appLabelPaint)
 
         // Media Widget Card in Dock
         val mediaState = MediaControllerRepository.mediaState.value
-        val mediaRect = RectF(28f, h - 220f, dockRight - 12f, h - 32f)
-        canvas.drawRoundRect(mediaRect, 20f, 20f, tilePaint)
-        canvas.drawRoundRect(mediaRect, 20f, 20f, borderPaint)
+        val mediaTop = (btnTop + btnHeight + 14f * scale).coerceAtLeast(h - 195f * scale)
+        val mediaRect = RectF(dockRect.left + 10f * scale, mediaTop, dockRight - 10f * scale, h - margin - 10f * scale)
+        canvas.drawRoundRect(mediaRect, 16f * scale, 16f * scale, tilePaint)
+        canvas.drawRoundRect(mediaRect, 16f * scale, 16f * scale, borderPaint)
         canvas.drawText(
-            mediaState.playerAppTitle.take(22),
-            44f,
-            mediaRect.top + 34f,
+            mediaState.playerAppTitle.take(20),
+            mediaRect.left + 12f * scale,
+            mediaRect.top + 26f * scale,
             emeraldTextPaint
         )
         canvas.drawText(
-            mediaState.trackTitle.take(18),
-            44f,
-            mediaRect.top + 68f,
+            mediaState.trackTitle.take(16),
+            mediaRect.left + 12f * scale,
+            mediaRect.top + 52f * scale,
             titlePaint
         )
         canvas.drawText(
-            mediaState.artistName.take(22),
-            44f,
-            mediaRect.top + 96f,
+            mediaState.artistName.take(20),
+            mediaRect.left + 12f * scale,
+            mediaRect.top + 76f * scale,
             subtitlePaint
         )
         // Play button circle
-        canvas.drawCircle(mediaRect.centerX(), mediaRect.bottom - 42f, 26f, accentPaint)
+        canvas.drawCircle(mediaRect.centerX(), mediaRect.bottom - 30f * scale, 20f * scale, accentPaint)
 
         // 3. Right App Grid Panel
-        val gridPanelRect = RectF(dockRight + 16f, 16f, w - 16f, h - 16f)
-        canvas.drawRoundRect(gridPanelRect, 24f, 24f, cardPaint)
-        canvas.drawRoundRect(gridPanelRect, 24f, 24f, borderPaint)
+        val gridPanelRect = RectF(dockRight + margin, margin, w - margin, h - margin)
+        canvas.drawRoundRect(gridPanelRect, 20f * scale, 20f * scale, cardPaint)
+        canvas.drawRoundRect(gridPanelRect, 20f * scale, 20f * scale, borderPaint)
 
         canvas.drawText(
             "CarLife Кокпит • Приложения смартфона",
-            gridPanelRect.left + 24f,
-            gridPanelRect.top + 46f,
+            gridPanelRect.left + 18f * scale,
+            gridPanelRect.top + 36f * scale,
             titlePaint
         )
 
-        // Animated heartbeat bar so every frame has changing macroblocks for MediaCodec
-        val pulseOffset = ((frameSeq % 60L) / 60f) * (gridPanelRect.width() - 48f)
-        canvas.drawCircle(gridPanelRect.right - 36f, gridPanelRect.top + 36f, 8f, accentPaint)
+        // Subtle animated heartbeat indicator
+        val pulseOffset = ((frameSeq % 60L) / 60f) * (gridPanelRect.width() - 36f * scale)
+        canvas.drawCircle(gridPanelRect.right - 24f * scale, gridPanelRect.top + 28f * scale, 6f * scale, accentPaint)
         canvas.drawRect(
-            gridPanelRect.left + 24f,
-            gridPanelRect.top + 62f,
-            gridPanelRect.left + 24f + pulseOffset.coerceAtLeast(12f),
-            gridPanelRect.top + 65f,
+            gridPanelRect.left + 18f * scale,
+            gridPanelRect.top + 48f * scale,
+            gridPanelRect.left + 18f * scale + pulseOffset.coerceAtLeast(10f),
+            gridPanelRect.top + 51f * scale,
             accentPaint
         )
 
@@ -547,46 +616,47 @@ class CockpitProjectionManager(
         val apps = CarLifeLauncherRepository.installedApps.value.take(12)
         val cols = 4
         val rows = 3
-        val gridLeft = gridPanelRect.left + 24f
-        val gridTop = gridPanelRect.top + 84f
-        val availW = gridPanelRect.width() - 48f
-        val availH = gridPanelRect.height() - 104f
-        val cellW = (availW - (cols - 1) * 16f) / cols
-        val cellH = (availH - (rows - 1) * 16f) / rows
+        val gridGap = 12f * scale
+        val gridLeft = gridPanelRect.left + 18f * scale
+        val gridTop = gridPanelRect.top + 64f * scale
+        val availW = gridPanelRect.width() - 36f * scale
+        val availH = gridPanelRect.height() - 80f * scale
+        val cellW = (availW - (cols - 1) * gridGap) / cols
+        val cellH = (availH - (rows - 1) * gridGap) / rows
+        val iconSize = (cellH * 0.46f).toInt().coerceIn(32, 64)
 
         for (index in apps.indices) {
             val app = apps[index]
             val col = index % cols
             val row = index / cols
-            val left = gridLeft + col * (cellW + 16f)
-            val top = gridTop + row * (cellH + 16f)
+            val left = gridLeft + col * (cellW + gridGap)
+            val top = gridTop + row * (cellH + gridGap)
             val cellRect = RectF(left, top, left + cellW, top + cellH)
-            canvas.drawRoundRect(cellRect, 20f, 20f, tilePaint)
-            canvas.drawRoundRect(cellRect, 20f, 20f, borderPaint)
+            canvas.drawRoundRect(cellRect, 14f * scale, 14f * scale, tilePaint)
+            canvas.drawRoundRect(cellRect, 14f * scale, 14f * scale, borderPaint)
 
             val iconBmp = runCatching { app.iconBitmap?.asAndroidBitmap() }.getOrNull()
-            val iconSize = 68
             val iconLeft = (cellRect.centerX() - iconSize / 2f).toInt()
-            val iconTop = (cellRect.top + 20f).toInt()
+            val iconTop = (cellRect.top + 12f * scale).toInt()
             if (iconBmp != null && !iconBmp.isRecycled) {
                 val dstRect = Rect(iconLeft, iconTop, iconLeft + iconSize, iconTop + iconSize)
                 canvas.drawBitmap(iconBmp, null, dstRect, null)
             } else {
-                canvas.drawCircle(cellRect.centerX(), iconTop + iconSize / 2f, 28f, accentPaint)
+                canvas.drawCircle(cellRect.centerX(), iconTop + iconSize / 2f, iconSize * 0.42f, accentPaint)
             }
 
-            val label = if (app.label.length > 14) app.label.take(13) + "…" else app.label
+            val label = if (app.label.length > 13) app.label.take(12) + "…" else app.label
             canvas.drawText(
                 label,
                 cellRect.centerX(),
-                cellRect.bottom - 20f,
+                cellRect.bottom - 12f * scale,
                 appLabelPaint
             )
         }
 
         // Draw last touch feedback ring if present
         _stats.value.lastTouchPoint?.let { (tx, ty) ->
-            canvas.drawCircle(tx, ty, 22f, accentPaint)
+            canvas.drawCircle(tx, ty, 18f * scale, accentPaint)
         }
     }
 
@@ -604,7 +674,7 @@ class CockpitProjectionManager(
     }
 
     private suspend fun showPresentationWithRetry(display: Display): CockpitPresentation {
-        var lastError: WindowManager.InvalidDisplayException? = null
+        var lastError: Throwable? = null
         val isPrivateDisplay = (display.flags and Display.FLAG_PRIVATE) != 0
         val windowType = if (isPrivateDisplay) {
             WINDOW_TYPE_PRIVATE_PRESENTATION
@@ -615,57 +685,103 @@ class CockpitProjectionManager(
         for (attempt in 0 until 3) {
             try {
                 return withContext(Dispatchers.Main.immediate) {
-                    val displayContext = appContext.createDisplayContext(display)
-                    val presentationContext = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                        runCatching {
-                            displayContext.createWindowContext(
-                                display,
-                                windowType,
-                                null
-                            )
-                        }.getOrElse { displayContext }
-                    } else {
-                        displayContext
+                    // Try standard appContext / displayContext first so Presentation attaches cleanly
+                    val displayContext = runCatching { appContext.createDisplayContext(display) }.getOrElse { appContext }
+                    val presentation = runCatching {
+                        CockpitPresentation(
+                            outerContext = displayContext,
+                            display = display,
+                            statsFlow = _stats
+                        ).also { it.show() }
+                    }.getOrElse {
+                        val winContext = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                            runCatching {
+                                displayContext.createWindowContext(display, windowType, null)
+                            }.getOrElse { displayContext }
+                        } else {
+                            displayContext
+                        }
+                        CockpitPresentation(
+                            outerContext = winContext,
+                            display = display,
+                            statsFlow = _stats
+                        ).also { it.show() }
                     }
-                    val presentation = CockpitPresentation(
-                        outerContext = presentationContext,
-                        display = display,
-                        statsFlow = _stats
-                    )
-                    presentation.show()
                     presentation
                 }
-            } catch (e: WindowManager.InvalidDisplayException) {
+            } catch (e: Throwable) {
                 lastError = e
-                delay(60L * (attempt + 1))
+                delay(50L * (attempt + 1))
             }
         }
-        throw lastError ?: WindowManager.InvalidDisplayException("Unable to show Presentation on display ${display.displayId}")
+        throw (lastError as? WindowManager.InvalidDisplayException)
+            ?: WindowManager.InvalidDisplayException("Unable to show Presentation on display ${display.displayId}: ${lastError?.message}")
     }
 
     /**
-     * Immediately sends Packet #1 (`SPS + PPS` `BUFFER_FLAG_CODEC_CONFIG`) on channel `0x0002`,
-     * sends the cached `SPS + PPS + IDR` keyframe if available, and requests a fresh `IDR` sync frame from `MediaCodec`.
+     * Unlocked ONLY after `MSG_CMD_VIDEO_ENCODER_INIT (0x00010007)` is received from the Head Unit
+     * and `MSG_CMD_VIDEO_ENCODER_INIT_DONE (0x00018008)` is sent on channel `0x0001`.
+     *
+     * 1. Sets `isVideoChannelReadyForStreaming = true`.
+     * 2. Forces `MediaCodec` to generate a fresh sync keyframe (`PARAMETER_KEY_REQUEST_SYNC_FRAME = 0`).
+     * 3. If `cachedSpsPpsAnnexB` and `lastKeyFrameAnnexB` are already cached in memory, immediately sends
+     *    Packet #1 (`SPS/PPS`) and Packet #2 (`SPS/PPS + IDR`) on channel `0x0002`.
      */
-    fun requestInstantIdrKeyFrame() {
+    fun unlockVideoChannelAndRequestSyncFrame() {
+        awaitingFirstIdrAfterGateOpen.set(true)
+        isVideoChannelReadyForStreaming = true
+
         val codec = mediaCodec ?: return
-        val spsPps = cachedSpsPpsAnnexB
-        val idr = lastKeyFrameAnnexB
-        val tsMs = SystemClock.uptimeMillis() and 0x7FFF_FFFFL
-        if (spsPps != null) {
-            // 1. Send standalone 12-byte header SPS + PPS packet
-            onEncodedVideoNal(spsPps, tsMs, false)
-        }
-        if (idr != null) {
-            // 2. Send IDR keyframe prefixed with SPS/PPS (spsPpsBytes + idrBytes)
-            val combinedIdr = if (spsPps != null) spsPps + idr else idr
-            onEncodedVideoNal(combinedIdr, tsMs + 1L, true)
-        }
         runCatching {
             val params = Bundle().apply {
                 putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
             }
             codec.setParameters(params)
+        }
+
+        val spsPps = cachedSpsPpsAnnexB?.let { CarLifeFrameCodec.ensureAnnexBStartCode(it) }
+        val idr = lastKeyFrameAnnexB?.let { CarLifeFrameCodec.ensureAnnexBStartCode(it) }
+        if (spsPps != null && idr != null && awaitingFirstIdrAfterGateOpen.compareAndSet(true, false)) {
+            val tsMs = SystemClock.uptimeMillis() and 0x7FFF_FFFFL
+            // Packet #1 on 0x0002: standalone SPS/PPS
+            onEncodedVideoNal(spsPps, tsMs, false)
+            // Packet #2 on 0x0002: concatenated SPS/PPS + IDR
+            val combinedIdr = spsPps + idr
+            onEncodedVideoNal(combinedIdr, tsMs + 1L, true)
+            _stats.update {
+                it.copy(
+                    spsPpsConfigured = true,
+                    encodedNalFrames = it.encodedNalFrames + 2L,
+                    encodedBytes = it.encodedBytes + spsPps.size + combinedIdr.size,
+                    lastIdrBytes = combinedIdr.size
+                )
+            }
+        }
+    }
+
+    /**
+     * Requests a fresh `IDR` sync frame from `MediaCodec` and sends `SPS/PPS` + `SPS/PPS+IDR`
+     * ONLY if `isVideoChannelReadyForStreaming` is `true`.
+     */
+    fun requestInstantIdrKeyFrame() {
+        val codec = mediaCodec ?: return
+        runCatching {
+            val params = Bundle().apply {
+                putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
+            }
+            codec.setParameters(params)
+        }
+        if (!isVideoChannelReadyForStreaming) return
+
+        val spsPps = cachedSpsPpsAnnexB?.let { CarLifeFrameCodec.ensureAnnexBStartCode(it) }
+        val idr = lastKeyFrameAnnexB?.let { CarLifeFrameCodec.ensureAnnexBStartCode(it) }
+        val tsMs = SystemClock.uptimeMillis() and 0x7FFF_FFFFL
+        if (spsPps != null) {
+            onEncodedVideoNal(spsPps, tsMs, false)
+        }
+        if (idr != null) {
+            val combinedIdr = if (spsPps != null) spsPps + idr else idr
+            onEncodedVideoNal(combinedIdr, tsMs + 1L, true)
         }
     }
 
@@ -877,7 +993,41 @@ class CockpitProjectionManager(
     ): MediaCodec {
         val codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
 
-        // Stage 1: Pure AVCProfileBaseline (0x01) + AVCLevel31 + KEY_MAX_B_FRAMES = 0 + KEY_REPEAT_PREVIOUS_FRAME_AFTER = 100_000L
+        // Stage 1: Pure AVCProfileBaseline (0x01) + AVCLevel31 + BITRATE_MODE_VBR + KEY_I_FRAME_INTERVAL = 2 + QP bounds (IDR < 25 KB)
+        val baselineQpBoundedFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
+            setInteger(
+                MediaFormat.KEY_COLOR_FORMAT,
+                MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
+            )
+            setInteger(MediaFormat.KEY_BIT_RATE, bitRate)
+            setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
+            setInteger(
+                MediaFormat.KEY_PROFILE,
+                MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline
+            )
+            setInteger(
+                MediaFormat.KEY_LEVEL,
+                MediaCodecInfo.CodecProfileLevel.AVCLevel31
+            )
+            setInteger(
+                MediaFormat.KEY_BITRATE_MODE,
+                MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR
+            )
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                // Prevent initial IDR keyframe spikes > 25 KB on Qualcomm/Exynos hardware encoders
+                setInteger(MediaFormat.KEY_VIDEO_QP_I_MIN, 28)
+                setInteger(MediaFormat.KEY_VIDEO_QP_I_MAX, 46)
+                setInteger(MediaFormat.KEY_VIDEO_QP_P_MIN, 26)
+                setInteger(MediaFormat.KEY_VIDEO_QP_P_MAX, 46)
+            }
+            setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000L)
+        }
+
+        // Stage 2: Pure AVCProfileBaseline (0x01) + AVCLevel31 + BITRATE_MODE_VBR + KEY_I_FRAME_INTERVAL = 2
         val baselineLevel31Format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
             setInteger(
                 MediaFormat.KEY_COLOR_FORMAT,
@@ -885,7 +1035,7 @@ class CockpitProjectionManager(
             )
             setInteger(MediaFormat.KEY_BIT_RATE, bitRate)
             setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
             setInteger(
                 MediaFormat.KEY_PROFILE,
                 MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline
@@ -904,7 +1054,7 @@ class CockpitProjectionManager(
             setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000L)
         }
 
-        // Stage 2: Strict AVCProfileBaseline + Level 3.1 + KEY_REPEAT_PREVIOUS_FRAME_AFTER = 100_000L
+        // Stage 3: Strict AVCProfileBaseline + Level 3.1 + KEY_I_FRAME_INTERVAL = 2
         val baselineMinimalLevelFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
             setInteger(
                 MediaFormat.KEY_COLOR_FORMAT,
@@ -912,7 +1062,7 @@ class CockpitProjectionManager(
             )
             setInteger(MediaFormat.KEY_BIT_RATE, bitRate)
             setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
             setInteger(
                 MediaFormat.KEY_PROFILE,
                 MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline
@@ -924,26 +1074,10 @@ class CockpitProjectionManager(
             setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000L)
         }
 
-        // Stage 3: Strict AVCProfileBaseline (auto-level selection by hardware codec)
-        val baselineAutoLevelFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
-            setInteger(
-                MediaFormat.KEY_COLOR_FORMAT,
-                MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
-            )
-            setInteger(MediaFormat.KEY_BIT_RATE, bitRate)
-            setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-            setInteger(
-                MediaFormat.KEY_PROFILE,
-                MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline
-            )
-            setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000L)
-        }
-
         val candidates = listOf(
-            "AVCProfileBaseline+Level31+0B" to baselineLevel31Format,
-            "AVCProfileBaseline+Level31" to baselineMinimalLevelFormat,
-            "AVCProfileBaseline(AutoLevel)" to baselineAutoLevelFormat
+            "AVCProfileBaseline+Level31+VBR+QPBounded" to baselineQpBoundedFormat,
+            "AVCProfileBaseline+Level31+VBR" to baselineLevel31Format,
+            "AVCProfileBaseline+Level31" to baselineMinimalLevelFormat
         )
 
         for ((label, candidate) in candidates) {
@@ -965,7 +1099,7 @@ class CockpitProjectionManager(
             )
             setInteger(MediaFormat.KEY_BIT_RATE, bitRate)
             setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
             }
@@ -1015,8 +1149,12 @@ class CockpitProjectionManager(
         return result
     }
 
-    private suspend fun CoroutineScope.drainHardwareEncoderLoop(codec: MediaCodec) {
+    private suspend fun CoroutineScope.drainHardwareEncoderLoop(
+        codec: MediaCodec,
+        initialBitRate: Int
+    ) {
         val bufferInfo = MediaCodec.BufferInfo()
+        var currentDynamicBitrate = initialBitRate
 
         try {
             while (isActive && isEncoding.get()) {
@@ -1107,9 +1245,20 @@ class CockpitProjectionManager(
 
                                 if (containsIdrNal) {
                                     lastKeyFrameAnnexB = pureSliceBytes
+                                }
+
+                                // STRICT GATE: Do NOT send any 0x0002 packets or increment counters
+                                // while isVideoChannelReadyForStreaming == false (only cache spsPpsBytes & lastKeyFrameAnnexB in memory).
+                                if (!isVideoChannelReadyForStreaming) {
+                                    codec.releaseOutputBuffer(outIndex, false)
+                                    continue
+                                }
+
+                                if (containsIdrNal) {
+                                    awaitingFirstIdrAfterGateOpen.set(false)
                                     val spsPps = cachedSpsPpsAnnexB?.let { CarLifeFrameCodec.ensureAnnexBStartCode(it) }
                                     if (spsPps != null) {
-                                        // 1. Before every IDR keyframe: first send standalone packet with spsPpsBytes
+                                        // 1. First packet on 0x0002 before IDR: standalone spsPpsBytes
                                         onEncodedVideoNal(spsPps, timestampMs, false)
                                         _stats.update {
                                             it.copy(
@@ -1119,18 +1268,30 @@ class CockpitProjectionManager(
                                             )
                                         }
                                     }
-                                    // 2. Immediately follow with concatenated spsPpsBytes + idrBytes in a single video frame
+                                    // 2. Second packet on 0x0002: concatenated spsPpsBytes + idrBytes
                                     val idrWithSpsPps = if (spsPps != null) spsPps + pureSliceBytes else pureSliceBytes
                                     onEncodedVideoNal(idrWithSpsPps, timestampMs, true)
+
+                                    // If hardware rate-controller produced an IDR > 22 KB, dynamically lower target bitrate to keep IDR < 25 KB
+                                    if (idrWithSpsPps.size > 22_000 && currentDynamicBitrate > 450_000) {
+                                        currentDynamicBitrate = (currentDynamicBitrate * 70 / 100).coerceAtLeast(450_000)
+                                        runCatching {
+                                            val b = Bundle().apply {
+                                                putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, currentDynamicBitrate)
+                                            }
+                                            codec.setParameters(b)
+                                        }
+                                    }
 
                                     _stats.update {
                                         it.copy(
                                             encodedNalFrames = it.encodedNalFrames + 1L,
-                                            encodedBytes = it.encodedBytes + idrWithSpsPps.size
+                                            encodedBytes = it.encodedBytes + idrWithSpsPps.size,
+                                            lastIdrBytes = idrWithSpsPps.size
                                         )
                                     }
-                                } else {
-                                    // Non-keyframe P-slice
+                                } else if (!awaitingFirstIdrAfterGateOpen.get()) {
+                                    // Non-keyframe P-slice (only sent after the initial SPS/PPS + IDR pair has been transmitted)
                                     onEncodedVideoNal(pureSliceBytes, timestampMs, false)
 
                                     _stats.update {
@@ -1138,6 +1299,14 @@ class CockpitProjectionManager(
                                             encodedNalFrames = it.encodedNalFrames + 1L,
                                             encodedBytes = it.encodedBytes + pureSliceBytes.size
                                         )
+                                    }
+                                } else {
+                                    // Waiting for initial IDR after gate open: request sync frame and skip stale P-slice
+                                    runCatching {
+                                        val b = Bundle().apply {
+                                            putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
+                                        }
+                                        codec.setParameters(b)
                                     }
                                 }
                             }

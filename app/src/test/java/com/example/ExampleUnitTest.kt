@@ -72,7 +72,15 @@ class ExampleUnitTest {
         val h264Nal = byteArrayOf(0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x2A)
         val timestamp = 0x12345678L
 
-        // 1. Default Mode 1: AOA 20B (8B AOA + 12B 0x00028001)
+        // Verify Direct 12B is the default framing mode for 0x0002
+        val defaultFrame = CarLifeFrameCodec.createVideoFrame(
+            nalData = h264Nal,
+            timestampMs = timestamp
+        )
+        assertEquals(12, CarLifeFrameCodec.encodeHeader(defaultFrame.header).size)
+        assertArrayEquals(h264Nal, defaultFrame.payload)
+
+        // 1. Optional Mode: AOA 20B (8B AOA + 12B 0x00028001)
         val aoa20Frame = CarLifeFrameCodec.createVideoFrame(
             nalData = h264Nal,
             timestampMs = timestamp,
@@ -92,7 +100,7 @@ class ExampleUnitTest {
         assertEquals(CarLifeMsgType.MSG_VIDEO_DATA, parsedVideoMsg!!.serviceType)
         assertArrayEquals(h264Nal, parsedVideoMsg.body)
 
-        // 2. Mode 2: Direct 12B
+        // 2. Default Mode: Direct 12B ([00 00 00 02][nalSize][timestamp] + [00 00 00 01...])
         val legacyFrame = CarLifeFrameCodec.createVideoFrame(
             nalData = h264Nal,
             timestampMs = timestamp,
@@ -126,12 +134,12 @@ class ExampleUnitTest {
         val videoInitFrame = CarLifeFrameCodec.createCommandFrame(
             channel = CarLifeChannel.CONTROL,
             serviceType = CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT,
-            commandBody = CarlifeVideoEncoderInfoProto(width = 1280, height = 720, frameRate = 30).encode()
+            commandBody = CarlifeVideoEncoderInfoProto(width = 800, height = 480, frameRate = 30).encode()
         )
         val step2 = sm.onControlFrame(videoInitFrame)
         assertEquals(CarLifeSessionPhase.VIDEO_STREAMING, step2.updatedState.phase)
-        assertEquals(1280, step2.updatedState.negotiatedVideoWidth)
-        assertEquals(720, step2.updatedState.negotiatedVideoHeight)
+        assertEquals(800, step2.updatedState.negotiatedVideoWidth)
+        assertEquals(480, step2.updatedState.negotiatedVideoHeight)
         assertEquals(30, step2.updatedState.negotiatedFps)
         assertEquals(4, step2.outboundFrames.size)
 

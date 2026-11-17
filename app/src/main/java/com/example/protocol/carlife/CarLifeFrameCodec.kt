@@ -850,13 +850,13 @@ object CarLifeFrameCodec {
 
     /**
      * Runtime toggle for Baidu CarLife Video Channel (`0x0002`) payload framing (applied identically to SPS/PPS and IDR):
-     * - `true` (Mode 1 — **AOA 20B default**):
+     * - `false` (**Direct 12B — default**):
+     *   12B Header (`[00 00 00 02 (4B)][nalSize (4B)][timestamp (4B)]`) + `[00 00 00 01... h264Bytes]`.
+     * - `true` (**AOA 20B**):
      *   Outer AOA 8B (`[00 00 00 02][12 + h264.size]`) + Inner 12B (`[h264.size (4B)][timestampMs (4B)][0x00028001 (4B)]`) + `[h264Bytes]`.
-     * - `false` (Mode 2 — **Direct 12B**):
-     *   12B Header (`[00 00 00 02][h264.size (4B)][timestampMs (4B)]`) + `[h264Bytes]`.
      */
     @Volatile
-    var useNestedVideoMsgHeader: Boolean = true
+    var useNestedVideoMsgHeader: Boolean = false
 
     /**
      * Ensures an H.264 buffer starts with the 4-byte Annex-B start code `00 00 00 01`.

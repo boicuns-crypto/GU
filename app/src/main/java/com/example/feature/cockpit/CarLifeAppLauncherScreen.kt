@@ -134,9 +134,24 @@ object CarLifeLauncherRepository {
     val installedApps: StateFlow<List<InstalledAppInfo>> = _installedApps.asStateFlow()
 
     private val _lastLaunchStatus = MutableStateFlow(
-        "Ожидание запуска приложения на VirtualDisplay ГУ"
+        "Лаунчер ГУ активен — готов к выводу на VirtualDisplay автомобиля"
     )
     val lastLaunchStatus: StateFlow<String> = _lastLaunchStatus.asStateFlow()
+
+    fun markLauncherActiveOnDisplay(
+        displayId: Int,
+        width: Int,
+        height: Int,
+        bitrateBps: Int
+    ) {
+        val displayLabel = if (displayId == Display.DEFAULT_DISPLAY) {
+            "Surface (VD #0)"
+        } else {
+            "VD #$displayId"
+        }
+        _lastLaunchStatus.value =
+            "Лаунчер ГУ отрисован на $displayLabel (${width}×${height}, ${bitrateBps / 1000} кбит/с)"
+    }
 
     suspend fun loadInstalledApps(context: Context) {
         withContext(Dispatchers.IO) {
@@ -292,14 +307,15 @@ fun CarLifeAppLauncherScreen(
                 .fillMaxSize()
                 .padding(10.dp)
         ) {
-            val isWideScreen = maxWidth >= 520.dp
+            val isWideScreen = maxWidth >= 460.dp
+            val sideDockWidth = if (maxWidth < 640.dp) 196.dp else 240.dp
 
             if (isWideScreen) {
                 Row(
                     modifier = Modifier.fillMaxSize(),
                     horizontalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
-                    // Left Column (240.dp fixed width, padding = 12.dp): Clock + Home/Back + Media Player
+                    // Left Column: Clock + Home/Back + Media Player
                     CarLifeSideDockBar(
                         virtualDisplayId = virtualDisplayId,
                         a11yEnabled = a11yEnabled,
@@ -314,7 +330,7 @@ fun CarLifeAppLauncherScreen(
                         onPreviousTrack = onPreviousTrack,
                         onRequestNotificationAccess = onRequestNotificationAccess,
                         modifier = Modifier
-                            .width(240.dp)
+                            .width(sideDockWidth)
                             .fillMaxHeight()
                     )
 

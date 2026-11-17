@@ -72,8 +72,9 @@ data class BridgeRuntimeState(
     val transportState: UsbTransportState = UsbTransportState.Disconnected,
     val controlSession: CarLifeControlSessionState = CarLifeControlSessionState(),
     val projectionStats: ProjectionPipelineStats = ProjectionPipelineStats(),
-    val useNestedVideoMsgHeader: Boolean = CarLifeFrameCodec.useNestedVideoMsgHeader,
-    val configuredBitrateBps: Int = 1_800_000,
+    val isVideoChannelReadyForStreaming: Boolean = false,
+    val useNestedVideoMsgHeader: Boolean = false,
+    val configuredBitrateBps: Int = 800_000,
     val lastTouchOrKeyEvent: String = "None — Waiting for Touch/Hardkey Channel (0x0006)",
     val rxBytes: Long = 0L,
     val txBytes: Long = 0L,
@@ -221,8 +222,29 @@ class BridgeForegroundService : Service() {
 
     val controlStateMachine = CarLifeControlStateMachine()
     private val videoPacketCounter = java.util.concurrent.atomic.AtomicLong(0L)
+
+    /**
+     * Strict gate for channel `0x0002` H.264 streaming:
+     * MUST be `false` on `VirtualDisplay` start and on USB AOA attachment.
+     * Switched to `true` ONLY after `MSG_CMD_VIDEO_ENCODER_INIT (0x00010007)` arrives on `0x0001`
+     * and `MSG_CMD_VIDEO_ENCODER_INIT_DONE (0x00018008)` is transmitted in response.
+     */
     @Volatile
-    private var activeBitrateBps: Int = 1_800_000
+    var isVideoChannelReadyForStreaming: Boolean = false
+        private set
+
+    @Volatile
+    private var activeBitrateBps: Int = 800_000
+
+    private fun setVideoStreamingReady(ready: Boolean) {
+        isVideoChannelReadyForStreaming = ready
+        if (::projectionManager.isInitialized) {
+            projectionManager.setVideoChannelReady(ready)
+        }
+        BridgeTelemetryBus.updateState {
+            it.copy(isVideoChannelReadyForStreaming = ready)
+        }
+    }
 
     private fun resetVideoLogFlags() {
         videoPacketCounter.set(0L)
@@ -233,6 +255,10 @@ class BridgeForegroundService : Service() {
         createNotificationChannel()
         acquireWakeLock()
 
+        // Default Mode 2: Direct 12B ([00 00 00 02][nalSize][timestampMs] + 00 00 00 01...)
+        CarLifeFrameCodec.useNestedVideoMsgHeader = false
+        isVideoChannelReadyForStreaming = false
+
         usbTransport = UsbAccessoryTransport(
             context = applicationContext,
             ioDispatcher = Dispatchers.IO,
@@ -242,6 +268,12 @@ class BridgeForegroundService : Service() {
         projectionManager = CockpitProjectionManager(
             context = applicationContext,
             onEncodedVideoNal = { nalBytes, timestampMs, isKeyFrame ->
+                // STRICT GATE: While isVideoChannelReadyForStreaming == false, NEVER send 0x0002 packets
+                // to usbOutputStream and NEVER increment 0x0002 packet counters!
+                if (!isVideoChannelReadyForStreaming || usbTransport.state.value !is UsbTransportState.Connected) {
+                    return@CockpitProjectionManager
+                }
+
                 // Forward H.264 NAL units directly into the active USB AOA transport on channel 0x0002
                 val pktIndex = videoPacketCounter.incrementAndGet()
                 val videoFrame = CarLifeFrameCodec.createVideoFrame(nalBytes, timestampMs)
@@ -251,12 +283,16 @@ class BridgeForegroundService : Service() {
                 // Log all SPS/PPS, all IDR keyframes, and every 15th Slice to the dedicated Video Tab (0x0002)
                 val shouldLogToVideoTab = isStandaloneSpsPps || isIdr || pktIndex <= 6L || (pktIndex % 15L == 0L)
                 serviceScope.launch {
-                    if (pktIndex <= 4L || isStandaloneSpsPps || isIdr) {
+                    if (!isVideoChannelReadyForStreaming || usbTransport.state.value !is UsbTransportState.Connected) {
+                        return@launch
+                    }
+                    val sentOk = if (pktIndex <= 4L || isStandaloneSpsPps || isIdr) {
                         // Send SPS/PPS and IDR keyframes immediately (chunked by 16,384B)
                         usbTransport.sendFrameImmediate(videoFrame)
                     } else {
                         usbTransport.sendFrame(videoFrame)
                     }
+                    if (!sentOk) return@launch
 
                     if (shouldLogToVideoTab) {
                         val nalLabel = when {
@@ -264,7 +300,7 @@ class BridgeForegroundService : Service() {
                             isIdr -> "IDR KeyFrame #$pktIndex (SPS/PPS+IDR)"
                             else -> "H.264 Slice #$pktIndex"
                         }
-                        val hdrMode = if (CarLifeFrameCodec.useNestedVideoMsgHeader) "AOA 20B" else "Direct 12B"
+                        val hdrMode = if (CarLifeFrameCodec.useNestedVideoMsgHeader) "Режим 1: AOA 20B" else "Режим 2: Direct 12B"
                         BridgeTelemetryBus.recordFrame(
                             direction = "TX (S26U -> HU)",
                             frame = videoFrame,
@@ -287,12 +323,15 @@ class BridgeForegroundService : Service() {
             },
             externalScope = serviceScope
         )
+        projectionManager.setVideoChannelReady(false)
 
         BridgeTelemetryBus.updateState {
             it.copy(
                 isServiceRunning = true,
                 wakeLockHeld = wakeLock?.isHeld == true,
-                lastProtocolEvent = "BridgeForegroundService active (Core 1 USB + Core 2 Projection ready)"
+                isVideoChannelReadyForStreaming = false,
+                useNestedVideoMsgHeader = CarLifeFrameCodec.useNestedVideoMsgHeader,
+                lastProtocolEvent = "BridgeForegroundService active (0x0002 locked until MSG_CMD_VIDEO_ENCODER_INIT)"
             )
         }
 
@@ -317,19 +356,23 @@ class BridgeForegroundService : Service() {
         // Observe USB transport state changes
         serviceScope.launch {
             usbTransport.state.collect { newState ->
-                if (newState is UsbTransportState.Disconnected) {
+                // On any new USB AOA connection or disconnect, lock 0x0002 streaming until 0x0001 handshake completes!
+                setVideoStreamingReady(false)
+                resetVideoLogFlags()
+                if (newState is UsbTransportState.Disconnected || newState is UsbTransportState.Connecting) {
                     controlStateMachine.reset()
                 }
                 BridgeTelemetryBus.updateState { current ->
                     current.copy(
                         transportState = newState,
+                        isVideoChannelReadyForStreaming = false,
                         rxBytes = usbTransport.rxBytes,
                         txBytes = usbTransport.txBytes,
                         rxFrames = usbTransport.rxFrames,
                         txFrames = usbTransport.txFrames,
                         lastProtocolEvent = when (newState) {
                             is UsbTransportState.Connected ->
-                                "AOA Connected: ${newState.accessory.manufacturer} ${newState.accessory.model} (fd=${newState.fdNumber})"
+                                "AOA Connected: ${newState.accessory.manufacturer} ${newState.accessory.model} (fd=${newState.fdNumber}) — Awaiting 0x0001 Handshake"
                             is UsbTransportState.Connecting ->
                                 "Opening Direct-IO FileChannel for ${newState.accessory.manufacturer} ${newState.accessory.model}..."
                             is UsbTransportState.WaitingForPermission ->
@@ -337,7 +380,7 @@ class BridgeForegroundService : Service() {
                             is UsbTransportState.Error ->
                                 "AOA Status: ${newState.reason}"
                             UsbTransportState.Disconnected ->
-                                "USB AOA Disconnected"
+                                "USB AOA Disconnected (0x0002 Video Gate Locked)"
                         }
                     )
                 }
@@ -352,11 +395,11 @@ class BridgeForegroundService : Service() {
             }
         }
 
-        // Periodic 1,000ms Heartbeat loop to prevent Jetta VS7 (MQB) Head Unit watchdog disconnect
+        // Periodic 1,000ms Heartbeat loop ONLY after 0x0001 handshake has unlocked video streaming
         serviceScope.launch {
             while (isActive) {
                 kotlinx.coroutines.delay(1_000L)
-                if (usbTransport.state.value is UsbTransportState.Connected) {
+                if (usbTransport.state.value is UsbTransportState.Connected && isVideoChannelReadyForStreaming) {
                     val hb = controlStateMachine.createHeartbeatFrame()
                     usbTransport.sendFrameImmediate(hb)
                 }
@@ -393,58 +436,83 @@ class BridgeForegroundService : Service() {
                     MediaProjectionTokenStore.saveToken(resultCode, resultData)
                     promoteToForeground(usbTransport.state.value)
                     val session = controlStateMachine.sessionState.value
-                    val targetW = session.negotiatedVideoWidth.coerceAtLeast(1280)
-                    val targetH = session.negotiatedVideoHeight.coerceAtLeast(720)
-                    val targetFps = session.negotiatedFps.coerceIn(30, 60)
+                    val targetW = session.negotiatedVideoWidth.coerceIn(480, 3840)
+                    val targetH = session.negotiatedVideoHeight.coerceIn(272, 2160)
+                    val targetFps = session.negotiatedFps.coerceIn(15, 60)
+                    val wasHandshakeReady = (usbTransport.state.value is UsbTransportState.Connected) &&
+                        (session.phase == com.example.protocol.carlife.CarLifeSessionPhase.VIDEO_STREAMING)
+                    if (!wasHandshakeReady) {
+                        setVideoStreamingReady(false)
+                    }
                     serviceScope.launch {
                         resetVideoLogFlags()
                         if (projectionManager.stats.value.isRunning) {
                             projectionManager.stopProjection()
                         }
+                        projectionManager.setVideoChannelReady(wasHandshakeReady)
                         projectionManager.startProjection(
                             width = targetW,
                             height = targetH,
                             frameRate = targetFps,
                             bitRate = activeBitrateBps
                         )
+                        if (wasHandshakeReady) {
+                            projectionManager.unlockVideoChannelAndRequestSyncFrame()
+                        }
                     }
                     BridgeTelemetryBus.updateState {
                         it.copy(
-                            lastProtocolEvent = "MediaProjection (Entire Screen) granted — H.264 SPS/PPS + IDR active"
+                            lastProtocolEvent = if (wasHandshakeReady) {
+                                "MediaProjection granted — Streaming 0x0002 ($targetW×$targetH @ ${activeBitrateBps / 1000} kbps)"
+                            } else {
+                                "MediaProjection granted — SPS/PPS cached in memory (0x0002 waits for MSG_CMD_VIDEO_ENCODER_INIT)"
+                            }
                         )
                     }
                 }
             }
 
             ACTION_START_PROJECTION -> {
-                val width = intent.getIntExtra(EXTRA_WIDTH, 1280)
-                val height = intent.getIntExtra(EXTRA_HEIGHT, 720)
+                val width = intent.getIntExtra(EXTRA_WIDTH, 800)
+                val height = intent.getIntExtra(EXTRA_HEIGHT, 480)
                 val fps = intent.getIntExtra(EXTRA_FPS, 30)
-                val bitrate = intent.getIntExtra(EXTRA_BITRATE, activeBitrateBps).coerceIn(800_000, 12_000_000)
+                val bitrate = intent.getIntExtra(EXTRA_BITRATE, activeBitrateBps).coerceIn(400_000, 12_000_000)
                 activeBitrateBps = bitrate
+                controlStateMachine.preferredVideoWidth = width
+                controlStateMachine.preferredVideoHeight = height
+                val wasHandshakeReady = (usbTransport.state.value is UsbTransportState.Connected) &&
+                    (controlStateMachine.sessionState.value.phase == com.example.protocol.carlife.CarLifeSessionPhase.VIDEO_STREAMING)
+                if (!wasHandshakeReady) {
+                    setVideoStreamingReady(false)
+                }
                 BridgeTelemetryBus.updateState { it.copy(configuredBitrateBps = bitrate) }
                 serviceScope.launch {
                     resetVideoLogFlags()
+                    projectionManager.setVideoChannelReady(wasHandshakeReady)
                     projectionManager.startProjection(
                         width = width,
                         height = height,
                         frameRate = fps,
                         bitRate = bitrate
                     )
+                    if (wasHandshakeReady) {
+                        projectionManager.unlockVideoChannelAndRequestSyncFrame()
+                    }
                 }
             }
 
             ACTION_STOP_PROJECTION -> {
+                setVideoStreamingReady(false)
                 serviceScope.launch {
                     projectionManager.stopProjection()
                 }
             }
 
             ACTION_INJECT_TEST_TOUCH -> {
-                val x = intent.getIntExtra(EXTRA_TOUCH_X, 320)
-                val y = intent.getIntExtra(EXTRA_TOUCH_Y, 360)
-                val w = intent.getIntExtra(EXTRA_WIDTH, 1280)
-                val h = intent.getIntExtra(EXTRA_HEIGHT, 720)
+                val x = intent.getIntExtra(EXTRA_TOUCH_X, 240)
+                val y = intent.getIntExtra(EXTRA_TOUCH_Y, 240)
+                val w = intent.getIntExtra(EXTRA_WIDTH, 800)
+                val h = intent.getIntExtra(EXTRA_HEIGHT, 480)
                 serviceScope.launch {
                     val pkt = CarLifeTouchPacket(
                         androidAction = MotionEvent.ACTION_DOWN,
@@ -503,20 +571,23 @@ class BridgeForegroundService : Service() {
                 }
                 CarLifeFrameCodec.useNestedVideoMsgHeader = newMode
                 resetVideoLogFlags()
-                projectionManager.requestInstantIdrKeyFrame()
+                if (isVideoChannelReadyForStreaming) {
+                    projectionManager.requestInstantIdrKeyFrame()
+                }
                 BridgeTelemetryBus.updateState {
                     it.copy(
                         useNestedVideoMsgHeader = newMode,
                         lastProtocolEvent = if (newMode) {
-                            "Video 0x0002 Framing: AOA 20B (8B AOA + 12B 0x00028001) active"
+                            "Video 0x0002 Framing: Режим 1: AOA 20B (8B AOA + 12B 0x00028001) active"
                         } else {
-                            "Video 0x0002 Framing: Strict 12B Header (00 00 00 01 Annex-B) active"
+                            "Video 0x0002 Framing: Режим 2: Direct 12B ([00 00 00 02][nalSize][ts]) active"
                         }
                     )
                 }
             }
 
             ACTION_DISCONNECT_STOP -> {
+                setVideoStreamingReady(false)
                 serviceScope.launch {
                     projectionManager.stopProjection()
                     usbTransport.closeSession("Stopped by user")
@@ -579,20 +650,37 @@ class BridgeForegroundService : Service() {
 
                 val cmd = frame.parseCommandMessageOrNull()
                 when (cmd?.serviceType) {
+                    CarLifeMsgType.MSG_CMD_HU_PROTOCOL_VERSION,
+                    CarLifeMsgType.MSG_CMD_HU_PROTOCOL_VERSION_ALT -> {
+                        // Handshake just started: keep 0x0002 strictly locked until MSG_CMD_VIDEO_ENCODER_INIT (0x00010007)
+                        setVideoStreamingReady(false)
+                    }
+
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT,
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT_ALT,
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_RESET,
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_RESET_ALT -> {
                         val s = transition.updatedState
                         resetVideoLogFlags()
-                        // Start H.264 encoder & 0x0002 streaming IMMEDIATELY after MSG_CMD_VIDEO_ENCODER_INIT_DONE
-                        projectionManager.startProjection(
-                            width = s.negotiatedVideoWidth,
-                            height = s.negotiatedVideoHeight,
-                            frameRate = s.negotiatedFps,
-                            bitRate = activeBitrateBps
-                        )
+                        val projStats = projectionManager.stats.value
+                        if (!projStats.isRunning ||
+                            projStats.width != s.negotiatedVideoWidth ||
+                            projStats.height != s.negotiatedVideoHeight
+                        ) {
+                            projectionManager.startProjection(
+                                width = s.negotiatedVideoWidth,
+                                height = s.negotiatedVideoHeight,
+                                frameRate = s.negotiatedFps,
+                                bitRate = activeBitrateBps
+                            )
+                        }
+                        // ONLY NOW, after MSG_CMD_VIDEO_ENCODER_INIT (0x00010007) was received and
+                        // MSG_CMD_VIDEO_ENCODER_INIT_DONE (0x00018008) was sent, unlock 0x0002 streaming,
+                        // force PARAMETER_KEY_REQUEST_SYNC_FRAME = 0, and send Packet #1 (SPS/PPS) + Packet #2 (SPS/PPS + IDR)!
+                        setVideoStreamingReady(true)
+                        projectionManager.unlockVideoChannelAndRequestSyncFrame()
                     }
+
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START,
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_ALT -> {
                         val s = transition.updatedState
@@ -605,8 +693,12 @@ class BridgeForegroundService : Service() {
                                 bitRate = activeBitrateBps
                             )
                         }
-                        // Immediately send SPS/PPS packet on channel 0x0002 and request IDR sync frame
-                        projectionManager.requestInstantIdrKeyFrame()
+                        setVideoStreamingReady(true)
+                        projectionManager.unlockVideoChannelAndRequestSyncFrame()
+                    }
+
+                    CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_PAUSE -> {
+                        setVideoStreamingReady(false)
                     }
                 }
             }

@@ -26,13 +26,13 @@ data class CarLifeControlSessionState(
     val huProtocolMajor: Int = 0,
     val huProtocolMinor: Int = 0,
     val huDeviceInfo: CarlifeDeviceInfoProto? = null,
-    val negotiatedVideoWidth: Int = 1280,
-    val negotiatedVideoHeight: Int = 720,
+    val negotiatedVideoWidth: Int = 800,
+    val negotiatedVideoHeight: Int = 480,
     val negotiatedFps: Int = 30,
     val isHuScreenOn: Boolean = true,
     val isHuForeground: Boolean = true,
     val heartbeatCount: Long = 0L,
-    val lastControlAction: String = "Awaiting MSG_CMD_HU_PROTOCOL_VERSION (0x00018001)"
+    val lastControlAction: String = "Awaiting MSG_CMD_HU_PROTOCOL_VERSION (0x00010001)"
 )
 
 /**
@@ -49,13 +49,23 @@ data class ControlTransitionResult(
  */
 class CarLifeControlStateMachine(
     private val force60FpsOnMqb: Boolean = false,
-    private val mobileDeviceInfo: CarlifeDeviceInfoProto = CarlifeDeviceInfoProto()
+    private val mobileDeviceInfo: CarlifeDeviceInfoProto = CarlifeDeviceInfoProto(),
+    @Volatile var preferredVideoWidth: Int = 800,
+    @Volatile var preferredVideoHeight: Int = 480
 ) {
-    private val _sessionState = MutableStateFlow(CarLifeControlSessionState())
+    private val _sessionState = MutableStateFlow(
+        CarLifeControlSessionState(
+            negotiatedVideoWidth = preferredVideoWidth,
+            negotiatedVideoHeight = preferredVideoHeight
+        )
+    )
     val sessionState: StateFlow<CarLifeControlSessionState> = _sessionState.asStateFlow()
 
     fun reset() {
-        _sessionState.value = CarLifeControlSessionState()
+        _sessionState.value = CarLifeControlSessionState(
+            negotiatedVideoWidth = preferredVideoWidth,
+            negotiatedVideoHeight = preferredVideoHeight
+        )
     }
 
     /**
@@ -307,11 +317,18 @@ class CarLifeControlStateMachine(
 
     private fun handleVideoEncoderInit(body: ByteArray): ControlTransitionResult {
         val requested = CarlifeVideoEncoderInfoProto.decode(body)
-        val negotiatedWidth = if (force60FpsOnMqb && requested.width in 480..3840) requested.width else 1280
-        val negotiatedHeight = if (force60FpsOnMqb && requested.height in 272..2160) requested.height else 720
+        val negotiatedWidth = if (force60FpsOnMqb && requested.width in 480..3840) {
+            requested.width
+        } else {
+            preferredVideoWidth.coerceIn(480, 3840)
+        }
+        val negotiatedHeight = if (force60FpsOnMqb && requested.height in 272..2160) {
+            requested.height
+        } else {
+            preferredVideoHeight.coerceIn(272, 2160)
+        }
         val negotiatedFps = if (force60FpsOnMqb) 60 else 30
 
-        // Protobuf: width=1280 (08 80 0A), height=720 (10 D0 05), frameRate=30 (18 1E)
         val negotiatedProto = CarlifeVideoEncoderInfoProto(
             width = negotiatedWidth,
             height = negotiatedHeight,
@@ -319,7 +336,7 @@ class CarLifeControlStateMachine(
         )
         val encodedNegotiated = negotiatedProto.encode()
 
-        // 1. MSG_CMD_VIDEO_ENCODER_INIT_DONE (0x00018008) with [00 08][00 00][00 01 80 08][08 80 0A 10 D0 05 18 1E]
+        // 1. MSG_CMD_VIDEO_ENCODER_INIT_DONE (0x00018008)
         val initDoneFrame = CarLifeFrameCodec.createCommandFrame(
             channel = CarLifeChannel.CONTROL,
             serviceType = CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT_DONE, // 0x00018008

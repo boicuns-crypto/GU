@@ -361,9 +361,9 @@ fun CarLifeBridgeApp(
     // 2 = «Настройки» (Settings — VD Controls, H.264 Stream Config & Expandable AOA/Protocol Lab)
     var selectedTab by rememberSaveable { mutableIntStateOf(0) }
 
-    var configuredWidth by rememberSaveable { mutableIntStateOf(1280) }
-    var configuredHeight by rememberSaveable { mutableIntStateOf(720) }
-    var configuredBitrateKbps by rememberSaveable { mutableIntStateOf(1800) }
+    var configuredWidth by rememberSaveable { mutableIntStateOf(800) }
+    var configuredHeight by rememberSaveable { mutableIntStateOf(480) }
+    var configuredBitrateKbps by rememberSaveable { mutableIntStateOf(800) }
 
     var checklistStatus by remember {
         mutableStateOf(
@@ -1394,10 +1394,15 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                         shape = RoundedCornerShape(10.dp),
                         border = BorderStroke(1.dp, ObsidianBorder)
                     ) {
+                        val vdStatusLine = if (state.projectionStats.isRunning && !lastLaunchStatus.startsWith("Запущено:")) {
+                            "Лаунчер ГУ активен на VD #${state.projectionStats.virtualDisplayId} (${state.projectionStats.width}×${state.projectionStats.height} @ ${state.configuredBitrateBps / 1000} кбит/с)"
+                        } else {
+                            lastLaunchStatus
+                        }
                         Text(
-                            text = lastLaunchStatus,
+                            text = vdStatusLine,
                             style = MaterialTheme.typography.labelMedium,
-                            color = TextSecondary,
+                            color = if (state.projectionStats.isRunning) TelemetryEmerald else TextSecondary,
                             maxLines = 2,
                             overflow = TextOverflow.Ellipsis,
                             modifier = Modifier
@@ -1409,7 +1414,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
             }
         }
 
-        // 2. Настройки H.264 видеопотока (разрешение 1280x720 / 1920x1080, битрейт 1.8 Мбит/с, формат канала 0x0002)
+        // 2. Настройки H.264 видеопотока (разрешение 800x480 / 1024x600 / 1280x720, битрейт 800 кбит/с VBR, Direct 12B по умолчанию)
         item {
             Card(
                 modifier = Modifier.fillMaxWidth(),
@@ -1441,7 +1446,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                             border = BorderStroke(1.dp, ObsidianBorder)
                         ) {
                             Text(
-                                text = "Baseline L3.1 • 30 FPS",
+                                text = "Baseline VBR • I=2s",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = ElectricCyan,
                                 softWrap = false,
@@ -1452,7 +1457,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                     }
 
                     Text(
-                        text = "Разрешение экрана ГУ",
+                        text = "Разрешение виртуального дисплея и кодека (800×480 для IDR < 25 КБ)",
                         style = MaterialTheme.typography.labelMedium,
                         color = TextSecondary
                     )
@@ -1462,23 +1467,30 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         SelectableOptionButton(
-                            label = "1280 × 720 (HD)",
+                            label = "800 × 480",
+                            selected = configuredWidth == 800,
+                            testTag = "res_480p_btn",
+                            onClick = { onSelectResolution(800, 480) },
+                            modifier = Modifier.weight(1f)
+                        )
+                        SelectableOptionButton(
+                            label = "1024 × 600",
+                            selected = configuredWidth == 1024,
+                            testTag = "res_600p_btn",
+                            onClick = { onSelectResolution(1024, 600) },
+                            modifier = Modifier.weight(1f)
+                        )
+                        SelectableOptionButton(
+                            label = "1280 × 720",
                             selected = configuredWidth == 1280,
                             testTag = "res_720p_btn",
                             onClick = { onSelectResolution(1280, 720) },
                             modifier = Modifier.weight(1f)
                         )
-                        SelectableOptionButton(
-                            label = "1920 × 1080 (FHD)",
-                            selected = configuredWidth == 1920,
-                            testTag = "res_1080p_btn",
-                            onClick = { onSelectResolution(1920, 1080) },
-                            modifier = Modifier.weight(1f)
-                        )
                     }
 
                     Text(
-                        text = "Битрейт аппаратного кодека (Baseline 0 B-frames, IDR < 32 KB)",
+                        text = "Битрейт кодека (BITRATE_MODE_VBR, KEY_I_FRAME_INTERVAL = 2, IDR < 25 КБ)",
                         style = MaterialTheme.typography.labelMedium,
                         color = TextSecondary
                     )
@@ -1488,30 +1500,30 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         SelectableOptionButton(
+                            label = "800 кбит/с",
+                            selected = configuredBitrateKbps == 800,
+                            testTag = "bitrate_2m_btn",
+                            onClick = { onSelectBitrate(800) },
+                            modifier = Modifier.weight(1f)
+                        )
+                        SelectableOptionButton(
+                            label = "1.2 Мбит/с",
+                            selected = configuredBitrateKbps == 1200,
+                            testTag = "bitrate_4m_btn",
+                            onClick = { onSelectBitrate(1200) },
+                            modifier = Modifier.weight(1f)
+                        )
+                        SelectableOptionButton(
                             label = "1.8 Мбит/с",
                             selected = configuredBitrateKbps == 1800,
-                            testTag = "bitrate_2m_btn",
-                            onClick = { onSelectBitrate(1800) },
-                            modifier = Modifier.weight(1f)
-                        )
-                        SelectableOptionButton(
-                            label = "2.5 Мбит/с",
-                            selected = configuredBitrateKbps == 2500,
-                            testTag = "bitrate_4m_btn",
-                            onClick = { onSelectBitrate(2500) },
-                            modifier = Modifier.weight(1f)
-                        )
-                        SelectableOptionButton(
-                            label = "4.0 Мбит/с",
-                            selected = configuredBitrateKbps == 4000,
                             testTag = "bitrate_6m_btn",
-                            onClick = { onSelectBitrate(4000) },
+                            onClick = { onSelectBitrate(1800) },
                             modifier = Modifier.weight(1f)
                         )
                     }
 
                     Text(
-                        text = "Формат шапки видеоканала 0x0002 (одинаково для SPS/PPS и IDR)",
+                        text = "Формат шапки видеоканала 0x0002 (Direct 12B по умолчанию)",
                         style = MaterialTheme.typography.labelMedium,
                         color = TextSecondary
                     )
@@ -1522,9 +1534,9 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                             it.copy(
                                 useNestedVideoMsgHeader = useAoA20B,
                                 lastProtocolEvent = if (useAoA20B) {
-                                    "Video 0x0002 Framing: Режим 1 (AOA 20B: 8B AOA + 12B 0x00028001) active"
+                                    "Video 0x0002 Framing: Режим 1: AOA 20B (8B AOA + 12B 0x00028001) active"
                                 } else {
-                                    "Video 0x0002 Framing: Режим 2 (Direct 12B Header) active"
+                                    "Video 0x0002 Framing: Режим 2: Direct 12B ([00 00 00 02][nalSize][ts]) active"
                                 }
                             )
                         }
@@ -1542,18 +1554,18 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         SelectableOptionButton(
-                            label = "Режим 1: AOA 20B (По умолч.)",
-                            selected = state.useNestedVideoMsgHeader,
-                            testTag = "toggle_video_header_mode_btn",
-                            onClick = { applyVideoHeaderMode(true) },
-                            modifier = Modifier.weight(1.25f)
-                        )
-                        SelectableOptionButton(
                             label = "Режим 2: Direct 12B",
                             selected = !state.useNestedVideoMsgHeader,
                             testTag = "video_header_legacy_12b_btn",
                             onClick = { applyVideoHeaderMode(false) },
-                            modifier = Modifier.weight(0.95f)
+                            modifier = Modifier.weight(1.1f)
+                        )
+                        SelectableOptionButton(
+                            label = "Режим 1: AOA 20B",
+                            selected = state.useNestedVideoMsgHeader,
+                            testTag = "toggle_video_header_mode_btn",
+                            onClick = { applyVideoHeaderMode(true) },
+                            modifier = Modifier.weight(1f)
                         )
                     }
                 }
@@ -1662,10 +1674,10 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                                 val videoInitFrame = CarLifeFrameCodec.createCommandFrame(
                                                     channel = CarLifeChannel.CONTROL,
                                                     serviceType = CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT,
-                                                    commandBody = CarlifeVideoEncoderInfoProto(1280, 720, 30).encode()
+                                                    commandBody = CarlifeVideoEncoderInfoProto(800, 480, 30).encode()
                                                 )
                                                 runLoopbackCodecTest(versionFrame, "Control 0x0001: MSG_CMD_HU_PROTOCOL_VERSION (v2.0)")
-                                                runLoopbackCodecTest(videoInitFrame, "Control 0x0001: MSG_CMD_VIDEO_ENCODER_INIT (1280x720@30)")
+                                                runLoopbackCodecTest(videoInitFrame, "Control 0x0001: MSG_CMD_VIDEO_ENCODER_INIT (800x480@30)")
                                             }
                                         )
 
@@ -1797,7 +1809,12 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                 val hdrModeLabel = if (state.useNestedVideoMsgHeader) {
                                     "Режим 1: AOA 20B (8B AOA + 12B 0x00028001)"
                                 } else {
-                                    "Режим 2: Direct 12B ([0x0002][len][ts])"
+                                    "Режим 2: Direct 12B ([0x0002][nalSize][ts])"
+                                }
+                                val gateStatusLabel = if (state.isVideoChannelReadyForStreaming) {
+                                    "Шлюз 0x0002: ОТКРЫТ (после 0x00010007 -> 0x00018008)"
+                                } else {
+                                    "Шлюз 0x0002: ЗАКРЫТ (ожидание 0x00010007 от ГУ)"
                                 }
                                 Surface(
                                     color = ObsidianSurfaceHigh,
@@ -1816,7 +1833,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                             color = TelemetryEmerald
                                         )
                                         Text(
-                                            text = "Кадров 0x0002: $videoFramesCount • Кодек: ${state.projectionStats.width}×${state.projectionStats.height}@${state.projectionStats.fps}fps (${state.configuredBitrateBps / 1000} kbps) • Передано: ${state.projectionStats.encodedBytes / 1024} КБ",
+                                            text = "$gateStatusLabel • Кадров 0x0002: $videoFramesCount • Кодек: ${state.projectionStats.width}×${state.projectionStats.height}@${state.projectionStats.fps}fps (${state.configuredBitrateBps / 1000} kbps) • IDR: ${state.projectionStats.lastIdrBytes}B",
                                             style = MaterialTheme.typography.labelSmall,
                                             fontFamily = JetBrainsMonoFamily,
                                             color = TextSecondary
@@ -2001,7 +2018,7 @@ private fun ProjectionEngineCard(
             ) {
                 if (!proj.isRunning) {
                     Button(
-                        onClick = { onStartProjection(1280, 720, 60) },
+                        onClick = { onStartProjection(800, 480, 30) },
                         modifier = Modifier
                             .weight(1f)
                             .testTag("start_projection_btn"),
