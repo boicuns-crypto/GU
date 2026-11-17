@@ -138,27 +138,61 @@ class ExampleUnitTest {
             commandBody = CarlifeVideoEncoderInfoProto(width = 800, height = 480, frameRate = 30).encode()
         )
         val step2 = sm.onControlFrame(videoInitFrame)
-        assertEquals(CarLifeSessionPhase.VIDEO_STREAMING, step2.updatedState.phase)
+        assertEquals(CarLifeSessionPhase.VIDEO_INITIALIZED, step2.updatedState.phase)
         assertEquals(800, step2.updatedState.negotiatedVideoWidth)
         assertEquals(480, step2.updatedState.negotiatedVideoHeight)
         assertEquals(30, step2.updatedState.negotiatedFps)
-        assertEquals(4, step2.outboundFrames.size)
+        assertEquals(1, step2.outboundFrames.size)
         assertEquals(
             CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT_DONE,
             step2.outboundFrames[0].parseCommandMessageOrNull()?.serviceType
         )
+
+        val videoStartFrame = CarLifeFrameCodec.createCommandFrame(
+            channel = CarLifeChannel.CONTROL,
+            serviceType = CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START
+        )
+        val step3 = sm.onControlFrame(videoStartFrame)
+        assertEquals(CarLifeSessionPhase.VIDEO_STREAMING, step3.updatedState.phase)
+        assertEquals(3, step3.outboundFrames.size)
         assertEquals(
             CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_DONE,
-            step2.outboundFrames[1].parseCommandMessageOrNull()?.serviceType
+            step3.outboundFrames[0].parseCommandMessageOrNull()?.serviceType
         )
         assertEquals(
             CarLifeMsgType.MSG_CMD_FOREGROUND,
-            step2.outboundFrames[2].parseCommandMessageOrNull()?.serviceType
+            step3.outboundFrames[1].parseCommandMessageOrNull()?.serviceType
         )
         assertEquals(
             CarLifeMsgType.MSG_CMD_SCREEN_ON,
-            step2.outboundFrames[3].parseCommandMessageOrNull()?.serviceType
+            step3.outboundFrames[2].parseCommandMessageOrNull()?.serviceType
         )
+
+        // Verify Mock Auth bypass (0x0001000A -> 0x0001800B, 0x0001000B -> 0x0001800C, 0x00010004 -> 0x00018004)
+        val auth0B = CarLifeFrameCodec.createCommandFrame(
+            channel = CarLifeChannel.CONTROL,
+            serviceType = CarLifeMsgType.MSG_CMD_AUTHEN_REQUEST_0B,
+            commandBody = byteArrayOf(0x0A, 0x02, 0x01, 0x02)
+        )
+        val auth0BResult = sm.onControlFrame(auth0B)
+        assertEquals(1, auth0BResult.outboundFrames.size)
+        assertEquals(
+            CarLifeMsgType.MSG_CMD_AUTHEN_RESPONSE_0C,
+            auth0BResult.outboundFrames[0].parseCommandMessageOrNull()?.serviceType
+        )
+        assertTrue(auth0BResult.summary.contains("AUTH / UNKNOWN (0x0001000B)"))
+
+        val statsReq = CarLifeFrameCodec.createCommandFrame(
+            channel = CarLifeChannel.CONTROL,
+            serviceType = CarLifeMsgType.MSG_CMD_HU_STATS_REQUEST
+        )
+        val statsResult = sm.onControlFrame(statsReq)
+        assertEquals(1, statsResult.outboundFrames.size)
+        assertEquals(
+            CarLifeMsgType.MSG_CMD_MD_INFO,
+            statsResult.outboundFrames[0].parseCommandMessageOrNull()?.serviceType
+        )
+        assertEquals(0, statsResult.outboundFrames[0].parseCommandMessageOrNull()?.body?.size)
 
         // Verify Module Control, Authen Request, and AES Key Request replies
         val modCtrl = CarLifeFrameCodec.createCommandFrame(
@@ -274,9 +308,10 @@ class ExampleUnitTest {
         assertNotNull(parsed)
         assertEquals(CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT, parsed!!.serviceType)
 
-        // Verify START_DONE (0x0001800A) vs PAUSE (0x0001000A) and auto-start sequence
+        // Verify START_DONE (0x0001800A) vs AUTH_0A (0x0001000A) and auto-start sequence
         assertEquals("MSG_CMD_VIDEO_ENCODER_START_DONE", CarLifeMsgType.nameOf(0x0001800A))
-        assertEquals("MSG_CMD_VIDEO_ENCODER_PAUSE", CarLifeMsgType.nameOf(0x0001000A))
+        assertEquals("AUTH / UNKNOWN (0x0001000A)", CarLifeMsgType.nameOf(0x0001000A))
+        assertEquals("AUTH / UNKNOWN (0x00010077)", CarLifeMsgType.nameOf(0x00010077))
         val sm = CarLifeControlStateMachine()
         sm.setPreferredResolution(800, 480)
         val autoStart = sm.buildAutoVideoEncoderInitAndStartFrames(800, 480, 30)

@@ -1644,7 +1644,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                             )
                             Spacer(modifier = Modifier.height(2.dp))
                             Text(
-                                text = "После MD_INFO (0x00018003) с задержкой 120мс отправляются аудиофреймы (0x0003, 0x0004), INIT_DONE + START_DONE + FOREGROUND + SCREEN_ON, далее раздельные NAL в Direct 12B.",
+                                text = "После MD_INFO (0x00018003) отправляется Audio-Init (0x0003, 0x0004) и перехватываются RSA/AES/Auth-команды (0x0001000A–0x0001000D, 0x00010040–0x00010057); видеопоток 0x0002 (Direct 12B) запускается строго после VIDEO_ENCODER_START (0x00010009).",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = TextSecondary
                             )

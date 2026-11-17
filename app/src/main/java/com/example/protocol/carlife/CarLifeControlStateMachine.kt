@@ -228,17 +228,21 @@ class CarLifeControlStateMachine(
             CarLifeMsgType.MSG_CMD_HU_PROTOCOL_VERSION_ALT -> handleProtocolVersion(cmd.body)
             CarLifeMsgType.MSG_CMD_HU_INFO,
             CarLifeMsgType.MSG_CMD_HU_INFO_ALT -> handleHuInfo(cmd.body)
+            CarLifeMsgType.MSG_CMD_HU_STATS_REQUEST -> handleStatsRequest(frame)
             CarLifeMsgType.MSG_CMD_HU_BT_OOB_INFO,
             CarLifeMsgType.MSG_CMD_HU_BT_OOB_INFO_ALT -> handleBtOobInfo()
             CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT,
             CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT_ALT -> handleVideoEncoderInit(cmd.body)
             CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START,
             CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_ALT -> handleVideoEncoderStart(frame.totalFrameBytes)
-            CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_PAUSE -> handleVideoEncoderPause()
-            CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_RESET,
-            CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_RESET_ALT -> handleVideoEncoderReset()
-            CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_FRAME_RATE_CHANGE,
-            CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_FRAME_RATE_CHANGE_ALT -> handleFrameRateChange(cmd.body)
+            CarLifeMsgType.MSG_CMD_AUTHEN_REQUEST_0A ->
+                handleMockAuthBypass(frame, cmd.serviceType, CarLifeMsgType.MSG_CMD_AUTHEN_RESPONSE_0B)
+            CarLifeMsgType.MSG_CMD_AUTHEN_REQUEST_0B ->
+                handleMockAuthBypass(frame, cmd.serviceType, CarLifeMsgType.MSG_CMD_AUTHEN_RESPONSE_0C)
+            CarLifeMsgType.MSG_CMD_AUTHEN_REQUEST_0C ->
+                handleMockAuthBypass(frame, cmd.serviceType, CarLifeMsgType.MSG_CMD_AUTHEN_RESPONSE_0D)
+            CarLifeMsgType.MSG_CMD_AUTHEN_REQUEST_0D ->
+                handleMockAuthBypass(frame, cmd.serviceType, CarLifeMsgType.MSG_CMD_AUTHEN_RESPONSE_0E)
             CarLifeMsgType.MSG_CMD_MODULE_CONTROL,
             CarLifeMsgType.MSG_CMD_MODULE_CONTROL_ALT -> handleModuleControl(frame, cmd.body)
             CarLifeMsgType.MSG_CMD_MODULE_STATUS,
@@ -253,6 +257,10 @@ class CarLifeControlStateMachine(
                     summary = note
                 )
             }
+            CarLifeMsgType.MSG_CMD_HU_RSA_PUBLIC_KEY_REQUEST ->
+                handleMockAuthBypass(frame, cmd.serviceType, CarLifeMsgType.MSG_CMD_HU_RSA_PUBLIC_KEY_RESPONSE)
+            CarLifeMsgType.MSG_CMD_VEHICLE_CERTIFICATE_REQUEST ->
+                handleMockAuthBypass(frame, cmd.serviceType, CarLifeMsgType.MSG_CMD_VEHICLE_CERTIFICATE_RESPONSE)
             CarLifeMsgType.MSG_CMD_HU_AUTHEN_REQUEST,
             CarLifeMsgType.MSG_CMD_HU_AUTHEN_REQUEST_ALT,
             CarLifeMsgType.MSG_CMD_HU_AUTHEN_REQUEST_LEGACY -> handleHuAuthenRequest(frame, cmd.serviceType, cmd.body)
@@ -269,17 +277,7 @@ class CarLifeControlStateMachine(
             CarLifeMsgType.MSG_CMD_FOREGROUND_ALT,
             CarLifeMsgType.MSG_CMD_FOREGROUND_LEGACY -> updateForegroundLifecycle(foreground = true)
             CarLifeMsgType.MSG_CMD_BACKGROUND -> updateForegroundLifecycle(foreground = false)
-            else -> {
-                val msgName = CarLifeMsgType.nameOf(cmd.serviceType)
-                val hex = CarLifeFrameCodec.formatHexPreview(frame, maxPayloadBytes = 256)
-                val note = "RX Control $msgName (${frame.totalFrameBytes}B wire / ${cmd.body.size}B proto) $hex"
-                _sessionState.update { it.copy(lastControlAction = note) }
-                ControlTransitionResult(
-                    updatedState = _sessionState.value,
-                    outboundFrames = emptyList(),
-                    summary = note
-                )
-            }
+            else -> handleUnknownOrAuthCommand(frame, cmd.serviceType)
         }
     }
 
@@ -476,6 +474,81 @@ class CarLifeControlStateMachine(
         )
     }
 
+    private fun handleStatsRequest(frame: CarLifeFrame): ControlTransitionResult {
+        val hex = CarLifeFrameCodec.formatHexPreview(frame, maxPayloadBytes = 256)
+        val replyFrame = CarLifeFrameCodec.createCommandFrame(
+            channel = CarLifeChannel.CONTROL,
+            serviceType = CarLifeMsgType.MSG_CMD_MD_INFO, // 0x00018004
+            commandBody = ByteArray(0)
+        )
+        val summary = "AUTH / STATS_REQ (0x00010004) $hex -> TX Empty Response (0x00018004)"
+        _sessionState.update { it.copy(lastControlAction = summary) }
+        return ControlTransitionResult(
+            updatedState = _sessionState.value,
+            outboundFrames = listOf(replyFrame),
+            summary = summary
+        )
+    }
+
+    private fun handleMockAuthBypass(
+        frame: CarLifeFrame,
+        reqServiceId: Int,
+        respServiceId: Int
+    ): ControlTransitionResult {
+        val hex = CarLifeFrameCodec.formatHexPreview(frame, maxPayloadBytes = 256)
+        val reqHex = "0x${reqServiceId.toUInt().toString(16).uppercase().padStart(8, '0')}"
+        val respHex = "0x${respServiceId.toUInt().toString(16).uppercase().padStart(8, '0')}"
+        val ackProto = byteArrayOf(0x08, 0x01) // status = true / 1
+        val replyFrame = CarLifeFrameCodec.createCommandFrame(
+            channel = CarLifeChannel.CONTROL,
+            serviceType = respServiceId,
+            commandBody = ackProto
+        )
+        val summary = "AUTH / UNKNOWN ($reqHex) $hex -> TX Mock Auth ($respHex [08 01])"
+        _sessionState.update { it.copy(lastControlAction = summary) }
+        return ControlTransitionResult(
+            updatedState = _sessionState.value,
+            outboundFrames = listOf(replyFrame),
+            summary = summary
+        )
+    }
+
+    private fun handleUnknownOrAuthCommand(frame: CarLifeFrame, serviceId: Int): ControlTransitionResult {
+        val hex = CarLifeFrameCodec.formatHexPreview(frame, maxPayloadBytes = 256)
+        val serviceHex = "0x${serviceId.toUInt().toString(16).uppercase().padStart(8, '0')}"
+        val isPassiveTelemetry = serviceId in CarLifeMsgType.MSG_CMD_CAR_VELOCITY..CarLifeMsgType.MSG_CMD_CAR_OIL ||
+            serviceId == CarLifeMsgType.MSG_CMD_STATISTIC_INFO ||
+            serviceId == CarLifeMsgType.MSG_CMD_PAUSE_MEDIA
+        val isHuRequest = ((serviceId ushr 16) == 0x0001) && ((serviceId and 0x8000) == 0) && !isPassiveTelemetry
+
+        val outbound = if (isHuRequest) {
+            val mockReplyId = serviceId or 0x00008000
+            listOf(
+                CarLifeFrameCodec.createCommandFrame(
+                    channel = CarLifeChannel.CONTROL,
+                    serviceType = mockReplyId,
+                    commandBody = byteArrayOf(0x08, 0x01)
+                )
+            )
+        } else {
+            emptyList()
+        }
+
+        val replyNote = if (outbound.isNotEmpty()) {
+            val replyHex = "0x${(serviceId or 0x00008000).toUInt().toString(16).uppercase().padStart(8, '0')}"
+            " -> TX Mock Ack ($replyHex [08 01])"
+        } else {
+            ""
+        }
+        val summary = "AUTH / UNKNOWN ($serviceHex, ${frame.payload.size}B) $hex$replyNote"
+        _sessionState.update { it.copy(lastControlAction = summary) }
+        return ControlTransitionResult(
+            updatedState = _sessionState.value,
+            outboundFrames = outbound,
+            summary = summary
+        )
+    }
+
     private fun handleVideoEncoderInit(body: ByteArray): ControlTransitionResult {
         val requested = CarlifeVideoEncoderInfoProto.decode(body)
         val negotiatedWidth = if (force60FpsOnMqb && requested.width in 480..3840) {
@@ -497,46 +570,27 @@ class CarLifeControlStateMachine(
         )
         val encodedNegotiated = negotiatedProto.encode()
 
-        // 1. MSG_CMD_VIDEO_ENCODER_INIT_DONE (0x00018008)
+        // Step 3: Reply ONLY with MSG_CMD_VIDEO_ENCODER_INIT_DONE (0x00018008) here;
+        // SPS/PPS + IDR streaming begins ONLY after responding to VIDEO_ENCODER_START (0x00010009)!
         val initDoneFrame = CarLifeFrameCodec.createCommandFrame(
             channel = CarLifeChannel.CONTROL,
             serviceType = CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT_DONE, // 0x00018008
             commandBody = encodedNegotiated
         )
-        // 2. MSG_CMD_VIDEO_ENCODER_START_DONE (0x0001800A)
-        val startDoneFrame = CarLifeFrameCodec.createCommandFrame(
-            channel = CarLifeChannel.CONTROL,
-            serviceType = CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_DONE, // 0x0001800A
-            commandBody = ByteArray(0)
-        )
-        // 3. MSG_CMD_FOREGROUND (0x00018025)
-        val foregroundFrame = CarLifeFrameCodec.createCommandFrame(
-            channel = CarLifeChannel.CONTROL,
-            serviceType = CarLifeMsgType.MSG_CMD_FOREGROUND, // 0x00018025
-            commandBody = ByteArray(0)
-        )
-        // 4. MSG_CMD_SCREEN_ON (0x00018018)
-        val screenOnFrame = CarLifeFrameCodec.createCommandFrame(
-            channel = CarLifeChannel.CONTROL,
-            serviceType = CarLifeMsgType.MSG_CMD_SCREEN_ON, // 0x00018018
-            commandBody = ByteArray(0)
-        )
 
-        val summary = "Video Init: ${negotiatedProto.width}x${negotiatedProto.height}@${negotiatedProto.frameRate}fps -> TX INIT_DONE + START_DONE + FOREGROUND + SCREEN_ON"
+        val summary = "Video Init: ${negotiatedProto.width}x${negotiatedProto.height}@${negotiatedProto.frameRate}fps -> TX INIT_DONE (0x00018008), awaiting VIDEO_ENCODER_START"
         _sessionState.update {
             it.copy(
-                phase = CarLifeSessionPhase.VIDEO_STREAMING,
+                phase = CarLifeSessionPhase.VIDEO_INITIALIZED,
                 negotiatedVideoWidth = negotiatedProto.width,
                 negotiatedVideoHeight = negotiatedProto.height,
                 negotiatedFps = negotiatedProto.frameRate,
-                isHuForeground = true,
-                isHuScreenOn = true,
                 lastControlAction = summary
             )
         }
         return ControlTransitionResult(
             updatedState = _sessionState.value,
-            outboundFrames = listOf(initDoneFrame, startDoneFrame, foregroundFrame, screenOnFrame),
+            outboundFrames = listOf(initDoneFrame),
             summary = summary
         )
     }
