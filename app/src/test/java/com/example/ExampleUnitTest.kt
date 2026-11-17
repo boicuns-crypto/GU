@@ -313,14 +313,23 @@ class ExampleUnitTest {
             CarLifeFrameCodec.encodeFrame(audioInitFrames[1])
         )
 
-        // Verify concatenated SPS/PPS + IDR fits into a SINGLE 0x0002 AOA 20B frame
-        val spsPps = byteArrayOf(0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1F, 0x00, 0x00, 0x00, 0x01, 0x68, 0xCE.toByte(), 0x3C, 0x80.toByte())
+        // Verify multi-NAL MediaCodec buffer ([00 00 00 01 SPS][00 00 00 01 PPS][00 00 00 01 IDR])
+        // is split into 3 SEPARATE 0x0002 AOA 20B frames, each with its own 20B header and 00 00 00 01 prefix
+        val sps = byteArrayOf(0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1F)
+        val pps = byteArrayOf(0x00, 0x00, 0x00, 0x01, 0x68, 0xCE.toByte(), 0x3C, 0x80.toByte())
         val idr = byteArrayOf(0x00, 0x00, 0x00, 0x01, 0x65, 0x88.toByte(), 0x84.toByte(), 0x21)
-        val combined = spsPps + idr
-        val combinedFrame = CarLifeFrameCodec.encodeAoAVideoFrame(combined, timestampMs = 500L)
-        val combinedWire = CarLifeFrameCodec.encodeFrame(combinedFrame)
-        assertEquals(20 + combined.size, combinedWire.size)
-        assertArrayEquals(combined, combinedWire.copyOfRange(20, combinedWire.size))
+        val multiNalBuffer = sps + pps + idr
+        val splitFrames = CarLifeFrameCodec.encodeAoAVideoFrames(multiNalBuffer, timestampMs = 500L)
+        assertEquals(3, splitFrames.size)
+        val wire0 = CarLifeFrameCodec.encodeFrame(splitFrames[0])
+        val wire1 = CarLifeFrameCodec.encodeFrame(splitFrames[1])
+        val wire2 = CarLifeFrameCodec.encodeFrame(splitFrames[2])
+        assertEquals(20 + sps.size, wire0.size)
+        assertEquals(20 + pps.size, wire1.size)
+        assertEquals(20 + idr.size, wire2.size)
+        assertArrayEquals(sps, wire0.copyOfRange(20, wire0.size))
+        assertArrayEquals(pps, wire1.copyOfRange(20, wire1.size))
+        assertArrayEquals(idr, wire2.copyOfRange(20, wire2.size))
 
         // Verify AVCC length-prefixed NAL is converted cleanly to Annex-B 00 00 00 01 inside encodeAoAVideoFrame
         val avccIdr = byteArrayOf(0x00, 0x00, 0x00, 0x04, 0x65, 0x88.toByte(), 0x84.toByte(), 0x21)

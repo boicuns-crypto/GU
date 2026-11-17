@@ -932,11 +932,93 @@ object CarLifeFrameCodec {
     }
 
     /**
+     * Parses an H.264 buffer (`h264Buffer`) by Annex-B start codes (`00 00 00 01` or `00 00 01`)
+     * — or length-prefixed AVCC blocks if no Annex-B start codes are present — and splits it into
+     * individual NAL units (`SPS`, `PPS`, `IDR`, `Slice`), each normalized to start strictly with
+     * the 4-byte Annex-B start code `00 00 00 01`.
+     */
+    fun splitAnnexBNalUnits(h264Buffer: ByteArray): List<ByteArray> {
+        if (h264Buffer.isEmpty()) return emptyList()
+
+        val starts = ArrayList<Pair<Int, Int>>(8) // (startCodeOffset, payloadOffset)
+        var i = 0
+        while (i <= h264Buffer.size - 3) {
+            if (h264Buffer[i] == 0x00.toByte() && h264Buffer[i + 1] == 0x00.toByte()) {
+                if (i + 3 < h264Buffer.size &&
+                    h264Buffer[i + 2] == 0x00.toByte() &&
+                    h264Buffer[i + 3] == 0x01.toByte()
+                ) {
+                    starts.add(i to (i + 4))
+                    i += 4
+                    continue
+                } else if (h264Buffer[i + 2] == 0x01.toByte()) {
+                    starts.add(i to (i + 3))
+                    i += 3
+                    continue
+                }
+            }
+            i++
+        }
+
+        if (starts.isNotEmpty()) {
+            val result = ArrayList<ByteArray>(starts.size)
+            for (idx in starts.indices) {
+                val payloadStart = starts[idx].second
+                val payloadEnd = if (idx + 1 < starts.size) starts[idx + 1].first else h264Buffer.size
+                val payloadLen = payloadEnd - payloadStart
+                if (payloadLen <= 0) continue
+                val nal = ByteArray(4 + payloadLen)
+                nal[0] = 0x00
+                nal[1] = 0x00
+                nal[2] = 0x00
+                nal[3] = 0x01
+                System.arraycopy(h264Buffer, payloadStart, nal, 4, payloadLen)
+                result.add(nal)
+            }
+            if (result.isNotEmpty()) return result
+        }
+
+        // Check for one or more concatenated AVCC length-prefixed NALs: [4B len][NAL...]
+        val avccResult = ArrayList<ByteArray>(4)
+        var offset = 0
+        var validAvcc = h264Buffer.size > 4
+        while (offset < h264Buffer.size && validAvcc) {
+            if (offset + 4 >= h264Buffer.size) {
+                validAvcc = false
+                break
+            }
+            val avccLen = ((h264Buffer[offset].toInt() and 0xFF) shl 24) or
+                ((h264Buffer[offset + 1].toInt() and 0xFF) shl 16) or
+                ((h264Buffer[offset + 2].toInt() and 0xFF) shl 8) or
+                (h264Buffer[offset + 3].toInt() and 0xFF)
+            val nalHdr = h264Buffer[offset + 4].toInt() and 0xFF
+            val nalType = nalHdr and 0x1F
+            if (avccLen <= 0 || offset + 4 + avccLen > h264Buffer.size || (nalHdr and 0x80) != 0 || nalType !in 1..12) {
+                validAvcc = false
+                break
+            }
+            val nal = ByteArray(4 + avccLen)
+            nal[0] = 0x00
+            nal[1] = 0x00
+            nal[2] = 0x00
+            nal[3] = 0x01
+            System.arraycopy(h264Buffer, offset + 4, nal, 4, avccLen)
+            avccResult.add(nal)
+            offset += 4 + avccLen
+        }
+        if (validAvcc && offset == h264Buffer.size && avccResult.isNotEmpty()) {
+            return avccResult
+        }
+
+        return listOf(ensureAnnexBStartCode(h264Buffer))
+    }
+
+    /**
      * Canonical Jetta VS7 USB AOA `0x0002` Video frame encoder (`AOA 20B` + `0x00028001` + `Annex-B`):
      * - Outer 8B AOA Header: `[00 00 00 02][len + 12]`
      * - Inner 12B Video Header: `[len][timestampMs][00 02 80 01]`
      * - Payload: `[00 00 00 01 ... (H.264 Annex-B)]`
-     * Used strictly for BOTH `SPS/PPS` and `IDR` / `P-slice` NAL units.
+     * Used strictly for each individual `SPS`, `PPS`, `IDR`, and `P-slice` NAL unit.
      */
     fun encodeAoAVideoFrame(
         h264Data: ByteArray,
@@ -963,6 +1045,30 @@ object CarLifeFrameCodec {
         )
     }
 
+    /**
+     * Splits an arbitrary `MediaCodec` H.264 output buffer (`h264Buffer`) by Annex-B `00 00 00 01`
+     * start codes and wraps **every individual NAL unit** (`SPS`, `PPS`, `IDR`, `Slice`) into its
+     * own separate 20-byte `encodeAoAVideoFrame` packet so hardware decoders like Jetta VS7 never
+     * receive concatenated `SPS+PPS+IDR` frames in a single CarLife packet.
+     */
+    fun encodeAoAVideoFrames(
+        h264Buffer: ByteArray,
+        timestampMs: Long = (android.os.SystemClock.uptimeMillis().takeIf { it > 0L } ?: System.currentTimeMillis()) and 0x7FFF_FFFFL
+    ): List<CarLifeFrame> {
+        val nals = splitAnnexBNalUnits(h264Buffer)
+        if (nals.isEmpty()) return emptyList()
+        return nals.map { singleNal ->
+            encodeAoAVideoFrame(h264Data = singleNal, timestampMs = timestampMs)
+        }
+    }
+
+    /**
+     * Splits `h264Buffer` by Annex-B `00 00 00 01` start codes and returns raw wire packets
+     * (`[Header 20B][00 00 00 01 NAL]`) ready for USB AOA transmission.
+     */
+    fun buildAoAVideoPackets(h264Buffer: ByteArray, timestampMs: Int): List<ByteArray> =
+        encodeAoAVideoFrames(h264Buffer, timestampMs.toLong() and 0x7FFF_FFFFL).map { encodeFrame(it) }
+
     fun createVideoFrame(
         nalData: ByteArray,
         timestampMs: Long = (android.os.SystemClock.uptimeMillis().takeIf { it > 0L } ?: System.currentTimeMillis()) and 0x7FFF_FFFFL,
@@ -983,6 +1089,22 @@ object CarLifeFrameCodec {
                     includeOuterTimestamp = true
                 ),
                 payload = annexBData
+            )
+        }
+    }
+
+    fun createVideoFrames(
+        h264Buffer: ByteArray,
+        timestampMs: Long = (android.os.SystemClock.uptimeMillis().takeIf { it > 0L } ?: System.currentTimeMillis()) and 0x7FFF_FFFFL,
+        nestedVideoMsgHeader: Boolean = useNestedVideoMsgHeader
+    ): List<CarLifeFrame> {
+        val nals = splitAnnexBNalUnits(h264Buffer)
+        if (nals.isEmpty()) return emptyList()
+        return nals.map { singleNal ->
+            createVideoFrame(
+                nalData = singleNal,
+                timestampMs = timestampMs,
+                nestedVideoMsgHeader = nestedVideoMsgHeader
             )
         }
     }

@@ -37,9 +37,11 @@ import com.example.protocol.carlife.CarLifeTouchEventType
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.Executors
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -240,6 +242,9 @@ class BridgeForegroundService : Service() {
 
     private val binder = LocalBinder()
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val videoTxDispatcher = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "CarLifeVideoTxFifo").apply { isDaemon = true }
+    }.asCoroutineDispatcher()
 
     private var wakeLock: PowerManager.WakeLock? = null
 
@@ -455,53 +460,55 @@ class BridgeForegroundService : Service() {
                     return@CockpitProjectionManager
                 }
 
-                // STRICT: Both SPS/PPS and IDR/P-slice frames use encodeAoAVideoFrame() (AOA 20B + 0x00028001 + Annex-B)
-                val pktIndex = videoPacketCounter.incrementAndGet()
-                val videoFrame = CarLifeFrameCodec.encodeAoAVideoFrame(
-                    h264Data = nalBytes,
-                    timestampMs = timestampMs
-                )
-                val nalType = if (nalBytes.size > 4) (nalBytes[4].toInt() and 0x1F) else 0
-                val isIdr = isKeyFrame || nalType == 5
-                val isStandaloneSpsPps = !isIdr && (nalType == 7 || nalType == 8)
-                // Log all SPS/PPS, all IDR keyframes, and every 15th Slice to the dedicated Video Tab (0x0002)
-                val shouldLogToVideoTab = isStandaloneSpsPps || isIdr || pktIndex <= 6L || (pktIndex % 15L == 0L)
-                serviceScope.launch {
+                // Split any multi-NAL MediaCodec buffer by 00 00 00 01 and wrap EACH NAL unit
+                // (SPS, PPS, IDR, Slice) into its own 20B AOA header via encodeAoAVideoFrame().
+                val singleNalUnits = CarLifeFrameCodec.splitAnnexBNalUnits(nalBytes)
+                if (singleNalUnits.isEmpty()) return@CockpitProjectionManager
+
+                serviceScope.launch(videoTxDispatcher) {
                     if (!isVideoChannelReadyForStreaming || usbTransport.state.value !is UsbTransportState.Connected) {
                         return@launch
                     }
-                    val sentOk = if (pktIndex <= 4L || isStandaloneSpsPps || isIdr) {
-                        // Send SPS/PPS and IDR keyframes immediately (chunked by 16,384B)
-                        usbTransport.sendFrameImmediate(videoFrame)
-                    } else {
-                        usbTransport.sendFrame(videoFrame)
-                    }
-                    if (!sentOk) return@launch
+                    for (singleNal in singleNalUnits) {
+                        val nalType = if (singleNal.size > 4) (singleNal[4].toInt() and 0x1F) else 0
+                        val isConfigNal = nalType == 7 || nalType == 8
+                        val isIdr = !isConfigNal && (isKeyFrame || nalType == 5)
+                        val pktIndex = videoPacketCounter.incrementAndGet()
+                        val videoFrame = CarLifeFrameCodec.encodeAoAVideoFrame(
+                            h264Data = singleNal,
+                            timestampMs = timestampMs
+                        )
+                        val sentOk = usbTransport.sendFrameImmediate(videoFrame)
+                        if (!sentOk) return@launch
 
-                    if (shouldLogToVideoTab) {
-                        val nalLabel = when {
-                            isStandaloneSpsPps -> "SPS/PPS (CODEC_CONFIG)"
-                            isIdr -> "IDR KeyFrame #$pktIndex (SPS/PPS+IDR)"
-                            else -> "H.264 Slice #$pktIndex"
+                        // Log all SPS/PPS, all IDR keyframes, and every 15th Slice to the dedicated Video Tab (0x0002)
+                        val shouldLogToVideoTab = isConfigNal || isIdr || pktIndex <= 6L || (pktIndex % 15L == 0L)
+                        if (shouldLogToVideoTab) {
+                            val nalLabel = when (nalType) {
+                                7 -> "SPS #$pktIndex (NAL=7)"
+                                8 -> "PPS #$pktIndex (NAL=8)"
+                                5 -> "IDR KeyFrame #$pktIndex (NAL=5)"
+                                else -> if (isIdr) "IDR KeyFrame #$pktIndex" else "H.264 Slice #$pktIndex"
+                            }
+                            val hdrMode = if (CarLifeFrameCodec.useNestedVideoMsgHeader) "Режим 1: AOA 20B" else "Режим 2: Direct 12B"
+                            BridgeTelemetryBus.recordFrame(
+                                direction = "TX (S26U -> HU)",
+                                frame = videoFrame,
+                                rxBytesTotal = usbTransport.rxBytes,
+                                txBytesTotal = usbTransport.txBytes,
+                                rxFramesTotal = usbTransport.rxFrames,
+                                txFramesTotal = usbTransport.txFrames,
+                                protocolNote = "TX H.264 Video (0x0002 $hdrMode) $nalLabel (${singleNal.size}B, ts=${timestampMs}ms)",
+                                serviceNameOverride = nalLabel
+                            )
+                        } else {
+                            BridgeTelemetryBus.recordVideoFrameCountersOnly(
+                                rxBytesTotal = usbTransport.rxBytes,
+                                txBytesTotal = usbTransport.txBytes,
+                                rxFramesTotal = usbTransport.rxFrames,
+                                txFramesTotal = usbTransport.txFrames
+                            )
                         }
-                        val hdrMode = if (CarLifeFrameCodec.useNestedVideoMsgHeader) "Режим 1: AOA 20B" else "Режим 2: Direct 12B"
-                        BridgeTelemetryBus.recordFrame(
-                            direction = "TX (S26U -> HU)",
-                            frame = videoFrame,
-                            rxBytesTotal = usbTransport.rxBytes,
-                            txBytesTotal = usbTransport.txBytes,
-                            rxFramesTotal = usbTransport.rxFrames,
-                            txFramesTotal = usbTransport.txFrames,
-                            protocolNote = "TX H.264 Video (0x0002 $hdrMode) $nalLabel (${nalBytes.size}B, ts=${timestampMs}ms)",
-                            serviceNameOverride = nalLabel
-                        )
-                    } else {
-                        BridgeTelemetryBus.recordVideoFrameCountersOnly(
-                            rxBytesTotal = usbTransport.rxBytes,
-                            txBytesTotal = usbTransport.txBytes,
-                            rxFramesTotal = usbTransport.rxFrames,
-                            txFramesTotal = usbTransport.txFrames
-                        )
                     }
                 }
             },
@@ -888,6 +895,7 @@ class BridgeForegroundService : Service() {
             )
         }
         serviceScope.cancel()
+        runCatching { videoTxDispatcher.close() }
         super.onDestroy()
     }
 
