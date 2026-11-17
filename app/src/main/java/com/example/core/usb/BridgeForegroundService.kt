@@ -990,10 +990,12 @@ class BridgeForegroundService : Service() {
                     protocolNote = transition.summary
                 )
 
-                // If HU requested video encoder init/start before MD_INFO/Audio-Init ran,
-                // force-send mandatory Audio-Init (0x0003 & 0x0004) BEFORE INIT_DONE/START_DONE/FOREGROUND/SCREEN_ON!
+                // Step 2 (VIDEO_ENCODER_INIT) & fallback guard: send mandatory Audio-Init (0x0003 & 0x0004)
+                // BEFORE INIT_DONE (0x00018008) or START_DONE (0x0001800A).
                 if ((cmd?.serviceType == CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT ||
                         cmd?.serviceType == CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT_ALT ||
+                        cmd?.serviceType == CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_RESET ||
+                        cmd?.serviceType == CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_RESET_ALT ||
                         cmd?.serviceType == CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START ||
                         cmd?.serviceType == CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_ALT) &&
                     !hasSentAudioInitInSession
@@ -1003,7 +1005,6 @@ class BridgeForegroundService : Service() {
 
                 for (reply in transition.outboundFrames) {
                     if (usbTransport.sendFrameImmediate(reply)) {
-                        val replyService = reply.parseCommandMessageOrNull()?.serviceType
                         BridgeTelemetryBus.recordFrame(
                             direction = "TX (S26U -> HU)",
                             frame = reply,
@@ -1013,11 +1014,6 @@ class BridgeForegroundService : Service() {
                             txFramesTotal = usbTransport.txFrames,
                             protocolNote = "Auto-Reply: ${reply.parseCommandMessageOrNull()?.serviceName ?: "Frame"}"
                         )
-                        // Requirement 1: Immediately after MSG_CMD_MD_INFO (0x00018003), send empty 12B Audio-Init
-                        // packets on 0x0003 (Media Audio) & 0x0004 (TTS Audio) BEFORE VIDEO_ENCODER_INIT_DONE/START_DONE/SCREEN_ON
-                        if (replyService == CarLifeMsgType.MSG_CMD_MD_INFO_03 && !hasSentAudioInitInSession) {
-                            sendAudioMultiplexerInitPackets()
-                        }
                     }
                 }
 
@@ -1027,19 +1023,18 @@ class BridgeForegroundService : Service() {
                 when (cmd?.serviceType) {
                     CarLifeMsgType.MSG_CMD_HU_PROTOCOL_VERSION,
                     CarLifeMsgType.MSG_CMD_HU_PROTOCOL_VERSION_ALT -> {
-                        // Lock 0x0002 during handshake and give the HU 1.5s to exchange HU_INFO / Auth / AES / ModuleControl / VIDEO_ENCODER_INIT.
+                        // Strict Step 1: Sent MATCH_STATUS (0x00018002) + MD_INFO (0x00018003).
+                        // Keep 0x0002 locked until HU completes init & sends VIDEO_ENCODER_START (0x00010009).
+                        mdInfoAutoStartJob?.cancel()
+                        mdInfoAutoStartJob = null
                         setVideoStreamingReady(false)
                         hasSentMdInfoInSession = true
-                        scheduleMdInfoAutoStartWatchdog("Auto-Start fallback 1500ms after HU_PROTOCOL_VERSION")
                     }
 
                     CarLifeMsgType.MSG_CMD_HU_INFO,
                     CarLifeMsgType.MSG_CMD_HU_INFO_ALT -> {
                         hasSentMdInfoInSession = true
-                        if (!isVideoChannelReadyForStreaming) {
-                            // Do NOT flood 0x0002 immediately on HU_INFO while Auth/AES/FeatureConfig/VIDEO_ENCODER_INIT are still pending!
-                            scheduleMdInfoAutoStartWatchdog("Auto-Start fallback 1500ms after HU_INFO")
-                        } else {
+                        if (isVideoChannelReadyForStreaming) {
                             projectionManager.requestInstantIdrKeyFrame()
                         }
                     }
@@ -1048,11 +1043,14 @@ class BridgeForegroundService : Service() {
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT_ALT,
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_RESET,
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_RESET_ALT -> {
+                        // Strict Step 2: Audio-Init (0x0003 & 0x0004) + VIDEO_ENCODER_INIT_DONE (0x00018008) sent.
+                        // Warm up MediaCodec (800x480@30fps) so SPS/PPS are cached, but WAIT with 0x0002 locked!
                         mdInfoAutoStartJob?.cancel()
                         mdInfoAutoStartJob = null
                         val targetW = activeWidth.coerceIn(480, 3840)
                         val targetH = activeHeight.coerceIn(272, 2160)
                         controlStateMachine.setPreferredResolution(targetW, targetH)
+                        setVideoStreamingReady(false)
                         resetVideoLogFlags()
                         val projStats = projectionManager.stats.value
                         if (!projStats.isRunning ||
@@ -1066,18 +1064,17 @@ class BridgeForegroundService : Service() {
                                 bitRate = activeBitrateBps
                             )
                         }
-                        setVideoStreamingReady(true)
-                        projectionManager.unlockVideoChannelAndRequestSyncFrame()
                     }
 
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START,
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_ALT -> {
+                        // Strict Step 3: START_DONE (0x0001800A) + FOREGROUND (0x00018025) + SCREEN_ON (0x00018018) sent.
+                        // IMMEDIATELY unlock 0x0002, request SYNC_FRAME from MediaCodec, and stream separate H.264 NALs!
                         mdInfoAutoStartJob?.cancel()
                         mdInfoAutoStartJob = null
                         val targetW = activeWidth.coerceIn(480, 3840)
                         val targetH = activeHeight.coerceIn(272, 2160)
                         controlStateMachine.setPreferredResolution(targetW, targetH)
-                        // Do NOT clear pending videoTxQueue here: VIDEO_ENCODER_INIT may have just queued [SPS][PPS][IDR]!
                         if (!projectionManager.stats.value.isRunning ||
                             projectionManager.stats.value.width != targetW ||
                             projectionManager.stats.value.height != targetH
@@ -1097,63 +1094,15 @@ class BridgeForegroundService : Service() {
                         }
                     }
 
-                    CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_PAUSE,
-                    CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_PAUSE_ALT -> {
+                    CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_PAUSE -> {
                         mdInfoAutoStartJob?.cancel()
                         mdInfoAutoStartJob = null
                         setVideoStreamingReady(false)
                     }
 
-                    CarLifeMsgType.MSG_CMD_HU_AUTHEN_REQUEST,
-                    CarLifeMsgType.MSG_CMD_HU_AUTHEN_REQUEST_ALT,
-                    CarLifeMsgType.MSG_CMD_HU_AUTHEN_REQUEST_LEGACY,
-                    CarLifeMsgType.MSG_CMD_HU_AUTHEN_RESULT,
-                    CarLifeMsgType.MSG_CMD_HU_AUTHEN_RESULT_ALT,
-                    CarLifeMsgType.MSG_CMD_MD_AES_KEY_REQUEST,
-                    CarLifeMsgType.MSG_CMD_MD_AES_KEY_REQUEST_ALT,
-                    CarLifeMsgType.MSG_CMD_HU_AES_KEY_REQUEST,
-                    CarLifeMsgType.MSG_CMD_HU_FEATURE_CONFIG_REQUEST,
-                    CarLifeMsgType.MSG_CMD_MD_FEATURE_CONFIG_REQUEST,
-                    CarLifeMsgType.MSG_CMD_MODULE_CONTROL,
-                    CarLifeMsgType.MSG_CMD_MODULE_CONTROL_ALT,
-                    CarLifeMsgType.MSG_CMD_HU_BT_OOB_INFO,
-                    CarLifeMsgType.MSG_CMD_HU_BT_OOB_INFO_ALT -> {
-                        // Recognized handshake / auth / module negotiation step: keep waiting cleanly for VIDEO_ENCODER_INIT
-                        if (!isVideoChannelReadyForStreaming && hasSentMdInfoInSession) {
-                            scheduleMdInfoAutoStartWatchdog("Auto-Start fallback 1500ms after ${cmd.serviceName}")
-                        }
-                    }
-
-                    CarLifeMsgType.MSG_CMD_MODULE_STATUS,
-                    CarLifeMsgType.MSG_CMD_MODULE_STATUS_ALT,
-                    CarLifeMsgType.MSG_CMD_SCREEN_ON,
-                    CarLifeMsgType.MSG_CMD_SCREEN_OFF,
-                    CarLifeMsgType.MSG_CMD_SCREEN_USER_PRESENT,
-                    CarLifeMsgType.MSG_CMD_FOREGROUND,
-                    CarLifeMsgType.MSG_CMD_FOREGROUND_ALT,
-                    CarLifeMsgType.MSG_CMD_FOREGROUND_LEGACY,
-                    CarLifeMsgType.MSG_CMD_BACKGROUND,
-                    CarLifeMsgType.MSG_CMD_GO_TO_DESKTOP,
-                    CarLifeMsgType.MSG_CMD_GO_TO_FOREGROUND,
-                    CarLifeMsgType.MSG_CMD_STATISTIC_INFO,
-                    CarLifeMsgType.MSG_CMD_CAR_VELOCITY,
-                    CarLifeMsgType.MSG_CMD_CAR_GPS,
-                    CarLifeMsgType.MSG_CMD_CAR_GYROSCOPE,
-                    CarLifeMsgType.MSG_CMD_CAR_ACCELERATION,
-                    CarLifeMsgType.MSG_CMD_CAR_OIL -> {
-                        // Passive status / lifecycle notification from HU: never re-send INIT_DONE/FOREGROUND/SCREEN_ON feedback loops!
-                    }
-
                     else -> {
-                        // Unrecognized control frame / split Payload: 0B poll after MD_INFO:
-                        // Trigger fallback start ONLY if 0x0002 is still locked; never loop INIT_DONE when already streaming.
-                        if (hasSentMdInfoInSession && !isVideoChannelReadyForStreaming) {
-                            mdInfoAutoStartJob?.cancel()
-                            mdInfoAutoStartJob = null
-                            triggerAutoVideoEncoderStart(
-                                "Auto-Start on RX Control Packet (${cmd?.serviceName ?: "Payload:${frame.payload.size}B"})"
-                            )
-                        }
+                        // Strict State Machine: ignore all intermediate/status/unknown commands without racing
+                        // INIT_DONE / START_DONE / FOREGROUND / SCREEN_ON ahead of VIDEO_ENCODER_START (0x00010009).
                     }
                 }
             }

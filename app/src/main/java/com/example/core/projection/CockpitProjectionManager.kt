@@ -198,6 +198,9 @@ class CockpitProjectionManager(
     @Volatile
     private var lastKeyFrameAnnexB: ByteArray? = null
 
+    @Volatile
+    private var lastCodecFrameElapsedMs: Long = 0L
+
     private val activeDownTimeUptimeMs = AtomicLong(0L)
 
     private val _stats = MutableStateFlow(ProjectionPipelineStats())
@@ -775,6 +778,7 @@ class CockpitProjectionManager(
      */
     fun unlockVideoChannelAndRequestSyncFrame() {
         awaitingFirstIdrAfterGateOpen.set(true)
+        lastCodecFrameElapsedMs = SystemClock.elapsedRealtime()
         isVideoChannelReadyForStreaming = true
         mainHandler.post {
             cockpitPresentation?.window?.decorView?.postInvalidate()
@@ -1226,6 +1230,21 @@ class CockpitProjectionManager(
                 val outIndex = codec.dequeueOutputBuffer(bufferInfo, DEQUEUE_TIMEOUT_US)
                 when {
                     outIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> {
+                        val nowElapsed = SystemClock.elapsedRealtime()
+                        if (isVideoChannelReadyForStreaming &&
+                            lastCodecFrameElapsedMs > 0L &&
+                            (nowElapsed - lastCodecFrameElapsedMs) >= 200L &&
+                            (cachedSpsAnnexB != null || cachedPpsAnnexB != null)
+                        ) {
+                            lastCodecFrameElapsedMs = nowElapsed
+                            val keepAliveTs = SystemClock.uptimeMillis() and 0x7FFF_FFFFL
+                            cachedSpsAnnexB?.let { sps ->
+                                onEncodedVideoNal(sps, keepAliveTs, false)
+                            }
+                            cachedPpsAnnexB?.let { pps ->
+                                onEncodedVideoNal(pps, keepAliveTs, false)
+                            }
+                        }
                         delay(2L)
                     }
 
@@ -1313,6 +1332,7 @@ class CockpitProjectionManager(
                             }
 
                             if (containsIdrNal && sliceNals.isNotEmpty()) {
+                                lastCodecFrameElapsedMs = SystemClock.elapsedRealtime()
                                 awaitingFirstIdrAfterGateOpen.set(false)
                                 // Send separate 0x0002 packets in strict order:
                                 // [20B Header][00 00 00 01 SPS], [20B Header][00 00 00 01 PPS], [20B Header][00 00 00 01 IDR]
@@ -1332,6 +1352,7 @@ class CockpitProjectionManager(
                                     }
                                 }
                             } else if (!awaitingFirstIdrAfterGateOpen.get() && sliceNals.isNotEmpty()) {
+                                lastCodecFrameElapsedMs = SystemClock.elapsedRealtime()
                                 // Non-keyframe P-slice(s) emitted individually after the initial SPS -> PPS -> IDR sequence
                                 var sliceBytes = 0L
                                 var sliceCount = 0L
