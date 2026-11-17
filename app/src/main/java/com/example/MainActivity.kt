@@ -1456,7 +1456,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
             }
         }
 
-        // 2. Настройки H.264 видеопотока (разрешение 800x480 / 1024x600 / 1280x720, битрейт 800 кбит/с CBR 30fps, AOA 20B по умолчанию)
+        // 2. Настройки H.264 видеопотока (разрешение 800x480 / 1024x600 / 1280x720, битрейт 1.2 Мбит/с CBR 30fps, Direct 12B по умолчанию)
         item {
             Card(
                 modifier = Modifier.fillMaxWidth(),
@@ -1532,7 +1532,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                     }
 
                     Text(
-                        text = "Битрейт кодека (AVCProfileBaseline CBR, 30fps, 800 кбит/с по умолчанию)",
+                        text = "Битрейт кодека (AVCProfileBaseline CBR, 30fps, I=1s, 1.2 Мбит/с по умолчанию)",
                         style = MaterialTheme.typography.labelMedium,
                         color = TextSecondary
                     )
@@ -1565,7 +1565,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                     }
 
                     Text(
-                        text = "Формат шапки видеоканала 0x0002 (AOA 20B + 0x00028001 + Annex-B по умолчанию)",
+                        text = "Формат шапки видеоканала 0x0002 (Direct 12B + Annex-B по умолчанию)",
                         style = MaterialTheme.typography.labelMedium,
                         color = TextSecondary
                     )
@@ -1638,13 +1638,13 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = "Профиль Jetta VS7 (AOA 20B + Audio Init)",
+                                text = "Профиль Jetta VS7 (Direct 12B + Audio Init)",
                                 style = MaterialTheme.typography.titleMedium,
                                 color = TextPrimary
                             )
                             Spacer(modifier = Modifier.height(2.dp))
                             Text(
-                                text = "Цикл авто-тестера отключён. После MD_INFO (0x00018003) отправляются пустые 12B аудиофреймы (0x0003, 0x0004), далее видео AOA 20B + 0x00028001 + Annex-B.",
+                                text = "После MD_INFO (0x00018003) с задержкой 120мс отправляются аудиофреймы (0x0003, 0x0004), INIT_DONE + START_DONE + FOREGROUND + SCREEN_ON, далее раздельные NAL в Direct 12B.",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = TextSecondary
                             )

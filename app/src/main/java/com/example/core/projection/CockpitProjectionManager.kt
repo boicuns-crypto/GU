@@ -135,7 +135,7 @@ data class ProjectionPipelineStats(
     val height: Int = 480,
     val fps: Int = 30,
     val bitRateMbps: Int = 1,
-    val bitRateKbps: Int = 800,
+    val bitRateKbps: Int = 1200,
     val encodedNalFrames: Long = 0L,
     val encodedBytes: Long = 0L,
     val lastIdrBytes: Int = 0,
@@ -143,7 +143,7 @@ data class ProjectionPipelineStats(
     val injectedTouches: Long = 0L,
     val lastTouchPoint: Pair<Float, Float>? = null,
     val activeCockpitWidget: String = "Лаунчер ГУ CarLife активен",
-    val statusMessage: String = "Лаунчер ГУ готов (800×480 @ 800 кбит/с, CBR 30fps)"
+    val statusMessage: String = "Лаунчер ГУ готов (800×480 @ 1.2 Мбит/с, CBR 30fps)"
 )
 
 /**
@@ -222,7 +222,7 @@ class CockpitProjectionManager(
         width: Int = 800,
         height: Int = 480,
         frameRate: Int = 30,
-        bitRate: Int = 800_000,
+        bitRate: Int = 1_200_000,
         densityDpi: Int = DisplayMetrics.DENSITY_MEDIUM
     ): Boolean = projectionMutex.withLock {
         // Stop only the previous MediaCodec / Surface while preserving any live MediaProjection & VirtualDisplay

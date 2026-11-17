@@ -72,17 +72,14 @@ class ExampleUnitTest {
         val h264Nal = byteArrayOf(0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x2A)
         val timestamp = 0x12345678L
 
-        // Verify AOA 20B (8B AOA + 12B 0x00028001 + Annex-B) is the default framing mode for 0x0002
+        // Verify Direct 12B ([00 00 00 02][nalSize][timestamp] + Annex-B) is the default framing mode for 0x0002
         val defaultFrame = CarLifeFrameCodec.createVideoFrame(
             nalData = h264Nal,
             timestampMs = timestamp
         )
-        assertEquals(8, CarLifeFrameCodec.encodeHeader(defaultFrame.header).size)
-        assertEquals(12 + h264Nal.size, defaultFrame.payload.size)
-        assertArrayEquals(
-            CarLifeFrameCodec.encodeFrame(CarLifeFrameCodec.encodeAoAVideoFrame(h264Nal, timestamp)),
-            CarLifeFrameCodec.encodeFrame(defaultFrame)
-        )
+        assertEquals(12, CarLifeFrameCodec.encodeHeader(defaultFrame.header).size)
+        assertEquals(h264Nal.size, defaultFrame.payload.size)
+        assertArrayEquals(h264Nal, defaultFrame.payload)
 
         // 1. Optional Mode: AOA 20B (8B AOA + 12B 0x00028001)
         val aoa20Frame = CarLifeFrameCodec.createVideoFrame(
@@ -141,34 +138,26 @@ class ExampleUnitTest {
             commandBody = CarlifeVideoEncoderInfoProto(width = 800, height = 480, frameRate = 30).encode()
         )
         val step2 = sm.onControlFrame(videoInitFrame)
-        assertEquals(CarLifeSessionPhase.VIDEO_INITIALIZED, step2.updatedState.phase)
+        assertEquals(CarLifeSessionPhase.VIDEO_STREAMING, step2.updatedState.phase)
         assertEquals(800, step2.updatedState.negotiatedVideoWidth)
         assertEquals(480, step2.updatedState.negotiatedVideoHeight)
         assertEquals(30, step2.updatedState.negotiatedFps)
-        assertEquals(1, step2.outboundFrames.size)
+        assertEquals(4, step2.outboundFrames.size)
         assertEquals(
             CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT_DONE,
             step2.outboundFrames[0].parseCommandMessageOrNull()?.serviceType
         )
-
-        val videoStartFrame = CarLifeFrameCodec.createCommandFrame(
-            channel = CarLifeChannel.CONTROL,
-            serviceType = CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START
-        )
-        val step3 = sm.onControlFrame(videoStartFrame)
-        assertEquals(CarLifeSessionPhase.VIDEO_STREAMING, step3.updatedState.phase)
-        assertEquals(3, step3.outboundFrames.size)
         assertEquals(
             CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_DONE,
-            step3.outboundFrames[0].parseCommandMessageOrNull()?.serviceType
+            step2.outboundFrames[1].parseCommandMessageOrNull()?.serviceType
         )
         assertEquals(
             CarLifeMsgType.MSG_CMD_FOREGROUND,
-            step3.outboundFrames[1].parseCommandMessageOrNull()?.serviceType
+            step2.outboundFrames[2].parseCommandMessageOrNull()?.serviceType
         )
         assertEquals(
             CarLifeMsgType.MSG_CMD_SCREEN_ON,
-            step3.outboundFrames[2].parseCommandMessageOrNull()?.serviceType
+            step2.outboundFrames[3].parseCommandMessageOrNull()?.serviceType
         )
 
         // Verify Module Control, Authen Request, and AES Key Request replies
@@ -317,8 +306,8 @@ class ExampleUnitTest {
         assertEquals(1, profiles.size)
         assertEquals(800, profiles[0].width)
         assertEquals(480, profiles[0].height)
-        assertEquals(800_000, profiles[0].bitrateBps)
-        assertEquals(true, profiles[0].useNestedVideoHeader)
+        assertEquals(1_200_000, profiles[0].bitrateBps)
+        assertEquals(false, profiles[0].useNestedVideoHeader)
         assertEquals(true, profiles[0].forceAudioMultiplexerInit)
 
         val audioInitFrames = CarLifeFrameCodec.createAudioMultiplexerInitFrames()

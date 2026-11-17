@@ -497,27 +497,46 @@ class CarLifeControlStateMachine(
         )
         val encodedNegotiated = negotiatedProto.encode()
 
-        // Strict Step 2: Send ONLY MSG_CMD_VIDEO_ENCODER_INIT_DONE (0x00018008) with 800x480@30fps and WAIT!
-        // Do NOT send FOREGROUND/SCREEN_ON or unlock 0x0002 until MSG_CMD_VIDEO_ENCODER_START (0x00010009) arrives.
+        // 1. MSG_CMD_VIDEO_ENCODER_INIT_DONE (0x00018008)
         val initDoneFrame = CarLifeFrameCodec.createCommandFrame(
             channel = CarLifeChannel.CONTROL,
             serviceType = CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT_DONE, // 0x00018008
             commandBody = encodedNegotiated
         )
+        // 2. MSG_CMD_VIDEO_ENCODER_START_DONE (0x0001800A)
+        val startDoneFrame = CarLifeFrameCodec.createCommandFrame(
+            channel = CarLifeChannel.CONTROL,
+            serviceType = CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_DONE, // 0x0001800A
+            commandBody = ByteArray(0)
+        )
+        // 3. MSG_CMD_FOREGROUND (0x00018025)
+        val foregroundFrame = CarLifeFrameCodec.createCommandFrame(
+            channel = CarLifeChannel.CONTROL,
+            serviceType = CarLifeMsgType.MSG_CMD_FOREGROUND, // 0x00018025
+            commandBody = ByteArray(0)
+        )
+        // 4. MSG_CMD_SCREEN_ON (0x00018018)
+        val screenOnFrame = CarLifeFrameCodec.createCommandFrame(
+            channel = CarLifeChannel.CONTROL,
+            serviceType = CarLifeMsgType.MSG_CMD_SCREEN_ON, // 0x00018018
+            commandBody = ByteArray(0)
+        )
 
-        val summary = "Video Init: ${negotiatedProto.width}x${negotiatedProto.height}@${negotiatedProto.frameRate}fps -> TX INIT_DONE (0x00018008), waiting for VIDEO_ENCODER_START"
+        val summary = "Video Init: ${negotiatedProto.width}x${negotiatedProto.height}@${negotiatedProto.frameRate}fps -> TX INIT_DONE + START_DONE + FOREGROUND + SCREEN_ON"
         _sessionState.update {
             it.copy(
-                phase = CarLifeSessionPhase.VIDEO_INITIALIZED,
+                phase = CarLifeSessionPhase.VIDEO_STREAMING,
                 negotiatedVideoWidth = negotiatedProto.width,
                 negotiatedVideoHeight = negotiatedProto.height,
                 negotiatedFps = negotiatedProto.frameRate,
+                isHuForeground = true,
+                isHuScreenOn = true,
                 lastControlAction = summary
             )
         }
         return ControlTransitionResult(
             updatedState = _sessionState.value,
-            outboundFrames = listOf(initDoneFrame),
+            outboundFrames = listOf(initDoneFrame, startDoneFrame, foregroundFrame, screenOnFrame),
             summary = summary
         )
     }

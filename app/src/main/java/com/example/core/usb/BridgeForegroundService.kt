@@ -87,9 +87,9 @@ data class AutoTestState(
     val isRunning: Boolean = false,
     val currentStep: Int = 0,
     val totalSteps: Int = 0,
-    val activeProfileLabel: String = "800×480 • 800 кбит/с • CBR 30fps • AOA 20B + Audio Init",
-    val statusMessage: String = "Авто-тестер отключён: зафиксирован профиль Jetta VS7 (800×480 • 800 кбит/с • CBR 30fps • AOA 20B + Audio Init)",
-    val matchedProfileLabel: String? = "800×480 • 800 кбит/с • CBR 30fps • AOA 20B + Audio Init",
+    val activeProfileLabel: String = "800×480 • 1.2 Мбит/с • CBR 30fps • Direct 12B + Audio Init",
+    val statusMessage: String = "Авто-тестер отключён: зафиксирован профиль Jetta VS7 (800×480 • 1.2 Мбит/с • CBR 30fps • Direct 12B + Audio Init)",
+    val matchedProfileLabel: String? = "800×480 • 1.2 Мбит/с • CBR 30fps • Direct 12B + Audio Init",
     val audioInitForced: Boolean = true
 )
 
@@ -103,10 +103,10 @@ data class BridgeRuntimeState(
     val controlSession: CarLifeControlSessionState = CarLifeControlSessionState(),
     val projectionStats: ProjectionPipelineStats = ProjectionPipelineStats(),
     val isVideoChannelReadyForStreaming: Boolean = false,
-    val useNestedVideoMsgHeader: Boolean = true,
+    val useNestedVideoMsgHeader: Boolean = false,
     val configuredWidth: Int = 800,
     val configuredHeight: Int = 480,
-    val configuredBitrateBps: Int = 800_000,
+    val configuredBitrateBps: Int = 1_200_000,
     val autoTestState: AutoTestState = AutoTestState(),
     val lastTouchOrKeyEvent: String = "None — Waiting for Touch/Hardkey Channel (0x0006)",
     val rxBytes: Long = 0L,
@@ -283,7 +283,7 @@ class BridgeForegroundService : Service() {
     private var activeHeight: Int = 480
 
     @Volatile
-    private var activeBitrateBps: Int = 800_000
+    private var activeBitrateBps: Int = 1_200_000
 
     @Volatile
     private var hasSentMdInfoInSession: Boolean = false
@@ -418,7 +418,7 @@ class BridgeForegroundService : Service() {
     private fun scheduleMdInfoAutoStartWatchdog(reason: String) {
         mdInfoAutoStartJob?.cancel()
         mdInfoAutoStartJob = serviceScope.launch {
-            kotlinx.coroutines.delay(1_500L)
+            kotlinx.coroutines.delay(120L)
             if (usbTransport.state.value is UsbTransportState.Connected && !isVideoChannelReadyForStreaming) {
                 triggerAutoVideoEncoderStart(reason)
             }
@@ -426,11 +426,11 @@ class BridgeForegroundService : Service() {
     }
 
     /**
-     * Fallback auto-start after `MSG_CMD_MD_INFO (0x00018003)`:
-     * sends mandatory `AUDIO_INIT (0x0003 & 0x0004)` if not yet sent, followed by
-     * `MSG_CMD_VIDEO_ENCODER_INIT_DONE (0x00018008)`, `MSG_CMD_FOREGROUND (0x00018025)`,
-     * and `MSG_CMD_SCREEN_ON (0x00018018)` on channel `0x0001`,
-     * then unlocks `0x0002` and streams separate `[SPS]`, `[PPS]`, `[IDR]` packets (`AOA 20B`).
+     * Auto-start chain triggered ~120ms after `MSG_CMD_MD_INFO (0x00018003)`:
+     * 1. Mandatory `AUDIO_INIT (0x0003 & 0x0004)` with valid `SystemClock.uptimeMillis()` timestamp.
+     * 2. `MSG_CMD_VIDEO_ENCODER_INIT_DONE (0x00018008, 800x480@30fps)` & `MSG_CMD_VIDEO_ENCODER_START_DONE (0x0001800A)`.
+     * 3. `MSG_CMD_FOREGROUND (0x00018025)` & `MSG_CMD_SCREEN_ON (0x00018018)`.
+     * 4. Sets `isVideoChannelReadyForStreaming = true` and requests `SYNC_FRAME` from `MediaCodec`.
      */
     private suspend fun triggerAutoVideoEncoderStart(reason: String) {
         if (usbTransport.state.value !is UsbTransportState.Connected) return
@@ -490,10 +490,10 @@ class BridgeForegroundService : Service() {
         autoTestJob = null
         mdInfoAutoStartJob?.cancel()
 
-        CarLifeFrameCodec.useNestedVideoMsgHeader = true
+        CarLifeFrameCodec.useNestedVideoMsgHeader = false
         activeWidth = 800
         activeHeight = 480
-        activeBitrateBps = 800_000
+        activeBitrateBps = 1_200_000
         forceAudioInitForSession = true
         controlStateMachine.setPreferredResolution(800, 480)
 
@@ -501,18 +501,18 @@ class BridgeForegroundService : Service() {
             current.copy(
                 configuredWidth = 800,
                 configuredHeight = 480,
-                configuredBitrateBps = 800_000,
-                useNestedVideoMsgHeader = true,
+                configuredBitrateBps = 1_200_000,
+                useNestedVideoMsgHeader = false,
                 autoTestState = AutoTestState(
                     isRunning = false,
                     currentStep = 0,
                     totalSteps = 0,
-                    activeProfileLabel = "800×480 • 800 кбит/с • CBR 30fps • AOA 20B + Audio Init",
-                    statusMessage = "Авто-тестер отключён: зафиксирован профиль Jetta VS7 (800×480 • 800 кбит/с • CBR 30fps • AOA 20B + Audio Init)",
-                    matchedProfileLabel = "800×480 • 800 кбит/с • CBR 30fps • AOA 20B + Audio Init",
+                    activeProfileLabel = "800×480 • 1.2 Мбит/с • CBR 30fps • Direct 12B + Audio Init",
+                    statusMessage = "Авто-тестер отключён: зафиксирован профиль Jetta VS7 (800×480 • 1.2 Мбит/с • CBR 30fps • Direct 12B + Audio Init)",
+                    matchedProfileLabel = "800×480 • 1.2 Мбит/с • CBR 30fps • Direct 12B + Audio Init",
                     audioInitForced = true
                 ),
-                lastProtocolEvent = "Locked Jetta VS7 Profile: 800×480 @ 800 kbps CBR 30fps, AOA 20B + Audio Init"
+                lastProtocolEvent = "Locked Jetta VS7 Profile: 800×480 @ 1.2 Mbps CBR 30fps, Direct 12B + Audio Init"
             )
         }
 
@@ -521,7 +521,7 @@ class BridgeForegroundService : Service() {
                 width = 800,
                 height = 480,
                 frameRate = 30,
-                bitRate = 800_000
+                bitRate = 1_200_000
             )
             if (usbTransport.state.value is UsbTransportState.Connected) {
                 sendAudioMultiplexerInitPackets()
@@ -534,8 +534,8 @@ class BridgeForegroundService : Service() {
         createNotificationChannel()
         acquireWakeLock()
 
-        // Hard-locked Jetta VS7 Mode 1: AOA 20B ([8B AOA][12B 0x00028001] + [00 00 00 01 Annex-B])
-        CarLifeFrameCodec.useNestedVideoMsgHeader = true
+        // Default Jetta VS7 Mode 2: Direct 12B ([00 00 00 02][nalSize][ts] + [00 00 00 01 Annex-B])
+        CarLifeFrameCodec.useNestedVideoMsgHeader = false
         isVideoChannelReadyForStreaming = false
 
         usbTransport = UsbAccessoryTransport(
@@ -591,11 +591,11 @@ class BridgeForegroundService : Service() {
                 isServiceRunning = true,
                 wakeLockHeld = wakeLock?.isHeld == true,
                 isVideoChannelReadyForStreaming = false,
-                useNestedVideoMsgHeader = true,
+                useNestedVideoMsgHeader = false,
                 configuredWidth = activeWidth,
                 configuredHeight = activeHeight,
                 configuredBitrateBps = activeBitrateBps,
-                lastProtocolEvent = "BridgeForegroundService active (800×480 @ 800kbps CBR 30fps, AOA 20B; 0x0002 gated until MD_INFO+AudioInit)"
+                lastProtocolEvent = "BridgeForegroundService active (800×480 @ 1.2Mbps CBR 30fps, Direct 12B; 0x0002 gated until MD_INFO+AudioInit)"
             )
         }
 
@@ -1023,18 +1023,22 @@ class BridgeForegroundService : Service() {
                 when (cmd?.serviceType) {
                     CarLifeMsgType.MSG_CMD_HU_PROTOCOL_VERSION,
                     CarLifeMsgType.MSG_CMD_HU_PROTOCOL_VERSION_ALT -> {
-                        // Strict Step 1: Sent MATCH_STATUS (0x00018002) + MD_INFO (0x00018003).
-                        // Keep 0x0002 locked until HU completes init & sends VIDEO_ENCODER_START (0x00010009).
-                        mdInfoAutoStartJob?.cancel()
-                        mdInfoAutoStartJob = null
+                        // Step 1: MATCH_STATUS (0x00018002) + MD_INFO (0x00018003) already sent above.
+                        // Lock 0x0002 for 120ms, then automatically execute:
+                        // AUDIO_INIT (0x0003/0x0004) -> INIT_DONE + START_DONE -> FOREGROUND + SCREEN_ON -> unlock 0x0002 + SYNC_FRAME!
                         setVideoStreamingReady(false)
                         hasSentMdInfoInSession = true
+                        scheduleMdInfoAutoStartWatchdog("Auto-Start 120ms after MSG_CMD_MD_INFO (0x00018003)")
                     }
 
                     CarLifeMsgType.MSG_CMD_HU_INFO,
                     CarLifeMsgType.MSG_CMD_HU_INFO_ALT -> {
                         hasSentMdInfoInSession = true
-                        if (isVideoChannelReadyForStreaming) {
+                        mdInfoAutoStartJob?.cancel()
+                        mdInfoAutoStartJob = null
+                        if (!isVideoChannelReadyForStreaming) {
+                            triggerAutoVideoEncoderStart("Auto-Start after MSG_CMD_HU_INFO")
+                        } else {
                             projectionManager.requestInstantIdrKeyFrame()
                         }
                     }
@@ -1043,14 +1047,11 @@ class BridgeForegroundService : Service() {
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT_ALT,
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_RESET,
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_RESET_ALT -> {
-                        // Strict Step 2: Audio-Init (0x0003 & 0x0004) + VIDEO_ENCODER_INIT_DONE (0x00018008) sent.
-                        // Warm up MediaCodec (800x480@30fps) so SPS/PPS are cached, but WAIT with 0x0002 locked!
                         mdInfoAutoStartJob?.cancel()
                         mdInfoAutoStartJob = null
                         val targetW = activeWidth.coerceIn(480, 3840)
                         val targetH = activeHeight.coerceIn(272, 2160)
                         controlStateMachine.setPreferredResolution(targetW, targetH)
-                        setVideoStreamingReady(false)
                         resetVideoLogFlags()
                         val projStats = projectionManager.stats.value
                         if (!projStats.isRunning ||
@@ -1064,12 +1065,12 @@ class BridgeForegroundService : Service() {
                                 bitRate = activeBitrateBps
                             )
                         }
+                        setVideoStreamingReady(true)
+                        projectionManager.unlockVideoChannelAndRequestSyncFrame()
                     }
 
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START,
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_ALT -> {
-                        // Strict Step 3: START_DONE (0x0001800A) + FOREGROUND (0x00018025) + SCREEN_ON (0x00018018) sent.
-                        // IMMEDIATELY unlock 0x0002, request SYNC_FRAME from MediaCodec, and stream separate H.264 NALs!
                         mdInfoAutoStartJob?.cancel()
                         mdInfoAutoStartJob = null
                         val targetW = activeWidth.coerceIn(480, 3840)
@@ -1100,9 +1101,39 @@ class BridgeForegroundService : Service() {
                         setVideoStreamingReady(false)
                     }
 
+                    CarLifeMsgType.MSG_CMD_MODULE_STATUS,
+                    CarLifeMsgType.MSG_CMD_MODULE_STATUS_ALT,
+                    CarLifeMsgType.MSG_CMD_SCREEN_ON,
+                    CarLifeMsgType.MSG_CMD_SCREEN_OFF,
+                    CarLifeMsgType.MSG_CMD_SCREEN_USER_PRESENT,
+                    CarLifeMsgType.MSG_CMD_FOREGROUND,
+                    CarLifeMsgType.MSG_CMD_FOREGROUND_ALT,
+                    CarLifeMsgType.MSG_CMD_FOREGROUND_LEGACY,
+                    CarLifeMsgType.MSG_CMD_BACKGROUND,
+                    CarLifeMsgType.MSG_CMD_GO_TO_DESKTOP,
+                    CarLifeMsgType.MSG_CMD_GO_TO_FOREGROUND,
+                    CarLifeMsgType.MSG_CMD_STATISTIC_INFO,
+                    CarLifeMsgType.MSG_CMD_CAR_VELOCITY,
+                    CarLifeMsgType.MSG_CMD_CAR_GPS,
+                    CarLifeMsgType.MSG_CMD_CAR_GYROSCOPE,
+                    CarLifeMsgType.MSG_CMD_CAR_ACCELERATION,
+                    CarLifeMsgType.MSG_CMD_CAR_OIL -> {
+                        // Passive notification from HU: if MD_INFO ran and 0x0002 is still locked, let the 120ms auto-start or this trigger unlock it; never loop when already streaming.
+                        if (hasSentMdInfoInSession && !isVideoChannelReadyForStreaming) {
+                            mdInfoAutoStartJob?.cancel()
+                            mdInfoAutoStartJob = null
+                            triggerAutoVideoEncoderStart("Auto-Start on HU ${cmd.serviceName}")
+                        }
+                    }
+
                     else -> {
-                        // Strict State Machine: ignore all intermediate/status/unknown commands without racing
-                        // INIT_DONE / START_DONE / FOREGROUND / SCREEN_ON ahead of VIDEO_ENCODER_START (0x00010009).
+                        if (hasSentMdInfoInSession && !isVideoChannelReadyForStreaming) {
+                            mdInfoAutoStartJob?.cancel()
+                            mdInfoAutoStartJob = null
+                            triggerAutoVideoEncoderStart(
+                                "Auto-Start on RX Control Packet (${cmd?.serviceName ?: "Payload:${frame.payload.size}B"})"
+                            )
+                        }
                     }
                 }
             }
@@ -1347,11 +1378,11 @@ class BridgeForegroundService : Service() {
         val AUTO_TEST_PROFILES: List<AutoTestProfile> = listOf(
             AutoTestProfile(
                 stepNumber = 1,
-                label = "800×480 • 800 кбит/с • CBR 30fps • AOA 20B + Audio Init (0x0003/0x0004)",
+                label = "800×480 • 1.2 Мбит/с • CBR 30fps • Direct 12B + Audio Init (0x0003/0x0004)",
                 width = 800,
                 height = 480,
-                bitrateBps = 800_000,
-                useNestedVideoHeader = true,
+                bitrateBps = 1_200_000,
+                useNestedVideoHeader = false,
                 forceAudioMultiplexerInit = true
             )
         )
@@ -1362,7 +1393,7 @@ class BridgeForegroundService : Service() {
                 putExtra(EXTRA_WIDTH, 800)
                 putExtra(EXTRA_HEIGHT, 480)
                 putExtra(EXTRA_FPS, 30)
-                putExtra(EXTRA_BITRATE, 800_000)
+                putExtra(EXTRA_BITRATE, 1_200_000)
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 context.startForegroundService(intent)
