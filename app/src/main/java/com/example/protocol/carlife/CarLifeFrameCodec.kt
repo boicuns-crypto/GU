@@ -98,6 +98,7 @@ object CarLifeMsgType {
     const val MSG_CMD_MIC_RECORD_RECOG_START = 0x00018021
     const val MSG_CMD_GO_TO_FOREGROUND = 0x00018022
     const val MSG_CMD_MODULE_STATUS = 0x00018023
+    const val MSG_CMD_MODULE_STATUS_ALT = 0x00010023
     const val MSG_CMD_STATISTIC_INFO = 0x00018024
     const val MSG_CMD_FOREGROUND = 0x00018025
     const val MSG_CMD_FOREGROUND_ALT = 0x00010025
@@ -184,7 +185,8 @@ object CarLifeMsgType {
         MSG_CMD_BACKGROUND -> "MSG_CMD_BACKGROUND"
         MSG_CMD_GO_TO_DESKTOP -> "MSG_CMD_GO_TO_DESKTOP"
         MSG_CMD_GO_TO_FOREGROUND -> "MSG_CMD_GO_TO_FOREGROUND"
-        MSG_CMD_MODULE_STATUS -> "MSG_CMD_MODULE_STATUS"
+        MSG_CMD_MODULE_STATUS,
+        MSG_CMD_MODULE_STATUS_ALT -> "MSG_CMD_MODULE_STATUS"
         MSG_CMD_STATISTIC_INFO -> "MSG_CMD_STATISTIC_INFO"
         MSG_CMD_MODULE_CONTROL,
         MSG_CMD_MODULE_CONTROL_ALT -> "MSG_CMD_MODULE_CONTROL"
@@ -968,6 +970,29 @@ object CarLifeFrameCodec {
                 timestamp = timestampMs and 0xFFFF_FFFFL
             ),
             payload = pcmData
+        )
+    }
+
+    /**
+     * Builds empty 12-byte initialization packets (`12B header + empty PCM buffer`) for
+     * `0x0003 (Media Audio)` and `0x0004 (TTS Audio)` to wake up the Jetta VS7 audio multiplexer
+     * on firmwares that block the 90% screen until audio channels are initialized.
+     */
+    fun createAudioMultiplexerInitFrames(
+        timestampMs: Long = (android.os.SystemClock.uptimeMillis().takeIf { it > 0L } ?: System.currentTimeMillis()) and 0x7FFF_FFFFL
+    ): List<CarLifeFrame> {
+        val safeTs = timestampMs and 0x7FFF_FFFFL
+        return listOf(
+            createAudioFrame(
+                audioChannel = CarLifeChannel.MEDIA_AUDIO,
+                pcmData = ByteArray(0),
+                timestampMs = safeTs
+            ),
+            createAudioFrame(
+                audioChannel = CarLifeChannel.TTS_AUDIO,
+                pcmData = ByteArray(0),
+                timestampMs = safeTs + 1L
+            )
         )
     }
 

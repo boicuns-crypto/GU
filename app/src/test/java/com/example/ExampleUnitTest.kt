@@ -279,5 +279,53 @@ class ExampleUnitTest {
             autoStart.outboundFrames[3].parseCommandMessageOrNull()?.serviceType
         )
     }
+
+    @Test
+    fun autoTester_profilesAndAudioMultiplexerInitAndModuleStatus_verifySpec() {
+        val profiles = com.example.core.usb.BridgeForegroundService.AUTO_TEST_PROFILES
+        assertEquals(4, profiles.size)
+
+        assertEquals(800, profiles[0].width)
+        assertEquals(480, profiles[0].height)
+        assertEquals(800_000, profiles[0].bitrateBps)
+        assertEquals(false, profiles[0].useNestedVideoHeader)
+        assertEquals(false, profiles[0].forceAudioMultiplexerInit)
+
+        assertEquals(1024, profiles[1].width)
+        assertEquals(600, profiles[1].height)
+        assertEquals(1_200_000, profiles[1].bitrateBps)
+        assertEquals(false, profiles[1].useNestedVideoHeader)
+        assertEquals(false, profiles[1].forceAudioMultiplexerInit)
+
+        assertEquals(1280, profiles[2].width)
+        assertEquals(720, profiles[2].height)
+        assertEquals(1_800_000, profiles[2].bitrateBps)
+        assertEquals(false, profiles[2].useNestedVideoHeader)
+        assertEquals(false, profiles[2].forceAudioMultiplexerInit)
+
+        assertEquals(800, profiles[3].width)
+        assertEquals(480, profiles[3].height)
+        assertEquals(800_000, profiles[3].bitrateBps)
+        assertEquals(false, profiles[3].useNestedVideoHeader)
+        assertEquals(true, profiles[3].forceAudioMultiplexerInit)
+
+        val audioInitFrames = CarLifeFrameCodec.createAudioMultiplexerInitFrames(timestampMs = 42L)
+        assertEquals(2, audioInitFrames.size)
+        assertEquals(CarLifeChannel.MEDIA_AUDIO, audioInitFrames[0].channel)
+        assertEquals(12, audioInitFrames[0].header.headerSizeBytes)
+        assertEquals(0, audioInitFrames[0].payload.size)
+        assertEquals(CarLifeChannel.TTS_AUDIO, audioInitFrames[1].channel)
+        assertEquals(12, audioInitFrames[1].header.headerSizeBytes)
+        assertEquals(0, audioInitFrames[1].payload.size)
+
+        val sm = CarLifeControlStateMachine()
+        val moduleStatusFrame = CarLifeFrameCodec.createCommandFrame(
+            channel = CarLifeChannel.CONTROL,
+            serviceType = CarLifeMsgType.MSG_CMD_MODULE_STATUS,
+            commandBody = byteArrayOf(0x08, 0x01, 0x10, 0x01)
+        )
+        val transition = sm.onControlFrame(moduleStatusFrame)
+        assertTrue(transition.summary.contains("MODULE_STATUS"))
+    }
 }
 

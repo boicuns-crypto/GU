@@ -38,6 +38,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
@@ -1605,6 +1606,233 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                             onClick = { applyVideoHeaderMode(true) },
                             modifier = Modifier.weight(1f)
                         )
+                    }
+                }
+            }
+        }
+
+        // 2.5 Автоподбор параметров ГУ (Auto-Test & Handshake: Шаги 1–4 с паузой 1.5с)
+        item {
+            val autoTest = state.autoTestState
+            val isMatched = autoTest.matchedProfileLabel != null
+            val badgeBg = when {
+                autoTest.isRunning -> ElectricCyan.copy(alpha = 0.16f)
+                isMatched -> SuccessBadgeBg
+                else -> ObsidianSurfaceHigh
+            }
+            val badgeFg = when {
+                autoTest.isRunning -> ElectricCyan
+                isMatched -> SuccessBadgeFg
+                else -> TextSecondary
+            }
+            val badgeLabel = when {
+                autoTest.isRunning -> "ШАГ ${autoTest.currentStep}/${autoTest.totalSteps}"
+                isMatched -> "НАЙДЕНО ✅"
+                else -> "1.5с / шаг"
+            }
+
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("auto_test_card"),
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(containerColor = ObsidianSurface),
+                border = BorderStroke(
+                    width = 1.dp,
+                    color = when {
+                        autoTest.isRunning -> ElectricCyan
+                        isMatched -> TelemetryEmerald
+                        else -> ObsidianBorder
+                    }
+                )
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Автоподбор параметров ГУ (Auto-Test & Handshake)",
+                                style = MaterialTheme.typography.titleMedium,
+                                color = TextPrimary
+                            )
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Text(
+                                text = "Перебор профилей с паузой 1.5с до ответа ГУ (0x0001 / 0x0006) и принудительным стартом аудио 0x0003/0x0004 на шаге 4",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = TextSecondary
+                            )
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Surface(
+                            color = badgeBg,
+                            shape = RoundedCornerShape(8.dp),
+                            border = BorderStroke(1.dp, if (autoTest.isRunning) ElectricCyan else ObsidianBorder)
+                        ) {
+                            Text(
+                                text = badgeLabel,
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    fontWeight = FontWeight.SemiBold
+                                ),
+                                color = badgeFg,
+                                softWrap = false,
+                                maxLines = 1,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                            )
+                        }
+                    }
+
+                    if (autoTest.isRunning) {
+                        LinearProgressIndicator(
+                            progress = {
+                                (autoTest.currentStep.toFloat() / autoTest.totalSteps.coerceAtLeast(1).toFloat())
+                                    .coerceIn(0.05f, 1f)
+                            },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(6.dp)
+                                .clip(RoundedCornerShape(3.dp)),
+                            color = ElectricCyan,
+                            trackColor = ObsidianSurfaceHigh
+                        )
+                    }
+
+                    // 4-step Auto-Test profile list
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        BridgeForegroundService.AUTO_TEST_PROFILES.forEach { profile ->
+                            val isCurrentStep = autoTest.isRunning && autoTest.currentStep == profile.stepNumber
+                            val isStepMatched = autoTest.matchedProfileLabel == profile.label
+                            val isPassed = autoTest.isRunning && autoTest.currentStep > profile.stepNumber
+                            val stepTint = when {
+                                isStepMatched -> TelemetryEmerald
+                                isCurrentStep -> ElectricCyan
+                                isPassed -> TextMuted
+                                else -> TextSecondary
+                            }
+                            Surface(
+                                color = if (isCurrentStep || isStepMatched) {
+                                    stepTint.copy(alpha = 0.12f)
+                                } else {
+                                    ObsidianBackground
+                                },
+                                shape = RoundedCornerShape(10.dp),
+                                border = BorderStroke(
+                                    1.dp,
+                                    if (isCurrentStep || isStepMatched) stepTint.copy(alpha = 0.65f) else ObsidianBorder
+                                )
+                            ) {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 10.dp, vertical = 7.dp),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text(
+                                        text = "Шаг ${profile.stepNumber}: ${profile.label}",
+                                        style = MaterialTheme.typography.labelSmall.copy(
+                                            fontFamily = JetBrainsMonoFamily,
+                                            fontWeight = if (isCurrentStep || isStepMatched) FontWeight.SemiBold else FontWeight.Normal
+                                        ),
+                                        color = if (isCurrentStep || isStepMatched) TextPrimary else stepTint,
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = when {
+                                            isStepMatched -> "OK"
+                                            isCurrentStep -> "TEST"
+                                            isPassed -> "TIMEOUT"
+                                            profile.forceAudioMultiplexerInit -> "AUDIO+"
+                                            else -> "1.5s"
+                                        },
+                                        style = MaterialTheme.typography.labelSmall.copy(
+                                            fontWeight = FontWeight.Bold
+                                        ),
+                                        color = stepTint,
+                                        softWrap = false,
+                                        maxLines = 1
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    Surface(
+                        color = ObsidianBackground,
+                        shape = RoundedCornerShape(10.dp),
+                        border = BorderStroke(1.dp, ObsidianBorder)
+                    ) {
+                        Text(
+                            text = autoTest.statusMessage,
+                            style = MaterialTheme.typography.labelMedium,
+                            color = when {
+                                isMatched -> TelemetryEmerald
+                                autoTest.isRunning -> ElectricCyan
+                                else -> TextSecondary
+                            },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 12.dp, vertical = 8.dp)
+                        )
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Button(
+                            onClick = {
+                                val actionToSend = if (autoTest.isRunning) {
+                                    BridgeForegroundService.ACTION_STOP_AUTO_TEST
+                                } else {
+                                    BridgeForegroundService.ACTION_START_AUTO_TEST
+                                }
+                                val intent = Intent(context, BridgeForegroundService::class.java).apply {
+                                    action = actionToSend
+                                }
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !autoTest.isRunning) {
+                                    context.startForegroundService(intent)
+                                } else {
+                                    context.startService(intent)
+                                }
+                            },
+                            modifier = Modifier
+                                .weight(1f)
+                                .heightIn(min = 48.dp)
+                                .testTag("start_auto_test_btn"),
+                            shape = RoundedCornerShape(12.dp),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = if (autoTest.isRunning) CoralAlert else ElectricCyan,
+                                contentColor = if (autoTest.isRunning) Color.White else Color(0xFF001D24)
+                            )
+                        ) {
+                            Icon(
+                                imageVector = if (autoTest.isRunning) CockpitIcons.Stop else Icons.Default.Settings,
+                                contentDescription = if (autoTest.isRunning) "Остановить авто-тест" else "Запустить авто-тест",
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = if (autoTest.isRunning) {
+                                    "Остановить авто-тест"
+                                } else {
+                                    "Запустить авто-тест ⚙️"
+                                },
+                                fontWeight = FontWeight.SemiBold,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
                     }
                 }
             }

@@ -242,6 +242,18 @@ class CarLifeControlStateMachine(
             CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_FRAME_RATE_CHANGE_ALT -> handleFrameRateChange(cmd.body)
             CarLifeMsgType.MSG_CMD_MODULE_CONTROL,
             CarLifeMsgType.MSG_CMD_MODULE_CONTROL_ALT -> handleModuleControl(frame, cmd.body)
+            CarLifeMsgType.MSG_CMD_MODULE_STATUS,
+            CarLifeMsgType.MSG_CMD_MODULE_STATUS_ALT -> {
+                val hex = CarLifeFrameCodec.formatHexPreview(frame, maxPayloadBytes = 256)
+                val statusProto = CarlifeModuleStatusProto.decode(cmd.body)
+                val note = "RX MSG_CMD_MODULE_STATUS (module=${statusProto.moduleId}, status=${statusProto.statusId}) $hex"
+                _sessionState.update { it.copy(lastControlAction = note) }
+                ControlTransitionResult(
+                    updatedState = _sessionState.value,
+                    outboundFrames = emptyList(),
+                    summary = note
+                )
+            }
             CarLifeMsgType.MSG_CMD_HU_AUTHEN_REQUEST,
             CarLifeMsgType.MSG_CMD_HU_AUTHEN_REQUEST_ALT,
             CarLifeMsgType.MSG_CMD_HU_AUTHEN_REQUEST_LEGACY -> handleHuAuthenRequest(frame, cmd.serviceType, cmd.body)
