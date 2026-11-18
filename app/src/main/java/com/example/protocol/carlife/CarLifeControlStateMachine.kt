@@ -14,7 +14,7 @@ enum class CarLifeSessionPhase(val label: String) {
     VERSION_MATCHED("Protocol v2.0 Matched"),
     DEVICE_INFO_EXCHANGED("Jetta VS7 HU <-> S26 Ultra MD Info Exchanged"),
     VIDEO_INITIALIZED("Video Encoder Negotiated"),
-    VIDEO_STREAMING("Streaming H.264 @ 60fps"),
+    VIDEO_STREAMING("Streaming H.264 @ 30fps"),
     VIDEO_PAUSED("Video Encoder Paused")
 }
 
@@ -91,7 +91,7 @@ class CarLifeControlStateMachine(
         width: Int = preferredVideoWidth,
         height: Int = preferredVideoHeight,
         fps: Int = 30,
-        reason: String = "Auto-Start 150ms after MD_INFO"
+        reason: String = "Proactive Handshake on 0x00010001"
     ): ControlTransitionResult {
         val safeW = width.coerceIn(480, 3840)
         val safeH = height.coerceIn(272, 2160)

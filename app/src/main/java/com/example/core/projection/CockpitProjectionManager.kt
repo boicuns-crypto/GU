@@ -218,6 +218,31 @@ class CockpitProjectionManager(
 
     private var presentationRefreshJob: Job? = null
 
+    suspend fun ensureProjectionStarted(
+        width: Int = 800,
+        height: Int = 480,
+        frameRate: Int = 30,
+        bitRate: Int = 1_200_000,
+        densityDpi: Int = DisplayMetrics.DENSITY_MEDIUM
+    ): Boolean {
+        val safeWidth = if (width in 480..3840) width else 800
+        val safeHeight = if (height in 272..2160) height else 480
+        val safeFps = if (frameRate in 15..60) frameRate else 30
+        val safeBitRate = bitRate.coerceIn(400_000, 12_000_000)
+
+        val alreadyActive = projectionMutex.withLock {
+            val current = _stats.value
+            isEncoding.get() &&
+                mediaCodec != null &&
+                current.width == safeWidth &&
+                current.height == safeHeight &&
+                current.fps == safeFps &&
+                current.bitRateKbps == (safeBitRate / 1_000)
+        }
+        if (alreadyActive) return true
+        return startProjection(safeWidth, safeHeight, safeFps, safeBitRate, densityDpi)
+    }
+
     suspend fun startProjection(
         width: Int = 800,
         height: Int = 480,
@@ -369,11 +394,11 @@ class CockpitProjectionManager(
                     )
                 }
 
-                // Watchdog: if MediaProjection hasn't pushed any frame within 350ms,
+                // Watchdog: if MediaProjection hasn't pushed any video frame within 350ms,
                 // detach VirtualDisplay from inputSurface and start Canvas Feeder so 90% never hangs!
                 externalScope.launch(Dispatchers.IO) {
                     delay(350L)
-                    if (isEncoding.get() && cachedSpsAnnexB == null && cachedPpsAnnexB == null && lastKeyFrameAnnexB == null) {
+                    if (isEncoding.get() && lastKeyFrameAnnexB == null) {
                         Log.w(TAG, "MediaProjection produced 0 frames in 350ms; activating Canvas Surface Feeder fallback")
                         runCatching { vDisplay?.surface = null }
                         startCanvasFeederLoopIfNeeded(inputSurface, safeWidth, safeHeight, safeFps)
@@ -1243,6 +1268,12 @@ class CockpitProjectionManager(
                             }
                             cachedPpsAnnexB?.let { pps ->
                                 onEncodedVideoNal(pps, keepAliveTs, false)
+                            }
+                            runCatching {
+                                val syncParams = Bundle().apply {
+                                    putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
+                                }
+                                codec.setParameters(syncParams)
                             }
                         }
                         delay(2L)

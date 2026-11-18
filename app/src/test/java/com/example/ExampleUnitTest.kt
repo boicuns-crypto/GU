@@ -427,6 +427,40 @@ class ExampleUnitTest {
         assertArrayEquals(byteArrayOf(0x00, 0x00, 0x00, 0x01), wireBytes.copyOfRange(20, 24))
 
         val sm = CarLifeControlStateMachine()
+        val versionFrame = CarLifeFrameCodec.createCommandFrame(
+            channel = CarLifeChannel.CONTROL,
+            serviceType = CarLifeMsgType.MSG_CMD_HU_PROTOCOL_VERSION,
+            commandBody = CarlifeProtocolVersionProto(2, 0).encode()
+        )
+        val step1 = sm.onControlFrame(versionFrame)
+        assertEquals(2, step1.outboundFrames.size)
+        assertEquals(CarLifeMsgType.MSG_CMD_PROTOCOL_VERSION_MATCH_STATUS, step1.outboundFrames[0].parseCommandMessageOrNull()?.serviceType)
+        assertEquals(CarLifeMsgType.MSG_CMD_MD_INFO_03, step1.outboundFrames[1].parseCommandMessageOrNull()?.serviceType)
+        val proactive = sm.buildAutoVideoEncoderInitAndStartFrames(800, 480, 30, "Proactive Handshake on 0x00010001")
+        assertEquals(CarLifeSessionPhase.VIDEO_STREAMING, proactive.updatedState.phase)
+        assertEquals(4, proactive.outboundFrames.size)
+        assertEquals(CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT_DONE, proactive.outboundFrames[0].parseCommandMessageOrNull()?.serviceType)
+        assertEquals(CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_DONE, proactive.outboundFrames[1].parseCommandMessageOrNull()?.serviceType)
+        assertEquals(CarLifeMsgType.MSG_CMD_FOREGROUND, proactive.outboundFrames[2].parseCommandMessageOrNull()?.serviceType)
+        assertEquals(CarLifeMsgType.MSG_CMD_SCREEN_ON, proactive.outboundFrames[3].parseCommandMessageOrNull()?.serviceType)
+
+        // Verify Direct 12B splits SPS + PPS + IDR into 3 separate 12-byte header frames
+        val direct12Frames = CarLifeFrameCodec.createVideoFrames(
+            h264Buffer = sps + pps + idr,
+            timestampMs = 777L,
+            nestedVideoMsgHeader = false
+        )
+        assertEquals(3, direct12Frames.size)
+        val d0 = CarLifeFrameCodec.encodeFrame(direct12Frames[0])
+        val d1 = CarLifeFrameCodec.encodeFrame(direct12Frames[1])
+        val d2 = CarLifeFrameCodec.encodeFrame(direct12Frames[2])
+        assertEquals(12 + sps.size, d0.size)
+        assertEquals(12 + pps.size, d1.size)
+        assertEquals(12 + idr.size, d2.size)
+        assertArrayEquals(sps, d0.copyOfRange(12, d0.size))
+        assertArrayEquals(pps, d1.copyOfRange(12, d1.size))
+        assertArrayEquals(idr, d2.copyOfRange(12, d2.size))
+
         val moduleStatusFrame = CarLifeFrameCodec.createCommandFrame(
             channel = CarLifeChannel.CONTROL,
             serviceType = CarLifeMsgType.MSG_CMD_MODULE_STATUS,
@@ -436,4 +470,5 @@ class ExampleUnitTest {
         assertTrue(transition.summary.contains("MODULE_STATUS"))
     }
 }
+
 

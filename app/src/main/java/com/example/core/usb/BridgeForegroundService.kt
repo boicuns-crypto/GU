@@ -331,8 +331,9 @@ class BridgeForegroundService : Service() {
 
     /**
      * Wraps a SINGLE H.264 NAL unit (`SPS`, `PPS`, `IDR`, or `P-slice`) normalized to 4-byte
-     * Annex-B `00 00 00 01` into its own 20-byte CarLife `0x0002` video frame (`[20B header][00 00 00 01 NAL]`)
-     * and transmits it over USB AOA. Never merges `SPS`, `PPS`, and `IDR` into a single packet.
+     * Annex-B `00 00 00 01` into its own Direct 12B CarLife `0x0002` video frame
+     * (`[00 00 00 02][nalSize][ts][00 00 00 01 NAL]`) and transmits it over USB AOA.
+     * Never merges `SPS`, `PPS`, and `IDR` into a single packet.
      */
     private suspend fun sendVideoFrame(
         nalBytes: ByteArray,
@@ -415,29 +416,35 @@ class BridgeForegroundService : Service() {
         hasSentAudioInitInSession = true
     }
 
-    private fun scheduleMdInfoAutoStartWatchdog(reason: String) {
-        mdInfoAutoStartJob?.cancel()
-        mdInfoAutoStartJob = serviceScope.launch {
-            kotlinx.coroutines.delay(120L)
-            if (usbTransport.state.value is UsbTransportState.Connected && !isVideoChannelReadyForStreaming) {
-                triggerAutoVideoEncoderStart(reason)
-            }
-        }
-    }
-
     /**
-     * Auto-start chain triggered ~120ms after `MSG_CMD_MD_INFO (0x00018003)`:
-     * 1. Mandatory `AUDIO_INIT (0x0003 & 0x0004)` with valid `SystemClock.uptimeMillis()` timestamp.
-     * 2. `MSG_CMD_VIDEO_ENCODER_INIT_DONE (0x00018008, 800x480@30fps)` & `MSG_CMD_VIDEO_ENCODER_START_DONE (0x0001800A)`.
-     * 3. `MSG_CMD_FOREGROUND (0x00018025)` & `MSG_CMD_SCREEN_ON (0x00018018)`.
-     * 4. Sets `isVideoChannelReadyForStreaming = true` and requests `SYNC_FRAME` from `MediaCodec`.
+     * Proactive Video Start chain fired IMMEDIATELY upon `MSG_CMD_HU_PROTOCOL_VERSION (0x00010001)`
+     * after `MATCH_STATUS (0x00018002)` -> `MD_INFO (0x00018003)` -> `AUDIO_INIT (0x0003 & 0x0004)`:
+     * 5. `MSG_CMD_VIDEO_ENCODER_INIT_DONE (0x00018008, 800x480@30fps)`
+     * 6. `MSG_CMD_VIDEO_ENCODER_START_DONE (0x0001800A)`
+     * 7. `MSG_CMD_FOREGROUND (0x00018025)`
+     * 8. `MSG_CMD_SCREEN_ON (0x00018018)`
+     * 9. Immediately sets `isVideoChannelReadyForStreaming = true`, requests `SYNC_FRAME`, and streams NAL units.
      */
-    private suspend fun triggerAutoVideoEncoderStart(reason: String) {
+    private suspend fun triggerAutoVideoEncoderStart(
+        reason: String,
+        sendAudioInitIfNeeded: Boolean = true
+    ) {
         if (usbTransport.state.value !is UsbTransportState.Connected) return
 
         val targetW = activeWidth.coerceIn(480, 3840)
         val targetH = activeHeight.coerceIn(272, 2160)
         val targetFps = 30
+
+        projectionManager.ensureProjectionStarted(
+            width = targetW,
+            height = targetH,
+            frameRate = targetFps,
+            bitRate = activeBitrateBps
+        )
+
+        if (sendAudioInitIfNeeded && (!hasSentAudioInitInSession || forceAudioInitForSession)) {
+            sendAudioMultiplexerInitPackets()
+        }
 
         controlStateMachine.setPreferredResolution(targetW, targetH)
         val autoTransition = controlStateMachine.buildAutoVideoEncoderInitAndStartFrames(
@@ -446,20 +453,6 @@ class BridgeForegroundService : Service() {
             fps = targetFps,
             reason = reason
         )
-
-        val projStats = projectionManager.stats.value
-        if (!projStats.isRunning || projStats.width != targetW || projStats.height != targetH) {
-            projectionManager.startProjection(
-                width = targetW,
-                height = targetH,
-                frameRate = targetFps,
-                bitRate = activeBitrateBps
-            )
-        }
-
-        if (!hasSentAudioInitInSession || forceAudioInitForSession) {
-            sendAudioMultiplexerInitPackets()
-        }
 
         for (reply in autoTransition.outboundFrames) {
             if (usbTransport.sendFrameImmediate(reply)) {
@@ -470,7 +463,7 @@ class BridgeForegroundService : Service() {
                     txBytesTotal = usbTransport.txBytes,
                     rxFramesTotal = usbTransport.rxFrames,
                     txFramesTotal = usbTransport.txFrames,
-                    protocolNote = "Auto-Start: ${reply.parseCommandMessageOrNull()?.serviceName ?: "Frame"} ($targetW×$targetH@${targetFps}fps)"
+                    protocolNote = "Proactive Handshake: ${reply.parseCommandMessageOrNull()?.serviceName ?: "Frame"} ($targetW×$targetH@${targetFps}fps)"
                 )
             }
         }
@@ -595,7 +588,7 @@ class BridgeForegroundService : Service() {
                 configuredWidth = activeWidth,
                 configuredHeight = activeHeight,
                 configuredBitrateBps = activeBitrateBps,
-                lastProtocolEvent = "BridgeForegroundService active (800×480 @ 1.2Mbps CBR 30fps, Direct 12B; Mock Auth + 0x0002 gated until VIDEO_ENCODER_START)"
+                lastProtocolEvent = "BridgeForegroundService active (800×480 @ 1.2Mbps CBR 30fps, Direct 12B; Proactive Handshake on 0x00010001)"
             )
         }
 
@@ -995,7 +988,15 @@ class BridgeForegroundService : Service() {
                     serviceNameOverride = rxServiceLabel
                 )
 
-                // Send mandatory Audio-Init (0x0003 & 0x0004) BEFORE INIT_DONE/START_DONE if VIDEO_INIT/START arrived early
+                if (cmd?.serviceType == CarLifeMsgType.MSG_CMD_HU_PROTOCOL_VERSION ||
+                    cmd?.serviceType == CarLifeMsgType.MSG_CMD_HU_PROTOCOL_VERSION_ALT
+                ) {
+                    mdInfoAutoStartJob?.cancel()
+                    mdInfoAutoStartJob = null
+                    hasSentAudioInitInSession = false
+                }
+
+                // Send mandatory Audio-Init (0x0003 & 0x0004) BEFORE INIT_DONE/START_DONE if VIDEO_INIT/START arrived without prior Audio-Init
                 if ((cmd?.serviceType == CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT ||
                         cmd?.serviceType == CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT_ALT ||
                         cmd?.serviceType == CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START ||
@@ -1017,8 +1018,7 @@ class BridgeForegroundService : Service() {
                             txFramesTotal = usbTransport.txFrames,
                             protocolNote = "Auto-Reply: ${reply.parseCommandMessageOrNull()?.serviceName ?: "Frame"}"
                         )
-                        // Immediately after MSG_CMD_MD_INFO (0x00018003), send Audio-Init (0x0003 & 0x0004)
-                        // so HU continues into HU_INFO / Auth / VIDEO_ENCODER_INIT without stalling on VERSION_!
+                        // Step 3 & 4: Immediately after MSG_CMD_MD_INFO (0x00018003), send Audio-Init (0x0003 & 0x0004)
                         if (replyService == CarLifeMsgType.MSG_CMD_MD_INFO_03 && !hasSentAudioInitInSession) {
                             sendAudioMultiplexerInitPackets()
                         }
@@ -1030,11 +1030,15 @@ class BridgeForegroundService : Service() {
                 when (cmd?.serviceType) {
                     CarLifeMsgType.MSG_CMD_HU_PROTOCOL_VERSION,
                     CarLifeMsgType.MSG_CMD_HU_PROTOCOL_VERSION_ALT -> {
-                        // Sent MATCH_STATUS + MD_INFO + AUDIO_INIT. Keep 0x0002 locked so auth/RSA/AES is never interrupted!
-                        mdInfoAutoStartJob?.cancel()
-                        mdInfoAutoStartJob = null
-                        setVideoStreamingReady(false)
+                        // Strict 9-step Proactive Handshake for Jetta VS7:
+                        // Already sent: 1) MATCH_STATUS (0x00018002), 2) MD_INFO (0x00018003), 3-4) AUDIO_INIT (0x0003 & 0x0004).
+                        // Immediately fire 5) INIT_DONE (800x480@30fps), 6) START_DONE, 7) FOREGROUND, 8) SCREEN_ON,
+                        // and 9) unlock 0x0002 + SYNC_FRAME + stream individual Annex-B NAL packets!
                         hasSentMdInfoInSession = true
+                        triggerAutoVideoEncoderStart(
+                            reason = "Proactive Handshake on 0x00010001",
+                            sendAudioInitIfNeeded = false
+                        )
                     }
 
                     CarLifeMsgType.MSG_CMD_HU_INFO,
@@ -1047,49 +1051,41 @@ class BridgeForegroundService : Service() {
 
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT,
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT_ALT -> {
-                        // Replied with VIDEO_ENCODER_INIT_DONE (0x00018008). Warm up MediaCodec (800x480@30fps, 1.2Mbps CBR),
-                        // but DO NOT send SPS/PPS or IDR yet — wait until after responding to VIDEO_ENCODER_START (0x00010009)!
+                        // HU explicitly sent VIDEO_ENCODER_INIT after/during handshake: ensure encoder is running
+                        // and keep/unlock 0x0002 streaming with an immediate SYNC_FRAME without stopping active video.
                         mdInfoAutoStartJob?.cancel()
                         mdInfoAutoStartJob = null
                         val targetW = activeWidth.coerceIn(480, 3840)
                         val targetH = activeHeight.coerceIn(272, 2160)
                         controlStateMachine.setPreferredResolution(targetW, targetH)
-                        setVideoStreamingReady(false)
-                        resetVideoLogFlags()
-                        val projStats = projectionManager.stats.value
-                        if (!projStats.isRunning ||
-                            projStats.width != targetW ||
-                            projStats.height != targetH
-                        ) {
-                            projectionManager.startProjection(
-                                width = targetW,
-                                height = targetH,
-                                frameRate = 30,
-                                bitRate = activeBitrateBps
-                            )
+                        projectionManager.ensureProjectionStarted(
+                            width = targetW,
+                            height = targetH,
+                            frameRate = 30,
+                            bitRate = activeBitrateBps
+                        )
+                        if (!isVideoChannelReadyForStreaming) {
+                            resetVideoLogFlags()
+                            setVideoStreamingReady(true)
+                            projectionManager.unlockVideoChannelAndRequestSyncFrame()
+                        } else {
+                            projectionManager.requestInstantIdrKeyFrame()
                         }
                     }
 
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START,
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_ALT -> {
-                        // Already replied above with START_DONE (0x0001800A) + FOREGROUND + SCREEN_ON.
-                        // NOW unlock 0x0002, request SYNC_FRAME, and stream separate SPS -> PPS -> IDR packets!
                         mdInfoAutoStartJob?.cancel()
                         mdInfoAutoStartJob = null
                         val targetW = activeWidth.coerceIn(480, 3840)
                         val targetH = activeHeight.coerceIn(272, 2160)
                         controlStateMachine.setPreferredResolution(targetW, targetH)
-                        if (!projectionManager.stats.value.isRunning ||
-                            projectionManager.stats.value.width != targetW ||
-                            projectionManager.stats.value.height != targetH
-                        ) {
-                            projectionManager.startProjection(
-                                width = targetW,
-                                height = targetH,
-                                frameRate = 30,
-                                bitRate = activeBitrateBps
-                            )
-                        }
+                        projectionManager.ensureProjectionStarted(
+                            width = targetW,
+                            height = targetH,
+                            frameRate = 30,
+                            bitRate = activeBitrateBps
+                        )
                         if (!isVideoChannelReadyForStreaming) {
                             setVideoStreamingReady(true)
                             projectionManager.unlockVideoChannelAndRequestSyncFrame()
