@@ -178,10 +178,9 @@ class CockpitProjectionManager(
     private val isEncoding = AtomicBoolean(false)
 
     /**
-     * Strict gate for channel `0x0002` video streaming:
-     * Remains `false` when `VirtualDisplay` starts or USB AOA connects.
-     * Switched to `true` ONLY after `MSG_CMD_VIDEO_ENCODER_INIT (0x00010007)` is received on `0x0001`
-     * and `MSG_CMD_VIDEO_ENCODER_INIT_DONE (0x00018008)` has been transmitted.
+     * Gate for channel `0x0002` video streaming:
+     * Remains `false` until USB AOA connects and receives `MSG_CMD_HU_PROTOCOL_VERSION (0x00010001)`.
+     * Force-unlocked immediately upon proactive handshake completion (`unlockVideoChannelAndRequestSyncFrame`).
      */
     @Volatile
     var isVideoChannelReadyForStreaming: Boolean = false
@@ -793,8 +792,8 @@ class CockpitProjectionManager(
     }
 
     /**
-     * Unlocked ONLY after `MSG_CMD_VIDEO_ENCODER_INIT (0x00010007)` is received from the Head Unit
-     * and `MSG_CMD_VIDEO_ENCODER_INIT_DONE (0x00018008)` is sent on channel `0x0001`.
+     * Force-unlocked immediately after `MSG_CMD_HU_PROTOCOL_VERSION (0x00010001)` proactive handshake
+     * (and never reverted by late `VIDEO_ENCODER_INIT`).
      *
      * 1. Sets `isVideoChannelReadyForStreaming = true`.
      * 2. Forces `MediaCodec` to generate a fresh sync keyframe (`PARAMETER_KEY_REQUEST_SYNC_FRAME = 0`).

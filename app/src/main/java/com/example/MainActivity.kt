@@ -1954,9 +1954,9 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                     "Режим 2: Direct 12B ([0x0002][nalSize][ts])"
                                 }
                                 val gateStatusLabel = if (state.isVideoChannelReadyForStreaming) {
-                                    "Шлюз 0x0002: ОТКРЫТ (после 0x00010007 -> 0x00018008)"
+                                    "Шлюз 0x0002: ОТКРЫТ (после 0x00010001 -> поток 0x0002 активен)"
                                 } else {
-                                    "Шлюз 0x0002: ЗАКРЫТ (ожидание 0x00010007 от ГУ)"
+                                    "Шлюз 0x0002: ЗАКРЫТ (ожидание 0x00010001 от ГУ)"
                                 }
                                 Surface(
                                     color = ObsidianSurfaceHigh,

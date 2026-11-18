@@ -267,14 +267,18 @@ class BridgeForegroundService : Service() {
     private val videoPacketCounter = java.util.concurrent.atomic.AtomicLong(0L)
 
     /**
-     * Strict gate for channel `0x0002` H.264 streaming:
-     * MUST be `false` on `VirtualDisplay` start and on USB AOA attachment.
-     * Switched to `true` ONLY after `MSG_CMD_VIDEO_ENCODER_INIT (0x00010007)` arrives on `0x0001`
-     * and `MSG_CMD_VIDEO_ENCODER_INIT_DONE (0x00018008)` is transmitted in response.
+     * Gate for channel `0x0002` H.264 streaming:
+     * Starts `false` until USB AOA connects and receives `MSG_CMD_HU_PROTOCOL_VERSION (0x00010001)`.
+     * Forced to `true` immediately inside `triggerAutoVideoEncoderStart()` right after sending
+     * `MD_INFO`, `AUDIO_INIT`, `VIDEO_ENCODER_INIT_DONE`, `START_DONE`, `FOREGROUND`, `SCREEN_ON`,
+     * and never reverted back to `false` within the same USB AOA session.
      */
     @Volatile
     var isVideoChannelReadyForStreaming: Boolean = false
         private set
+
+    @Volatile
+    private var activeHandshakeSessionTimestampMs: Long = -1L
 
     @Volatile
     private var activeWidth: Int = 800
@@ -624,38 +628,77 @@ class BridgeForegroundService : Service() {
         // Observe USB transport state changes
         serviceScope.launch {
             usbTransport.state.collect { newState ->
-                // On any new USB AOA connection or disconnect, lock 0x0002 streaming until 0x0001 handshake + AudioInit complete!
-                mdInfoAutoStartJob?.cancel()
-                mdInfoAutoStartJob = null
-                hasSentMdInfoInSession = false
-                hasSentAudioInitInSession = false
-                setVideoStreamingReady(false)
-                resetVideoLogFlags()
-                if (newState is UsbTransportState.Disconnected || newState is UsbTransportState.Connecting) {
-                    controlStateMachine.reset()
-                    controlStateMachine.setPreferredResolution(activeWidth, activeHeight)
-                }
-                BridgeTelemetryBus.updateState { current ->
-                    current.copy(
-                        transportState = newState,
-                        isVideoChannelReadyForStreaming = false,
-                        rxBytes = usbTransport.rxBytes,
-                        txBytes = usbTransport.txBytes,
-                        rxFrames = usbTransport.rxFrames,
-                        txFrames = usbTransport.txFrames,
-                        lastProtocolEvent = when (newState) {
-                            is UsbTransportState.Connected ->
-                                "AOA Connected: ${newState.accessory.manufacturer} ${newState.accessory.model} (fd=${newState.fdNumber}) — Awaiting 0x0001 Handshake"
-                            is UsbTransportState.Connecting ->
-                                "Opening Direct-IO FileChannel for ${newState.accessory.manufacturer} ${newState.accessory.model}..."
-                            is UsbTransportState.WaitingForPermission ->
-                                "Waiting for USB AOA permission: ${newState.accessory.manufacturer} ${newState.accessory.model}"
-                            is UsbTransportState.Error ->
-                                "AOA Status: ${newState.reason}"
-                            UsbTransportState.Disconnected ->
-                                "USB AOA Disconnected (0x0002 Video Gate Locked)"
+                when (newState) {
+                    is UsbTransportState.Connected -> {
+                        val alreadyHandshakedThisSession =
+                            activeHandshakeSessionTimestampMs == newState.connectedAtEpochMs &&
+                                (isVideoChannelReadyForStreaming || hasSentMdInfoInSession)
+                        if (!alreadyHandshakedThisSession) {
+                            mdInfoAutoStartJob?.cancel()
+                            mdInfoAutoStartJob = null
+                            hasSentMdInfoInSession = false
+                            hasSentAudioInitInSession = false
+                            setVideoStreamingReady(false)
+                            resetVideoLogFlags()
                         }
-                    )
+                        BridgeTelemetryBus.updateState { current ->
+                            current.copy(
+                                transportState = newState,
+                                isVideoChannelReadyForStreaming = if (alreadyHandshakedThisSession) {
+                                    isVideoChannelReadyForStreaming
+                                } else {
+                                    false
+                                },
+                                rxBytes = usbTransport.rxBytes,
+                                txBytes = usbTransport.txBytes,
+                                rxFrames = usbTransport.rxFrames,
+                                txFrames = usbTransport.txFrames,
+                                lastProtocolEvent = if (alreadyHandshakedThisSession) {
+                                    current.lastProtocolEvent
+                                } else {
+                                    "AOA Connected: ${newState.accessory.manufacturer} ${newState.accessory.model} (fd=${newState.fdNumber}) — Awaiting 0x00010001"
+                                }
+                            )
+                        }
+                    }
+
+                    is UsbTransportState.Connecting,
+                    is UsbTransportState.WaitingForPermission,
+                    is UsbTransportState.Error,
+                    UsbTransportState.Disconnected -> {
+                        mdInfoAutoStartJob?.cancel()
+                        mdInfoAutoStartJob = null
+                        activeHandshakeSessionTimestampMs = -1L
+                        hasSentMdInfoInSession = false
+                        hasSentAudioInitInSession = false
+                        setVideoStreamingReady(false)
+                        resetVideoLogFlags()
+                        if (newState is UsbTransportState.Disconnected || newState is UsbTransportState.Connecting) {
+                            controlStateMachine.reset()
+                            controlStateMachine.setPreferredResolution(activeWidth, activeHeight)
+                        }
+                        BridgeTelemetryBus.updateState { current ->
+                            current.copy(
+                                transportState = newState,
+                                isVideoChannelReadyForStreaming = false,
+                                rxBytes = usbTransport.rxBytes,
+                                txBytes = usbTransport.txBytes,
+                                rxFrames = usbTransport.rxFrames,
+                                txFrames = usbTransport.txFrames,
+                                lastProtocolEvent = when (newState) {
+                                    is UsbTransportState.Connecting ->
+                                        "Opening Direct-IO FileChannel for ${newState.accessory.manufacturer} ${newState.accessory.model}..."
+                                    is UsbTransportState.WaitingForPermission ->
+                                        "Waiting for USB AOA permission: ${newState.accessory.manufacturer} ${newState.accessory.model}"
+                                    is UsbTransportState.Error ->
+                                        "AOA Status: ${newState.reason}"
+                                    UsbTransportState.Disconnected ->
+                                        "USB AOA Disconnected (0x0002 Video Gate Locked)"
+                                    is UsbTransportState.Connected -> current.lastProtocolEvent
+                                }
+                            )
+                        }
+                    }
                 }
                 updateForegroundNotification(newState)
             }
@@ -726,20 +769,23 @@ class BridgeForegroundService : Service() {
                     val targetFps = 30
                     val wasHandshakeReady = (usbTransport.state.value is UsbTransportState.Connected) &&
                         (isVideoChannelReadyForStreaming ||
+                            hasSentMdInfoInSession ||
                             controlStateMachine.sessionState.value.phase == com.example.protocol.carlife.CarLifeSessionPhase.VIDEO_STREAMING)
                     if (!wasHandshakeReady) {
                         setVideoStreamingReady(false)
                     }
                     serviceScope.launch {
                         resetVideoLogFlags()
-                        projectionManager.setVideoChannelReady(wasHandshakeReady)
+                        val effectiveReady = wasHandshakeReady || isVideoChannelReadyForStreaming || hasSentMdInfoInSession
+                        projectionManager.setVideoChannelReady(effectiveReady)
                         projectionManager.startProjection(
                             width = targetW,
                             height = targetH,
                             frameRate = targetFps,
                             bitRate = activeBitrateBps
                         )
-                        if (wasHandshakeReady) {
+                        if (effectiveReady || isVideoChannelReadyForStreaming || hasSentMdInfoInSession) {
+                            setVideoStreamingReady(true)
                             projectionManager.unlockVideoChannelAndRequestSyncFrame()
                         }
                     }
@@ -801,6 +847,7 @@ class BridgeForegroundService : Service() {
                 controlStateMachine.setPreferredResolution(width, height)
                 val wasHandshakeReady = (usbTransport.state.value is UsbTransportState.Connected) &&
                     (isVideoChannelReadyForStreaming ||
+                        hasSentMdInfoInSession ||
                         controlStateMachine.sessionState.value.phase == com.example.protocol.carlife.CarLifeSessionPhase.VIDEO_STREAMING)
                 if (!wasHandshakeReady) {
                     setVideoStreamingReady(false)
@@ -813,15 +860,19 @@ class BridgeForegroundService : Service() {
                     )
                 }
                 serviceScope.launch {
-                    resetVideoLogFlags()
-                    projectionManager.setVideoChannelReady(wasHandshakeReady)
-                    projectionManager.startProjection(
+                    val effectiveReadyBeforeStart = wasHandshakeReady || isVideoChannelReadyForStreaming || hasSentMdInfoInSession
+                    if (!effectiveReadyBeforeStart) {
+                        resetVideoLogFlags()
+                    }
+                    projectionManager.setVideoChannelReady(effectiveReadyBeforeStart)
+                    projectionManager.ensureProjectionStarted(
                         width = width,
                         height = height,
                         frameRate = fps,
                         bitRate = bitrate
                     )
-                    if (wasHandshakeReady) {
+                    if (effectiveReadyBeforeStart || isVideoChannelReadyForStreaming || hasSentMdInfoInSession) {
+                        setVideoStreamingReady(true)
                         projectionManager.unlockVideoChannelAndRequestSyncFrame()
                     }
                 }
@@ -1033,12 +1084,16 @@ class BridgeForegroundService : Service() {
                         // Strict 9-step Proactive Handshake for Jetta VS7:
                         // Already sent: 1) MATCH_STATUS (0x00018002), 2) MD_INFO (0x00018003), 3-4) AUDIO_INIT (0x0003 & 0x0004).
                         // Immediately fire 5) INIT_DONE (800x480@30fps), 6) START_DONE, 7) FOREGROUND, 8) SCREEN_ON,
-                        // and 9) unlock 0x0002 + SYNC_FRAME + stream individual Annex-B NAL packets!
+                        // and 9) force-unlock 0x0002 + SYNC_FRAME + stream individual Annex-B NAL packets!
+                        val connectedState = usbTransport.state.value as? UsbTransportState.Connected
+                        activeHandshakeSessionTimestampMs = connectedState?.connectedAtEpochMs ?: System.currentTimeMillis()
                         hasSentMdInfoInSession = true
                         triggerAutoVideoEncoderStart(
                             reason = "Proactive Handshake on 0x00010001",
                             sendAudioInitIfNeeded = false
                         )
+                        setVideoStreamingReady(true)
+                        projectionManager.unlockVideoChannelAndRequestSyncFrame()
                     }
 
                     CarLifeMsgType.MSG_CMD_HU_INFO,
