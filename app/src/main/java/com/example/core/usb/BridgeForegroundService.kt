@@ -35,6 +35,7 @@ import com.example.protocol.carlife.CarLifeInputEvent
 import com.example.protocol.carlife.CarLifeMsgType
 import com.example.protocol.carlife.CarLifeTouchDecoder
 import com.example.protocol.carlife.CarLifeTouchEventType
+import com.example.protocol.carlife.HandshakeTestProfile
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -104,6 +105,7 @@ data class BridgeRuntimeState(
     val projectionStats: ProjectionPipelineStats = ProjectionPipelineStats(),
     val isVideoChannelReadyForStreaming: Boolean = false,
     val useNestedVideoMsgHeader: Boolean = false,
+    val handshakeTestProfile: HandshakeTestProfile = HandshakeTestProfile.TEST_1_MATCH_ONLY,
     val configuredWidth: Int = 800,
     val configuredHeight: Int = 480,
     val configuredBitrateBps: Int = 1_200_000,
@@ -130,6 +132,15 @@ object BridgeTelemetryBus {
 
     private var logSequence = 0L
 
+    fun setHandshakeTestProfile(profile: HandshakeTestProfile) {
+        _runtimeState.update {
+            it.copy(
+                handshakeTestProfile = profile,
+                lastProtocolEvent = "Профиль 0x00010001 выбран: ${profile.shortTitle}"
+            )
+        }
+    }
+
     fun updateState(transform: (BridgeRuntimeState) -> BridgeRuntimeState) {
         _runtimeState.update(transform)
     }
@@ -150,7 +161,11 @@ object BridgeTelemetryBus {
         val isAoA20BVideo = isVideo && !frame.header.includeOuterTimestamp && frame.payload.size >= 12
         val effectiveHeaderBytes = if (isAoA20BVideo) 20 else frame.header.headerSizeBytes
         val effectivePayloadBytes = if (isAoA20BVideo) (frame.payload.size - 12) else frame.payload.size
-        val hexMaxBytes = if (!isVideo || direction.startsWith("RX")) 256 else 24
+        val hexMaxBytes = when {
+            direction.startsWith("RX") -> Int.MAX_VALUE
+            !isVideo -> frame.payload.size.coerceAtLeast(16)
+            else -> 24
+        }
 
         val entry = PacketLogEntry(
             id = ++logSequence,
@@ -306,7 +321,6 @@ class BridgeForegroundService : Service() {
     @Volatile
     private var lastVideoTxElapsedMs: Long = 0L
 
-    private var mdInfoAutoStartJob: kotlinx.coroutines.Job? = null
     private var autoTestJob: kotlinx.coroutines.Job? = null
 
     private fun clearPendingVideoTxQueue() {
@@ -431,7 +445,8 @@ class BridgeForegroundService : Service() {
      */
     private suspend fun triggerAutoVideoEncoderStart(
         reason: String,
-        sendAudioInitIfNeeded: Boolean = true
+        sendAudioInitIfNeeded: Boolean = true,
+        includeForegroundAndScreenOn: Boolean = true
     ) {
         if (usbTransport.state.value !is UsbTransportState.Connected) return
 
@@ -455,7 +470,8 @@ class BridgeForegroundService : Service() {
             width = targetW,
             height = targetH,
             fps = targetFps,
-            reason = reason
+            reason = reason,
+            includeForegroundAndScreenOn = includeForegroundAndScreenOn
         )
 
         for (reply in autoTransition.outboundFrames) {
@@ -485,7 +501,6 @@ class BridgeForegroundService : Service() {
     private fun startAutoTestCycle() {
         autoTestJob?.cancel()
         autoTestJob = null
-        mdInfoAutoStartJob?.cancel()
 
         CarLifeFrameCodec.useNestedVideoMsgHeader = false
         activeWidth = 800
@@ -634,8 +649,6 @@ class BridgeForegroundService : Service() {
                             activeHandshakeSessionTimestampMs == newState.connectedAtEpochMs &&
                                 (isVideoChannelReadyForStreaming || hasSentMdInfoInSession)
                         if (!alreadyHandshakedThisSession) {
-                            mdInfoAutoStartJob?.cancel()
-                            mdInfoAutoStartJob = null
                             hasSentMdInfoInSession = false
                             hasSentAudioInitInSession = false
                             setVideoStreamingReady(false)
@@ -666,8 +679,6 @@ class BridgeForegroundService : Service() {
                     is UsbTransportState.WaitingForPermission,
                     is UsbTransportState.Error,
                     UsbTransportState.Disconnected -> {
-                        mdInfoAutoStartJob?.cancel()
-                        mdInfoAutoStartJob = null
                         activeHandshakeSessionTimestampMs = -1L
                         hasSentMdInfoInSession = false
                         hasSentAudioInitInSession = false
@@ -830,7 +841,12 @@ class BridgeForegroundService : Service() {
                             bitRate = bitrate
                         )
                         if (wasReady && usbTransport.state.value is UsbTransportState.Connected) {
-                            triggerAutoVideoEncoderStart("Resolution/Bitrate Updated (${width}×${height})")
+                            val includeScreen = BridgeTelemetryBus.runtimeState.value.handshakeTestProfile !=
+                                HandshakeTestProfile.TEST_4_AUDIO_VIDEO_NO_SCREEN
+                            triggerAutoVideoEncoderStart(
+                                reason = "Resolution/Bitrate Updated (${width}×${height})",
+                                includeForegroundAndScreenOn = includeScreen
+                            )
                         }
                     }
                 }
@@ -963,6 +979,16 @@ class BridgeForegroundService : Service() {
                 }
             }
 
+            ACTION_SET_HANDSHAKE_PROFILE -> {
+                val profileId = intent.getIntExtra(
+                    EXTRA_HANDSHAKE_PROFILE_ID,
+                    HandshakeTestProfile.TEST_1_MATCH_ONLY.id
+                )
+                val profile = HandshakeTestProfile.fromId(profileId)
+                controlStateMachine.handshakeTestProfile = profile
+                BridgeTelemetryBus.setHandshakeTestProfile(profile)
+            }
+
             ACTION_START_AUTO_TEST -> {
                 startAutoTestCycle()
             }
@@ -1022,6 +1048,8 @@ class BridgeForegroundService : Service() {
     private suspend fun handleIncomingCarLifeFrame(frame: CarLifeFrame) {
         when (frame.channel) {
             CarLifeChannel.CONTROL -> {
+                val activeProfile = BridgeTelemetryBus.runtimeState.value.handshakeTestProfile
+                controlStateMachine.handshakeTestProfile = activeProfile
                 val cmd = frame.parseCommandMessageOrNull()
                 val transition = controlStateMachine.onControlFrame(frame)
                 val rxServiceLabel = when {
@@ -1042,12 +1070,10 @@ class BridgeForegroundService : Service() {
                 if (cmd?.serviceType == CarLifeMsgType.MSG_CMD_HU_PROTOCOL_VERSION ||
                     cmd?.serviceType == CarLifeMsgType.MSG_CMD_HU_PROTOCOL_VERSION_ALT
                 ) {
-                    mdInfoAutoStartJob?.cancel()
-                    mdInfoAutoStartJob = null
                     hasSentAudioInitInSession = false
                 }
 
-                // Send mandatory Audio-Init (0x0003 & 0x0004) BEFORE INIT_DONE/START_DONE if VIDEO_INIT/START arrived without prior Audio-Init
+                // Send mandatory Audio-Init (0x0003 & 0x0004) BEFORE INIT_DONE/START_DONE if HU explicitly sent VIDEO_INIT/START
                 if ((cmd?.serviceType == CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT ||
                         cmd?.serviceType == CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT_ALT ||
                         cmd?.serviceType == CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START ||
@@ -1069,8 +1095,11 @@ class BridgeForegroundService : Service() {
                             txFramesTotal = usbTransport.txFrames,
                             protocolNote = "Auto-Reply: ${reply.parseCommandMessageOrNull()?.serviceName ?: "Frame"}"
                         )
-                        // Step 3 & 4: Immediately after MSG_CMD_MD_INFO (0x00018003), send Audio-Init (0x0003 & 0x0004)
-                        if (replyService == CarLifeMsgType.MSG_CMD_MD_INFO_03 && !hasSentAudioInitInSession) {
+                        // Strictly send Audio-Init after MD_INFO ONLY in Test 4 (Tests 1-3 omit Audio-Init cleanly)
+                        if (replyService == CarLifeMsgType.MSG_CMD_MD_INFO_03 &&
+                            !hasSentAudioInitInSession &&
+                            activeProfile == HandshakeTestProfile.TEST_4_AUDIO_VIDEO_NO_SCREEN
+                        ) {
                             sendAudioMultiplexerInitPackets()
                         }
                     }
@@ -1081,19 +1110,22 @@ class BridgeForegroundService : Service() {
                 when (cmd?.serviceType) {
                     CarLifeMsgType.MSG_CMD_HU_PROTOCOL_VERSION,
                     CarLifeMsgType.MSG_CMD_HU_PROTOCOL_VERSION_ALT -> {
-                        // Strict 9-step Proactive Handshake for Jetta VS7:
-                        // Already sent: 1) MATCH_STATUS (0x00018002), 2) MD_INFO (0x00018003), 3-4) AUDIO_INIT (0x0003 & 0x0004).
-                        // Immediately fire 5) INIT_DONE (800x480@30fps), 6) START_DONE, 7) FOREGROUND, 8) SCREEN_ON,
-                        // and 9) force-unlock 0x0002 + SYNC_FRAME + stream individual Annex-B NAL packets!
                         val connectedState = usbTransport.state.value as? UsbTransportState.Connected
                         activeHandshakeSessionTimestampMs = connectedState?.connectedAtEpochMs ?: System.currentTimeMillis()
-                        hasSentMdInfoInSession = true
-                        triggerAutoVideoEncoderStart(
-                            reason = "Proactive Handshake on 0x00010001",
-                            sendAudioInitIfNeeded = false
-                        )
-                        setVideoStreamingReady(true)
-                        projectionManager.unlockVideoChannelAndRequestSyncFrame()
+                        if (activeProfile == HandshakeTestProfile.TEST_4_AUDIO_VIDEO_NO_SCREEN) {
+                            hasSentMdInfoInSession = true
+                            triggerAutoVideoEncoderStart(
+                                reason = "Тест 4: Audio + Video Init (без FG/ScreenOn)",
+                                sendAudioInitIfNeeded = false,
+                                includeForegroundAndScreenOn = false
+                            )
+                            setVideoStreamingReady(true)
+                            projectionManager.unlockVideoChannelAndRequestSyncFrame()
+                        } else {
+                            // Tests 1-3: strictly wait for the next RX packet from the Head Unit without Audio, Video, FG, or ScreenOn.
+                            hasSentMdInfoInSession = false
+                            setVideoStreamingReady(false)
+                        }
                     }
 
                     CarLifeMsgType.MSG_CMD_HU_INFO,
@@ -1108,8 +1140,6 @@ class BridgeForegroundService : Service() {
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT_ALT -> {
                         // HU explicitly sent VIDEO_ENCODER_INIT after/during handshake: ensure encoder is running
                         // and keep/unlock 0x0002 streaming with an immediate SYNC_FRAME without stopping active video.
-                        mdInfoAutoStartJob?.cancel()
-                        mdInfoAutoStartJob = null
                         val targetW = activeWidth.coerceIn(480, 3840)
                         val targetH = activeHeight.coerceIn(272, 2160)
                         controlStateMachine.setPreferredResolution(targetW, targetH)
@@ -1130,8 +1160,6 @@ class BridgeForegroundService : Service() {
 
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START,
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_ALT -> {
-                        mdInfoAutoStartJob?.cancel()
-                        mdInfoAutoStartJob = null
                         val targetW = activeWidth.coerceIn(480, 3840)
                         val targetH = activeHeight.coerceIn(272, 2160)
                         controlStateMachine.setPreferredResolution(targetW, targetH)
@@ -1402,6 +1430,7 @@ class BridgeForegroundService : Service() {
         const val ACTION_SEND_VERSION_MATCH = "com.example.core.usb.action.SEND_VERSION_MATCH"
         const val ACTION_SEND_VIDEO_HEARTBEAT = "com.example.core.usb.action.SEND_VIDEO_HEARTBEAT"
         const val ACTION_TOGGLE_VIDEO_HEADER_MODE = "com.example.core.usb.action.TOGGLE_VIDEO_HEADER_MODE"
+        const val ACTION_SET_HANDSHAKE_PROFILE = "com.example.core.usb.action.SET_HANDSHAKE_PROFILE"
         const val ACTION_START_AUTO_TEST = "com.example.core.usb.action.START_AUTO_TEST"
         const val ACTION_STOP_AUTO_TEST = "com.example.core.usb.action.STOP_AUTO_TEST"
         const val ACTION_DISCONNECT_STOP = "com.example.core.usb.action.DISCONNECT_STOP"
@@ -1415,6 +1444,7 @@ class BridgeForegroundService : Service() {
         const val EXTRA_TOUCH_X = "extra_touch_x"
         const val EXTRA_TOUCH_Y = "extra_touch_y"
         const val EXTRA_USE_NESTED_VIDEO_HEADER = "extra_use_nested_video_header"
+        const val EXTRA_HANDSHAKE_PROFILE_ID = "extra_handshake_profile_id"
 
         const val AUTO_TEST_STEP_TIMEOUT_MS = 1_500L
         const val AUTO_TEST_STEP_POLL_MS = 50L

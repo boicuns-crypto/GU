@@ -13,12 +13,15 @@ import com.example.protocol.carlife.CarLifeMsgType
 import com.example.protocol.carlife.CarLifeSessionPhase
 import com.example.protocol.carlife.CarLifeTouchDecoder
 import com.example.protocol.carlife.CarLifeTouchEventType
+import com.example.protocol.carlife.CarlifeDeviceInfoProto
 import com.example.protocol.carlife.CarlifeProtocolVersionProto
 import com.example.protocol.carlife.CarlifeVideoEncoderInfoProto
+import com.example.protocol.carlife.HandshakeTestProfile
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -121,7 +124,10 @@ class ExampleUnitTest {
 
     @Test
     fun controlStateMachine_negotiatesVersionAndVideoWithJettaVs7() {
-        val sm = CarLifeControlStateMachine(force60FpsOnMqb = false)
+        val sm = CarLifeControlStateMachine(
+            force60FpsOnMqb = false,
+            handshakeTestProfile = HandshakeTestProfile.TEST_4_AUDIO_VIDEO_NO_SCREEN
+        )
 
         val versionFrame = CarLifeFrameCodec.createCommandFrame(
             channel = CarLifeChannel.CONTROL,
@@ -426,7 +432,9 @@ class ExampleUnitTest {
         // Annex-B start code at bytes [20..23]
         assertArrayEquals(byteArrayOf(0x00, 0x00, 0x00, 0x01), wireBytes.copyOfRange(20, 24))
 
-        val sm = CarLifeControlStateMachine()
+        val sm = CarLifeControlStateMachine(
+            handshakeTestProfile = HandshakeTestProfile.TEST_4_AUDIO_VIDEO_NO_SCREEN
+        )
         val versionFrame = CarLifeFrameCodec.createCommandFrame(
             channel = CarLifeChannel.CONTROL,
             serviceType = CarLifeMsgType.MSG_CMD_HU_PROTOCOL_VERSION,
@@ -468,6 +476,73 @@ class ExampleUnitTest {
         )
         val transition = sm.onControlFrame(moduleStatusFrame)
         assertTrue(transition.summary.contains("MODULE_STATUS"))
+    }
+
+    @Test
+    fun handshakeTestProfiles_strictlyMatchAllFourModesAndLogFullRxHex() {
+        val versionFrame = CarLifeFrameCodec.createCommandFrame(
+            channel = CarLifeChannel.CONTROL,
+            serviceType = CarLifeMsgType.MSG_CMD_HU_PROTOCOL_VERSION,
+            commandBody = CarlifeProtocolVersionProto(2, 0).encode()
+        )
+
+        // Minimal MD_INFO must contain only field 1 (os = "Android"): 0A 07 + "Android" = 9 bytes
+        val minimalMdInfo = CarlifeDeviceInfoProto().encodeMinimal()
+        assertEquals(9, minimalMdInfo.size)
+        assertEquals("Android", CarlifeDeviceInfoProto.decode(minimalMdInfo).os)
+
+        // Test 1: ONLY MATCH_STATUS (0x00018002, body [08 01])
+        val sm1 = CarLifeControlStateMachine(handshakeTestProfile = HandshakeTestProfile.TEST_1_MATCH_ONLY)
+        val res1 = sm1.onControlFrame(versionFrame)
+        assertEquals(1, res1.outboundFrames.size)
+        val cmd1 = res1.outboundFrames[0].parseCommandMessageOrNull()!!
+        assertEquals(CarLifeMsgType.MSG_CMD_PROTOCOL_VERSION_MATCH_STATUS, cmd1.serviceType)
+        assertArrayEquals(byteArrayOf(0x08, 0x01), cmd1.body)
+
+        // Test 2: MATCH_STATUS + minimal MD_INFO (0x00018003, 9 bytes)
+        val sm2 = CarLifeControlStateMachine(handshakeTestProfile = HandshakeTestProfile.TEST_2_MATCH_AND_MIN_MD_INFO)
+        val res2 = sm2.onControlFrame(versionFrame)
+        assertEquals(2, res2.outboundFrames.size)
+        assertEquals(CarLifeMsgType.MSG_CMD_PROTOCOL_VERSION_MATCH_STATUS, res2.outboundFrames[0].parseCommandMessageOrNull()?.serviceType)
+        val md2 = res2.outboundFrames[1].parseCommandMessageOrNull()!!
+        assertEquals(CarLifeMsgType.MSG_CMD_MD_INFO_03, md2.serviceType)
+        assertArrayEquals(minimalMdInfo, md2.body)
+
+        // Test 3: MATCH_STATUS + minimal MD_INFO + empty BT_OOB_INFO (0x00018006)
+        val sm3 = CarLifeControlStateMachine(handshakeTestProfile = HandshakeTestProfile.TEST_3_MATCH_MIN_MD_INFO_BT_OOB)
+        val res3 = sm3.onControlFrame(versionFrame)
+        assertEquals(3, res3.outboundFrames.size)
+        assertEquals(CarLifeMsgType.MSG_CMD_PROTOCOL_VERSION_MATCH_STATUS, res3.outboundFrames[0].parseCommandMessageOrNull()?.serviceType)
+        assertEquals(CarLifeMsgType.MSG_CMD_MD_INFO_03, res3.outboundFrames[1].parseCommandMessageOrNull()?.serviceType)
+        val bt3 = res3.outboundFrames[2].parseCommandMessageOrNull()!!
+        assertEquals(CarLifeMsgType.MSG_CMD_MD_BT_OOB_INFO, bt3.serviceType)
+        assertEquals(0, bt3.body.size)
+
+        // Test 4: MATCH_STATUS + MD_INFO + Audio/Video Init WITHOUT FOREGROUND / SCREEN_ON
+        val sm4 = CarLifeControlStateMachine(handshakeTestProfile = HandshakeTestProfile.TEST_4_AUDIO_VIDEO_NO_SCREEN)
+        val res4 = sm4.onControlFrame(versionFrame)
+        assertEquals(2, res4.outboundFrames.size)
+        val initStartNoScreen = sm4.buildAutoVideoEncoderInitAndStartFrames(
+            width = 800,
+            height = 480,
+            fps = 30,
+            reason = "Тест 4",
+            includeForegroundAndScreenOn = false
+        )
+        assertEquals(2, initStartNoScreen.outboundFrames.size)
+        assertEquals(CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT_DONE, initStartNoScreen.outboundFrames[0].parseCommandMessageOrNull()?.serviceType)
+        assertEquals(CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_DONE, initStartNoScreen.outboundFrames[1].parseCommandMessageOrNull()?.serviceType)
+
+        // Full RX HEX without truncation even for >256B packets
+        val largeRxPayload = ByteArray(320) { (it and 0xFF).toByte() }
+        val largeRxFrame = CarLifeFrameCodec.createCommandFrame(
+            channel = CarLifeChannel.CONTROL,
+            serviceType = CarLifeMsgType.MSG_CMD_HU_INFO,
+            commandBody = largeRxPayload
+        )
+        val fullHex = CarLifeFrameCodec.formatHexPreview(largeRxFrame, maxPayloadBytes = Int.MAX_VALUE)
+        assertFalse(fullHex.contains("… (+"))
+        assertTrue(fullHex.endsWith("3E 3F]"))
     }
 }
 

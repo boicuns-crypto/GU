@@ -49,6 +49,7 @@ import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -74,6 +75,8 @@ import androidx.compose.material3.NavigationRail
 import androidx.compose.material3.NavigationRailItem
 import androidx.compose.material3.NavigationRailItemDefaults
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.RadioButton
+import androidx.compose.material3.RadioButtonDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -96,6 +99,7 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
@@ -130,6 +134,7 @@ import com.example.protocol.carlife.CarLifeMsgType
 import com.example.protocol.carlife.CarLifeTouchDecoder
 import com.example.protocol.carlife.CarlifeProtocolVersionProto
 import com.example.protocol.carlife.CarlifeVideoEncoderInfoProto
+import com.example.protocol.carlife.HandshakeTestProfile
 import com.example.ui.theme.AmberSignal
 import com.example.ui.theme.CockpitIcons
 import com.example.ui.theme.CoralAlert
@@ -1456,6 +1461,131 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
             }
         }
 
+        // 1.5 Карточка «Тест рукопожатия 0x0001» (4 строгих профиля ответа на MSG_CMD_HU_PROTOCOL_VERSION)
+        item {
+            val activeProfile = state.handshakeTestProfile
+            fun selectHandshakeProfile(profile: HandshakeTestProfile) {
+                BridgeTelemetryBus.setHandshakeTestProfile(profile)
+                if (state.isServiceRunning) {
+                    val intent = Intent(context, BridgeForegroundService::class.java).apply {
+                        action = BridgeForegroundService.ACTION_SET_HANDSHAKE_PROFILE
+                        putExtra(BridgeForegroundService.EXTRA_HANDSHAKE_PROFILE_ID, profile.id)
+                    }
+                    context.startService(intent)
+                }
+            }
+
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("handshake_lab_card"),
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(containerColor = ObsidianSurface),
+                border = BorderStroke(1.dp, ElectricCyan.copy(alpha = 0.7f))
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Тест рукопожатия 0x0001",
+                                style = MaterialTheme.typography.titleMedium,
+                                color = TextPrimary
+                            )
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Text(
+                                text = "Режим ответа на MSG_CMD_HU_PROTOCOL_VERSION (0x00010001) от ГУ Jetta VS7",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = TextSecondary
+                            )
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Surface(
+                            color = ElectricCyan.copy(alpha = 0.16f),
+                            shape = RoundedCornerShape(8.dp),
+                            border = BorderStroke(1.dp, ElectricCyan.copy(alpha = 0.65f))
+                        ) {
+                            Text(
+                                text = "ТЕСТ ${activeProfile.id}/4",
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    fontWeight = FontWeight.SemiBold
+                                ),
+                                color = ElectricCyan,
+                                softWrap = false,
+                                maxLines = 1,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                            )
+                        }
+                    }
+
+                    HandshakeTestProfile.entries.forEach { profile ->
+                        val isSelected = activeProfile == profile
+                        val rowBg = if (isSelected) {
+                            ElectricCyan.copy(alpha = 0.12f)
+                        } else {
+                            ObsidianBackground
+                        }
+                        val rowBorder = if (isSelected) {
+                            ElectricCyan
+                        } else {
+                            ObsidianBorder
+                        }
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(min = 48.dp)
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(rowBg)
+                                .border(1.dp, rowBorder, RoundedCornerShape(12.dp))
+                                .selectable(
+                                    selected = isSelected,
+                                    onClick = { selectHandshakeProfile(profile) },
+                                    role = Role.RadioButton
+                                )
+                                .padding(horizontal = 12.dp, vertical = 10.dp)
+                                .testTag("handshake_profile_${profile.id}_btn"),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            RadioButton(
+                                selected = isSelected,
+                                onClick = null,
+                                colors = RadioButtonDefaults.colors(
+                                    selectedColor = ElectricCyan,
+                                    unselectedColor = TextMuted
+                                )
+                            )
+                            Spacer(modifier = Modifier.width(10.dp))
+                            Column(
+                                modifier = Modifier.weight(1f),
+                                verticalArrangement = Arrangement.spacedBy(2.dp)
+                            ) {
+                                Text(
+                                    text = profile.shortTitle,
+                                    style = MaterialTheme.typography.labelLarge.copy(
+                                        fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Medium
+                                    ),
+                                    color = if (isSelected) ElectricCyan else TextPrimary
+                                )
+                                Text(
+                                    text = profile.description,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = TextSecondary
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // 2. Настройки H.264 видеопотока (разрешение 800x480 / 1024x600 / 1280x720, битрейт 1.2 Мбит/с CBR 30fps, Direct 12B по умолчанию)
         item {
             Card(
@@ -2549,9 +2679,7 @@ private fun PacketLogItemCard(entry: PacketLogEntry) {
                 style = MaterialTheme.typography.labelSmall,
                 fontFamily = JetBrainsMonoFamily,
                 color = TextMuted,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .horizontalScroll(rememberScrollState())
+                modifier = Modifier.fillMaxWidth()
             )
         }
     }

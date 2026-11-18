@@ -256,6 +256,14 @@ data class CarlifeDeviceInfoProto(
         .writeStringField(23, btaddress)
         .toByteArray()
 
+    /**
+     * Minimal `MD_INFO` payload containing only field 1 (`os = "Android"`, ~9 bytes)
+     * for Handshake Lab Tests 2 & 3.
+     */
+    fun encodeMinimal(): ByteArray = CarLifeWireProtobuf.Writer(16)
+        .writeStringField(1, os.ifEmpty { "Android" })
+        .toByteArray()
+
     companion object {
         fun decode(bytes: ByteArray): CarlifeDeviceInfoProto {
             var os = ""

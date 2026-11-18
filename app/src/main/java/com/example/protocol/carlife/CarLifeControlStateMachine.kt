@@ -19,6 +19,42 @@ enum class CarLifeSessionPhase(val label: String) {
 }
 
 /**
+ * 4 strict Handshake Lab profiles selectable on the Settings tab to diagnose which
+ * `0x00010001` reply triggers the next RX packet from the Jetta VS7 Head Unit.
+ */
+enum class HandshakeTestProfile(
+    val id: Int,
+    val shortTitle: String,
+    val description: String
+) {
+    TEST_1_MATCH_ONLY(
+        id = 1,
+        shortTitle = "Тест 1: Только MATCH_STATUS (Чистый минимум)",
+        description = "Отправить ТОЛЬКО 0x00018002 [08 01] и ждать RX от ГУ (без MD_INFO, Audio, Video, Screen)."
+    ),
+    TEST_2_MATCH_AND_MIN_MD_INFO(
+        id = 2,
+        shortTitle = "Тест 2: MATCH_STATUS + минимальный MD_INFO",
+        description = "Отправить 0x00018002 + короткий MD_INFO 0x00018003 (только os=\"Android\", ~9B), без Audio/Screen."
+    ),
+    TEST_3_MATCH_MIN_MD_INFO_BT_OOB(
+        id = 3,
+        shortTitle = "Тест 3: MATCH_STATUS + MD_INFO + BT_OOB_INFO",
+        description = "Отправить 0x00018002 + короткий MD_INFO + пустой 0x00018006, без Audio/FOREGROUND/SCREEN_ON."
+    ),
+    TEST_4_AUDIO_VIDEO_NO_SCREEN(
+        id = 4,
+        shortTitle = "Тест 4: Без FOREGROUND/SCREEN_ON (Audio + Video)",
+        description = "Отправить MATCH_STATUS + MD_INFO + AUDIO_INIT (0x0003/0x0004) + INIT_DONE + START_DONE и открыть 0x0002."
+    );
+
+    companion object {
+        fun fromId(id: Int): HandshakeTestProfile =
+            entries.firstOrNull { it.id == id } ?: TEST_1_MATCH_ONLY
+    }
+}
+
+/**
  * Negotiated session configuration between the Jetta VS7 Head Unit and Galaxy S26 Ultra.
  */
 data class CarLifeControlSessionState(
@@ -51,7 +87,8 @@ class CarLifeControlStateMachine(
     private val force60FpsOnMqb: Boolean = false,
     private val mobileDeviceInfo: CarlifeDeviceInfoProto = CarlifeDeviceInfoProto(),
     @Volatile var preferredVideoWidth: Int = 800,
-    @Volatile var preferredVideoHeight: Int = 480
+    @Volatile var preferredVideoHeight: Int = 480,
+    @Volatile var handshakeTestProfile: HandshakeTestProfile = HandshakeTestProfile.TEST_1_MATCH_ONLY
 ) {
     private val _sessionState = MutableStateFlow(
         CarLifeControlSessionState(
@@ -91,7 +128,8 @@ class CarLifeControlStateMachine(
         width: Int = preferredVideoWidth,
         height: Int = preferredVideoHeight,
         fps: Int = 30,
-        reason: String = "Proactive Handshake on 0x00010001"
+        reason: String = "Proactive Handshake on 0x00010001",
+        includeForegroundAndScreenOn: Boolean = true
     ): ControlTransitionResult {
         val safeW = width.coerceIn(480, 3840)
         val safeH = height.coerceIn(272, 2160)
@@ -114,32 +152,43 @@ class CarLifeControlStateMachine(
             serviceType = CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_DONE, // 0x0001800A
             commandBody = ByteArray(0)
         )
-        val foregroundFrame = CarLifeFrameCodec.createCommandFrame(
-            channel = CarLifeChannel.CONTROL,
-            serviceType = CarLifeMsgType.MSG_CMD_FOREGROUND, // 0x00018025
-            commandBody = ByteArray(0)
-        )
-        val screenOnFrame = CarLifeFrameCodec.createCommandFrame(
-            channel = CarLifeChannel.CONTROL,
-            serviceType = CarLifeMsgType.MSG_CMD_SCREEN_ON, // 0x00018018
-            commandBody = ByteArray(0)
-        )
+        val outbound = ArrayList<CarLifeFrame>(4).apply {
+            add(initDoneFrame)
+            add(startDoneFrame)
+            if (includeForegroundAndScreenOn) {
+                add(
+                    CarLifeFrameCodec.createCommandFrame(
+                        channel = CarLifeChannel.CONTROL,
+                        serviceType = CarLifeMsgType.MSG_CMD_FOREGROUND, // 0x00018025
+                        commandBody = ByteArray(0)
+                    )
+                )
+                add(
+                    CarLifeFrameCodec.createCommandFrame(
+                        channel = CarLifeChannel.CONTROL,
+                        serviceType = CarLifeMsgType.MSG_CMD_SCREEN_ON, // 0x00018018
+                        commandBody = ByteArray(0)
+                    )
+                )
+            }
+        }
 
-        val summary = "$reason (${safeW}x${safeH}@${safeFps}fps) -> TX INIT_DONE (0x00018008) + START_DONE (0x0001800A) + FOREGROUND + SCREEN_ON"
+        val suffix = if (includeForegroundAndScreenOn) " + FOREGROUND + SCREEN_ON" else ""
+        val summary = "$reason (${safeW}x${safeH}@${safeFps}fps) -> TX INIT_DONE (0x00018008) + START_DONE (0x0001800A)$suffix"
         _sessionState.update {
             it.copy(
                 phase = CarLifeSessionPhase.VIDEO_STREAMING,
                 negotiatedVideoWidth = safeW,
                 negotiatedVideoHeight = safeH,
                 negotiatedFps = safeFps,
-                isHuForeground = true,
-                isHuScreenOn = true,
+                isHuForeground = includeForegroundAndScreenOn,
+                isHuScreenOn = includeForegroundAndScreenOn,
                 lastControlAction = summary
             )
         }
         return ControlTransitionResult(
             updatedState = _sessionState.value,
-            outboundFrames = listOf(initDoneFrame, startDoneFrame, foregroundFrame, screenOnFrame),
+            outboundFrames = outbound,
             summary = summary
         )
     }
@@ -316,20 +365,59 @@ class CarLifeControlStateMachine(
         val matchReplyProto = CarlifeProtocolVersionMatchStatusProto(
             matchStatus = CarlifeProtocolVersionMatchStatusProto.MATCH_SUCCESS
         )
-        val replyFrame = CarLifeFrameCodec.createCommandFrame(
+        val matchStatusFrame = CarLifeFrameCodec.createCommandFrame(
             channel = CarLifeChannel.CONTROL,
             serviceType = CarLifeMsgType.MSG_CMD_PROTOCOL_VERSION_MATCH_STATUS, // 0x00018002
             commandBody = matchReplyProto.encode()
         )
-        // 2. MSG_CMD_MD_INFO (0x00018003) with filled CarlifeDeviceInfoProto
-        val encodedMdInfo = mobileDeviceInfo.encode()
-        val mdInfo03Frame = CarLifeFrameCodec.createCommandFrame(
-            channel = CarLifeChannel.CONTROL,
-            serviceType = CarLifeMsgType.MSG_CMD_MD_INFO_03, // 0x00018003
-            commandBody = encodedMdInfo
-        )
 
-        val summary = "HU Protocol v${versionProto.majorVersion}.${versionProto.minorVersion} -> TX MATCH_STATUS (0x00018002 [08 01]) + MD_INFO (0x00018003)"
+        val outbound = when (handshakeTestProfile) {
+            HandshakeTestProfile.TEST_1_MATCH_ONLY -> listOf(matchStatusFrame)
+
+            HandshakeTestProfile.TEST_2_MATCH_AND_MIN_MD_INFO -> {
+                val minMdInfoFrame = CarLifeFrameCodec.createCommandFrame(
+                    channel = CarLifeChannel.CONTROL,
+                    serviceType = CarLifeMsgType.MSG_CMD_MD_INFO_03, // 0x00018003
+                    commandBody = mobileDeviceInfo.encodeMinimal()
+                )
+                listOf(matchStatusFrame, minMdInfoFrame)
+            }
+
+            HandshakeTestProfile.TEST_3_MATCH_MIN_MD_INFO_BT_OOB -> {
+                val minMdInfoFrame = CarLifeFrameCodec.createCommandFrame(
+                    channel = CarLifeChannel.CONTROL,
+                    serviceType = CarLifeMsgType.MSG_CMD_MD_INFO_03, // 0x00018003
+                    commandBody = mobileDeviceInfo.encodeMinimal()
+                )
+                val emptyBtOobFrame = CarLifeFrameCodec.createCommandFrame(
+                    channel = CarLifeChannel.CONTROL,
+                    serviceType = CarLifeMsgType.MSG_CMD_MD_BT_OOB_INFO, // 0x00018006
+                    commandBody = ByteArray(0)
+                )
+                listOf(matchStatusFrame, minMdInfoFrame, emptyBtOobFrame)
+            }
+
+            HandshakeTestProfile.TEST_4_AUDIO_VIDEO_NO_SCREEN -> {
+                val mdInfoFrame = CarLifeFrameCodec.createCommandFrame(
+                    channel = CarLifeChannel.CONTROL,
+                    serviceType = CarLifeMsgType.MSG_CMD_MD_INFO_03, // 0x00018003
+                    commandBody = mobileDeviceInfo.encode()
+                )
+                listOf(matchStatusFrame, mdInfoFrame)
+            }
+        }
+
+        val summary = when (handshakeTestProfile) {
+            HandshakeTestProfile.TEST_1_MATCH_ONLY ->
+                "HU Protocol v${versionProto.majorVersion}.${versionProto.minorVersion} [Тест 1] -> TX ONLY MATCH_STATUS (0x00018002 [08 01])"
+            HandshakeTestProfile.TEST_2_MATCH_AND_MIN_MD_INFO ->
+                "HU Protocol v${versionProto.majorVersion}.${versionProto.minorVersion} [Тест 2] -> TX MATCH_STATUS + min MD_INFO (${mobileDeviceInfo.encodeMinimal().size}B)"
+            HandshakeTestProfile.TEST_3_MATCH_MIN_MD_INFO_BT_OOB ->
+                "HU Protocol v${versionProto.majorVersion}.${versionProto.minorVersion} [Тест 3] -> TX MATCH_STATUS + min MD_INFO + empty BT_OOB (0x00018006)"
+            HandshakeTestProfile.TEST_4_AUDIO_VIDEO_NO_SCREEN ->
+                "HU Protocol v${versionProto.majorVersion}.${versionProto.minorVersion} [Тест 4] -> TX MATCH_STATUS + MD_INFO + Audio + Video Init (no Screen/FG)"
+        }
+
         _sessionState.update {
             it.copy(
                 phase = CarLifeSessionPhase.VERSION_MATCHED,
@@ -340,7 +428,7 @@ class CarLifeControlStateMachine(
         }
         return ControlTransitionResult(
             updatedState = _sessionState.value,
-            outboundFrames = listOf(replyFrame, mdInfo03Frame),
+            outboundFrames = outbound,
             summary = summary
         )
     }
