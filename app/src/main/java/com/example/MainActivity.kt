@@ -116,6 +116,7 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.core.input.CarLifeTouchAccessibilityService
 import com.example.core.projection.MediaProjectionTokenStore
+import com.example.core.projection.VideoSourceMode
 import com.example.core.usb.BridgeForegroundService
 import com.example.core.usb.BridgeRuntimeState
 import com.example.core.usb.BridgeTelemetryBus
@@ -1336,7 +1337,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                     val tsHex = rawHeader.sliceArray(8..11).joinToString(" ") { "%02X".format(it) }
                     "\n• Bytes [8..11] Timestamp: [$tsHex] -> ${decoded.header.timestamp} ms"
                 } else if (decoded.channel == CarLifeChannel.VIDEO) {
-                    "\n• Video Framing: AOA 20B (8B AOA + 12B 0x00028001) | ts=${decoded.header.timestamp} ms"
+                    "\n• Video Framing: AOA 20B (8B AOA + 12B 0x00020001) | ts=${decoded.header.timestamp} ms"
                 } else {
                     "\n• Timestamp Field: Omitted (8-byte Standard Channel Header)"
                 }
@@ -1384,8 +1385,13 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
+                        val isCanvasSource = state.videoSourceMode == VideoSourceMode.CANVAS_TEST_CARD
                         Text(
-                            text = "Виртуальный экран ГУ (VirtualDisplay)",
+                            text = if (isCanvasSource) {
+                                "Источник H.264: Тест-карта (Canvas)"
+                            } else {
+                                "Виртуальный экран ГУ (VirtualDisplay)"
+                            },
                             style = MaterialTheme.typography.titleMedium,
                             color = TextPrimary,
                             maxLines = 2,
@@ -1398,10 +1404,11 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                             shape = RoundedCornerShape(8.dp)
                         ) {
                             Text(
-                                text = if (state.projectionStats.isRunning) {
-                                    "VD #${state.projectionStats.virtualDisplayId} АКТИВЕН"
-                                } else {
-                                    "VD ВЫКЛ"
+                                text = when {
+                                    state.projectionStats.isRunning && isCanvasSource -> "CANVAS 30FPS"
+                                    state.projectionStats.isRunning -> "VD #${state.projectionStats.virtualDisplayId} АКТИВЕН"
+                                    isCanvasSource -> "CANVAS ВЫКЛ"
+                                    else -> "VD ВЫКЛ"
                                 },
                                 style = MaterialTheme.typography.labelSmall.copy(
                                     fontWeight = FontWeight.SemiBold
@@ -1418,8 +1425,14 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
+                        val isCanvasSource = state.videoSourceMode == VideoSourceMode.CANVAS_TEST_CARD
                         StatusActionChip(
-                            label = if (state.projectionStats.isRunning) "VD ON" else "Start VD",
+                            label = when {
+                                state.projectionStats.isRunning && isCanvasSource -> "Canvas ON"
+                                isCanvasSource -> "Start Canvas"
+                                state.projectionStats.isRunning -> "VD ON"
+                                else -> "Start VD"
+                            },
                             active = state.projectionStats.isRunning,
                             icon = CockpitIcons.Videocam,
                             testTag = "quick_toggle_vd_btn",
@@ -1450,7 +1463,11 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                         border = BorderStroke(1.dp, ObsidianBorder)
                     ) {
                         val vdStatusLine = if (state.projectionStats.isRunning && !lastLaunchStatus.startsWith("Запущено:")) {
-                            "Лаунчер ГУ активен на VD #${state.projectionStats.virtualDisplayId} (${state.configuredWidth}×${state.configuredHeight} @ ${state.configuredBitrateBps / 1000} кбит/с)"
+                            if (state.videoSourceMode == VideoSourceMode.CANVAS_TEST_CARD) {
+                                "Тест-карта (Canvas) активна на Surface (${state.configuredWidth}×${state.configuredHeight} @ ${state.configuredBitrateBps / 1000} кбит/с, 30 fps)"
+                            } else {
+                                "Лаунчер ГУ активен на VD #${state.projectionStats.virtualDisplayId} (${state.configuredWidth}×${state.configuredHeight} @ ${state.configuredBitrateBps / 1000} кбит/с)"
+                            }
                         } else if (!state.projectionStats.isRunning) {
                             "Готов к трансляции: выбрано разрешение ${state.configuredWidth}×${state.configuredHeight} @ ${state.configuredBitrateBps / 1000} кбит/с"
                         } else {
@@ -1466,6 +1483,136 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                 .fillMaxWidth()
                                 .padding(horizontal = 12.dp, vertical = 8.dp)
                         )
+                    }
+                }
+            }
+        }
+
+        // 1.25 Переключатель «Источник видео» (Режим A: Тест-карта Canvas по умолчанию vs Режим B: VirtualDisplay)
+        item {
+            val activeSource = state.videoSourceMode
+            fun selectVideoSource(mode: VideoSourceMode) {
+                BridgeTelemetryBus.setVideoSourceMode(mode)
+                if (state.isServiceRunning) {
+                    val intent = Intent(context, BridgeForegroundService::class.java).apply {
+                        action = BridgeForegroundService.ACTION_SET_VIDEO_SOURCE_MODE
+                        putExtra(BridgeForegroundService.EXTRA_VIDEO_SOURCE_MODE, mode.id)
+                    }
+                    safeStartService(context, intent)
+                }
+            }
+
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("video_source_card"),
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(containerColor = ObsidianSurface),
+                border = BorderStroke(1.dp, TelemetryEmerald.copy(alpha = 0.7f))
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Источник видео",
+                                style = MaterialTheme.typography.titleMedium,
+                                color = TextPrimary
+                            )
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Text(
+                                text = "Выбор входа для H.264 MediaCodec (без перезапуска сервиса)",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = TextSecondary
+                            )
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Surface(
+                            color = TelemetryEmerald.copy(alpha = 0.16f),
+                            shape = RoundedCornerShape(8.dp),
+                            border = BorderStroke(1.dp, TelemetryEmerald.copy(alpha = 0.65f))
+                        ) {
+                            Text(
+                                text = if (activeSource == VideoSourceMode.CANVAS_TEST_CARD) "CANVAS" else "VD",
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    fontWeight = FontWeight.SemiBold
+                                ),
+                                color = TelemetryEmerald,
+                                softWrap = false,
+                                maxLines = 1,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                            )
+                        }
+                    }
+
+                    VideoSourceMode.entries.forEach { mode ->
+                        val isSelected = activeSource == mode
+                        val rowBg = if (isSelected) {
+                            TelemetryEmerald.copy(alpha = 0.12f)
+                        } else {
+                            ObsidianBackground
+                        }
+                        val rowBorder = if (isSelected) {
+                            TelemetryEmerald
+                        } else {
+                            ObsidianBorder
+                        }
+                        val tag = if (mode == VideoSourceMode.CANVAS_TEST_CARD) {
+                            "video_source_canvas_btn"
+                        } else {
+                            "video_source_vd_btn"
+                        }
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(min = 48.dp)
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(rowBg)
+                                .border(1.dp, rowBorder, RoundedCornerShape(12.dp))
+                                .selectable(
+                                    selected = isSelected,
+                                    onClick = { selectVideoSource(mode) },
+                                    role = Role.RadioButton
+                                )
+                                .padding(horizontal = 12.dp, vertical = 10.dp)
+                                .testTag(tag),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            RadioButton(
+                                selected = isSelected,
+                                onClick = null,
+                                colors = RadioButtonDefaults.colors(
+                                    selectedColor = TelemetryEmerald,
+                                    unselectedColor = TextMuted
+                                )
+                            )
+                            Spacer(modifier = Modifier.width(10.dp))
+                            Column(
+                                modifier = Modifier.weight(1f),
+                                verticalArrangement = Arrangement.spacedBy(2.dp)
+                            ) {
+                                Text(
+                                    text = mode.title,
+                                    style = MaterialTheme.typography.labelLarge.copy(
+                                        fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Medium
+                                    ),
+                                    color = if (isSelected) TelemetryEmerald else TextPrimary
+                                )
+                                Text(
+                                    text = mode.subtitle,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = TextSecondary
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -1705,7 +1852,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                     }
 
                     Text(
-                        text = "Формат шапки видеоканала 0x0002 (Direct 12B + Annex-B по умолчанию)",
+                        text = "Формат шапки видеоканала 0x0002 (AOA 20B с 0x00020001 / Direct 12B по умолчанию)",
                         style = MaterialTheme.typography.labelMedium,
                         color = TextSecondary
                     )
@@ -1716,7 +1863,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                             it.copy(
                                 useNestedVideoMsgHeader = useAoA20B,
                                 lastProtocolEvent = if (useAoA20B) {
-                                    "Video 0x0002 Framing: Режим 1: AOA 20B (8B AOA + 12B 0x00028001) active"
+                                    "Video 0x0002 Framing: Режим 1: AOA 20B (8B AOA + 12B 0x00020001) active"
                                 } else {
                                     "Video 0x0002 Framing: Режим 2: Direct 12B ([00 00 00 02][nalSize][ts]) active"
                                 }
@@ -1736,11 +1883,11 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         SelectableOptionButton(
-                            label = "Режим 1: AOA 20B",
+                            label = "Режим 1: AOA 20B (0x00020001)",
                             selected = state.useNestedVideoMsgHeader,
                             testTag = "toggle_video_header_mode_btn",
                             onClick = { applyVideoHeaderMode(true) },
-                            modifier = Modifier.weight(1.1f)
+                            modifier = Modifier.weight(1.25f)
                         )
                         SelectableOptionButton(
                             label = "Режим 2: Direct 12B",
@@ -2089,7 +2236,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                             if (selectedLogTab == 1) {
                                 val videoFramesCount = state.channelFrameCounts[CarLifeChannel.VIDEO] ?: 0L
                                 val hdrModeLabel = if (state.useNestedVideoMsgHeader) {
-                                    "Режим 1: AOA 20B (8B AOA + 12B 0x00028001)"
+                                    "Режим 1: AOA 20B (8B AOA + 12B 0x00020001)"
                                 } else {
                                     "Режим 2: Direct 12B ([0x0002][nalSize][ts])"
                                 }
@@ -2259,7 +2406,11 @@ private fun ProjectionEngineCard(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = "Конвейер VirtualDisplay + H.264",
+                    text = if (state.videoSourceMode == VideoSourceMode.CANVAS_TEST_CARD) {
+                        "Конвейер Тест-карта (Canvas) + H.264"
+                    } else {
+                        "Конвейер VirtualDisplay + H.264"
+                    },
                     style = MaterialTheme.typography.titleSmall,
                     color = TextPrimary
                 )
@@ -2283,7 +2434,7 @@ private fun ProjectionEngineCard(
                 MetricPill(
                     label = "TOUCH INJECT",
                     value = "${proj.injectedTouches}",
-                    subValue = "VD #${proj.virtualDisplayId}",
+                    subValue = if (state.videoSourceMode == VideoSourceMode.CANVAS_TEST_CARD) "CANVAS" else "VD #${proj.virtualDisplayId}",
                     modifier = Modifier.weight(1f)
                 )
                 MetricPill(
@@ -2312,11 +2463,18 @@ private fun ProjectionEngineCard(
                     ) {
                         Icon(
                             imageVector = Icons.Default.PlayArrow,
-                            contentDescription = "Start VirtualDisplay",
+                            contentDescription = "Start Video Pipeline",
                             modifier = Modifier.size(18.dp)
                         )
                         Spacer(modifier = Modifier.width(6.dp))
-                        Text("Запустить VirtualDisplay + H.264", fontWeight = FontWeight.SemiBold)
+                        Text(
+                            text = if (state.videoSourceMode == VideoSourceMode.CANVAS_TEST_CARD) {
+                                "Запустить Тест-карту (Canvas) + H.264"
+                            } else {
+                                "Запустить VirtualDisplay + H.264"
+                            },
+                            fontWeight = FontWeight.SemiBold
+                        )
                     }
                 } else {
                     FilledTonalButton(

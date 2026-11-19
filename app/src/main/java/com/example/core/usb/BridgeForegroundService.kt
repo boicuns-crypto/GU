@@ -26,6 +26,7 @@ import com.example.core.carlife.CarLifeTouchPacket
 import com.example.core.projection.CockpitProjectionManager
 import com.example.core.projection.MediaProjectionTokenStore
 import com.example.core.projection.ProjectionPipelineStats
+import com.example.core.projection.VideoSourceMode
 import com.example.protocol.carlife.CarLifeChannel
 import com.example.protocol.carlife.CarLifeControlSessionState
 import com.example.protocol.carlife.CarLifeControlStateMachine
@@ -105,6 +106,7 @@ data class BridgeRuntimeState(
     val projectionStats: ProjectionPipelineStats = ProjectionPipelineStats(),
     val isVideoChannelReadyForStreaming: Boolean = false,
     val useNestedVideoMsgHeader: Boolean = false,
+    val videoSourceMode: VideoSourceMode = VideoSourceMode.CANVAS_TEST_CARD,
     val handshakeTestProfile: HandshakeTestProfile = HandshakeTestProfile.TEST_4_AUDIO_VIDEO_NO_SCREEN,
     val configuredWidth: Int = 800,
     val configuredHeight: Int = 480,
@@ -137,6 +139,15 @@ object BridgeTelemetryBus {
             it.copy(
                 handshakeTestProfile = profile,
                 lastProtocolEvent = "Профиль 0x00018001 выбран: ${profile.shortTitle}"
+            )
+        }
+    }
+
+    fun setVideoSourceMode(mode: VideoSourceMode) {
+        _runtimeState.update {
+            it.copy(
+                videoSourceMode = mode,
+                lastProtocolEvent = "Источник видео: ${mode.title}"
             )
         }
     }
@@ -311,6 +322,9 @@ class BridgeForegroundService : Service() {
     @Volatile
     private var forceAudioInitForSession: Boolean = true
 
+    @Volatile
+    private var activeVideoSourceMode: VideoSourceMode = VideoSourceMode.CANVAS_TEST_CARD
+
     private val huConfirmationSeq = java.util.concurrent.atomic.AtomicLong(0L)
 
     @Volatile
@@ -455,7 +469,8 @@ class BridgeForegroundService : Service() {
             width = targetW,
             height = targetH,
             frameRate = targetFps,
-            bitRate = activeBitrateBps
+            bitRate = activeBitrateBps,
+            sourceMode = activeVideoSourceMode
         )
 
         if (sendAudioInitIfNeeded && (!hasSentAudioInitInSession || forceAudioInitForSession)) {
@@ -530,7 +545,8 @@ class BridgeForegroundService : Service() {
                 width = 800,
                 height = 480,
                 frameRate = 30,
-                bitRate = 1_200_000
+                bitRate = 1_200_000,
+                sourceMode = activeVideoSourceMode
             )
             if (usbTransport.state.value is UsbTransportState.Connected) {
                 sendAudioMultiplexerInitPackets()
@@ -545,6 +561,7 @@ class BridgeForegroundService : Service() {
 
         // Default Jetta VS7 Mode 2: Direct 12B ([00 00 00 02][nalSize][ts] + [00 00 00 01 Annex-B])
         val currentNestedMode = BridgeTelemetryBus.runtimeState.value.useNestedVideoMsgHeader
+        activeVideoSourceMode = BridgeTelemetryBus.runtimeState.value.videoSourceMode
         CarLifeFrameCodec.useNestedVideoMsgHeader = currentNestedMode
         isVideoChannelReadyForStreaming = false
 
@@ -594,6 +611,7 @@ class BridgeForegroundService : Service() {
             },
             externalScope = serviceScope
         )
+        projectionManager.videoSourceMode = activeVideoSourceMode
         projectionManager.setVideoChannelReady(false)
 
         BridgeTelemetryBus.updateState {
@@ -602,21 +620,23 @@ class BridgeForegroundService : Service() {
                 wakeLockHeld = wakeLock?.isHeld == true,
                 isVideoChannelReadyForStreaming = false,
                 useNestedVideoMsgHeader = currentNestedMode,
+                videoSourceMode = activeVideoSourceMode,
                 configuredWidth = activeWidth,
                 configuredHeight = activeHeight,
                 configuredBitrateBps = activeBitrateBps,
-                lastProtocolEvent = "BridgeForegroundService active (800×480 @ 1.2Mbps CBR 30fps, Direct 12B; Awaiting 0x00018001)"
+                lastProtocolEvent = "BridgeForegroundService active (800×480 @ 1.2Mbps CBR 30fps, ${activeVideoSourceMode.title}; Awaiting 0x00018001)"
             )
         }
 
-        // Immediately start VirtualDisplay + H.264 MediaCodec (800x480, 30fps, 800 kbps CBR, AVCProfileBaseline)
+        // Immediately start selected Video Source (Canvas Test Card by default or VirtualDisplay) + H.264 MediaCodec
         // while keeping 0x0002 streaming locked until USB AOA handshake completes.
         serviceScope.launch {
             projectionManager.startProjection(
                 width = activeWidth,
                 height = activeHeight,
                 frameRate = 30,
-                bitRate = activeBitrateBps
+                bitRate = activeBitrateBps,
+                sourceMode = activeVideoSourceMode
             )
         }
 
@@ -791,7 +811,8 @@ class BridgeForegroundService : Service() {
                             width = targetW,
                             height = targetH,
                             frameRate = targetFps,
-                            bitRate = activeBitrateBps
+                            bitRate = activeBitrateBps,
+                            sourceMode = activeVideoSourceMode
                         )
                         if (effectiveReady || isVideoChannelReadyForStreaming || hasSentMdInfoInSession) {
                             setVideoStreamingReady(true)
@@ -836,7 +857,8 @@ class BridgeForegroundService : Service() {
                             width = width,
                             height = height,
                             frameRate = 30,
-                            bitRate = bitrate
+                            bitRate = bitrate,
+                            sourceMode = activeVideoSourceMode
                         )
                         if (wasReady && usbTransport.state.value is UsbTransportState.Connected) {
                             triggerAutoVideoEncoderStart(
@@ -881,7 +903,8 @@ class BridgeForegroundService : Service() {
                         width = width,
                         height = height,
                         frameRate = fps,
-                        bitRate = bitrate
+                        bitRate = bitrate,
+                        sourceMode = activeVideoSourceMode
                     )
                     if (effectiveReadyBeforeStart || isVideoChannelReadyForStreaming || hasSentMdInfoInSession) {
                         setVideoStreamingReady(true)
@@ -967,11 +990,34 @@ class BridgeForegroundService : Service() {
                     it.copy(
                         useNestedVideoMsgHeader = newMode,
                         lastProtocolEvent = if (newMode) {
-                            "Video 0x0002 Framing: Режим 1: AOA 20B (8B AOA + 12B 0x00028001) active"
+                            "Video 0x0002 Framing: Режим 1: AOA 20B (8B AOA + 12B 0x00020001) active"
                         } else {
                             "Video 0x0002 Framing: Режим 2: Direct 12B ([00 00 00 02][nalSize][ts]) active"
                         }
                     )
+                }
+            }
+
+            ACTION_SET_VIDEO_SOURCE_MODE -> {
+                val mode = VideoSourceMode.fromId(intent.getStringExtra(EXTRA_VIDEO_SOURCE_MODE))
+                activeVideoSourceMode = mode
+                projectionManager.videoSourceMode = mode
+                BridgeTelemetryBus.setVideoSourceMode(mode)
+                serviceScope.launch {
+                    val wasReady = isVideoChannelReadyForStreaming
+                    resetVideoLogFlags()
+                    projectionManager.setVideoChannelReady(wasReady)
+                    projectionManager.startProjection(
+                        width = activeWidth,
+                        height = activeHeight,
+                        frameRate = 30,
+                        bitRate = activeBitrateBps,
+                        sourceMode = mode
+                    )
+                    if (wasReady && usbTransport.state.value is UsbTransportState.Connected) {
+                        setVideoStreamingReady(true)
+                        projectionManager.unlockVideoChannelAndRequestSyncFrame()
+                    }
                 }
             }
 
@@ -1154,7 +1200,8 @@ class BridgeForegroundService : Service() {
                             width = targetW,
                             height = targetH,
                             frameRate = 30,
-                            bitRate = activeBitrateBps
+                            bitRate = activeBitrateBps,
+                            sourceMode = activeVideoSourceMode
                         )
                         if (!isVideoChannelReadyForStreaming) {
                             resetVideoLogFlags()
@@ -1456,6 +1503,7 @@ class BridgeForegroundService : Service() {
         const val ACTION_SEND_VERSION_MATCH = "com.example.core.usb.action.SEND_VERSION_MATCH"
         const val ACTION_SEND_VIDEO_HEARTBEAT = "com.example.core.usb.action.SEND_VIDEO_HEARTBEAT"
         const val ACTION_TOGGLE_VIDEO_HEADER_MODE = "com.example.core.usb.action.TOGGLE_VIDEO_HEADER_MODE"
+        const val ACTION_SET_VIDEO_SOURCE_MODE = "com.example.core.usb.action.SET_VIDEO_SOURCE_MODE"
         const val ACTION_SET_HANDSHAKE_PROFILE = "com.example.core.usb.action.SET_HANDSHAKE_PROFILE"
         const val ACTION_START_AUTO_TEST = "com.example.core.usb.action.START_AUTO_TEST"
         const val ACTION_STOP_AUTO_TEST = "com.example.core.usb.action.STOP_AUTO_TEST"
@@ -1470,6 +1518,7 @@ class BridgeForegroundService : Service() {
         const val EXTRA_TOUCH_X = "extra_touch_x"
         const val EXTRA_TOUCH_Y = "extra_touch_y"
         const val EXTRA_USE_NESTED_VIDEO_HEADER = "extra_use_nested_video_header"
+        const val EXTRA_VIDEO_SOURCE_MODE = "extra_video_source_mode"
         const val EXTRA_HANDSHAKE_PROFILE_ID = "extra_handshake_profile_id"
 
         const val AUTO_TEST_STEP_TIMEOUT_MS = 1_500L

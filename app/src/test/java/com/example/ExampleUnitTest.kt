@@ -4,6 +4,9 @@ import android.view.MotionEvent
 import com.example.core.carlife.CarLifePacketBuilder
 import com.example.core.carlife.CarLifeProtocolConstants
 import com.example.core.carlife.CarLifeTouchPacket
+import com.example.core.projection.ProjectionPipelineStats
+import com.example.core.projection.VideoSourceMode
+import com.example.core.usb.BridgeRuntimeState
 import com.example.protocol.carlife.CarLifeChannel
 import com.example.protocol.carlife.CarLifeControlStateMachine
 import com.example.protocol.carlife.CarLifeFrameCodec
@@ -84,7 +87,7 @@ class ExampleUnitTest {
         assertEquals(h264Nal.size, defaultFrame.payload.size)
         assertArrayEquals(h264Nal, defaultFrame.payload)
 
-        // 1. Optional Mode: AOA 20B (8B AOA + 12B 0x00028001)
+        // 1. Optional Mode: AOA 20B (8B AOA + 12B 0x00020001)
         val aoa20Frame = CarLifeFrameCodec.createVideoFrame(
             nalData = h264Nal,
             timestampMs = timestamp,
@@ -423,11 +426,11 @@ class ExampleUnitTest {
         // Outer 8B: ch=2, len=20 (8+12)
         assertEquals(0x02, wireBytes[3].toInt())
         assertEquals(20, wireBytes[7].toInt())
-        // Inner 12B: len=8, ts=500, service=0x00028001
+        // Inner 12B: len=8, ts=500, service=0x00020001
         assertEquals(8, wireBytes[11].toInt())
         assertEquals(0x00, wireBytes[16].toInt())
         assertEquals(0x02, wireBytes[17].toInt())
-        assertEquals(0x80.toByte(), wireBytes[18])
+        assertEquals(0x00.toByte(), wireBytes[18])
         assertEquals(0x01, wireBytes[19].toInt())
         // Annex-B start code at bytes [20..23]
         assertArrayEquals(byteArrayOf(0x00, 0x00, 0x00, 0x01), wireBytes.copyOfRange(20, 24))
@@ -676,6 +679,39 @@ class ExampleUnitTest {
         assertEquals(0x0001000A, step4.outboundFrames[0].parseCommandMessageOrNull()?.serviceType)
         assertEquals(0x00010025, step4.outboundFrames[1].parseCommandMessageOrNull()?.serviceType)
         assertEquals(0x00010018, step4.outboundFrames[2].parseCommandMessageOrNull()?.serviceType)
+    }
+
+    @Test
+    fun videoChannel0x0002_uses0x00020001WithoutDirectionBit_andDefaultsToCanvasTestCard() {
+        assertEquals(0x00020001, CarLifeMsgType.MSG_VIDEO_DATA)
+        assertEquals(0x00020002, CarLifeMsgType.MSG_VIDEO_HEARTBEAT)
+        assertEquals(CarLifeProtocolConstants.MSG_VIDEO_DATA, CarLifeMsgType.MSG_VIDEO_DATA)
+        assertEquals(CarLifeProtocolConstants.MSG_VIDEO_HEARTBEAT, CarLifeMsgType.MSG_VIDEO_HEARTBEAT)
+
+        // Default video source mode must be Режим A: Тест-карта (Canvas)
+        assertEquals(VideoSourceMode.CANVAS_TEST_CARD, ProjectionPipelineStats().videoSourceMode)
+        assertEquals(VideoSourceMode.CANVAS_TEST_CARD, BridgeRuntimeState().videoSourceMode)
+        assertEquals(VideoSourceMode.CANVAS_TEST_CARD, VideoSourceMode.fromId("canvas_test_card"))
+        assertEquals(VideoSourceMode.VIRTUAL_DISPLAY, VideoSourceMode.fromId("virtual_display"))
+        assertEquals(VideoSourceMode.CANVAS_TEST_CARD, VideoSourceMode.fromId(null))
+
+        // Direct 12B vs AOA 20B with 0x00020001
+        val sampleNal = byteArrayOf(0x00, 0x00, 0x00, 0x01, 0x65, 0x88.toByte(), 0x84.toByte())
+        val aoa20Bytes = CarLifeFrameCodec.buildAoAVideoPacket(sampleNal, timestampMs = 1234)
+        assertEquals(20 + sampleNal.size, aoa20Bytes.size)
+        assertArrayEquals(
+            byteArrayOf(0x00, 0x02, 0x00, 0x01),
+            aoa20Bytes.copyOfRange(16, 20)
+        )
+
+        val direct12Frame = CarLifeFrameCodec.createVideoFrame(
+            nalData = sampleNal,
+            timestampMs = 1234L,
+            nestedVideoMsgHeader = false
+        )
+        val direct12Bytes = CarLifeFrameCodec.encodeFrame(direct12Frame)
+        assertEquals(12 + sampleNal.size, direct12Bytes.size)
+        assertArrayEquals(sampleNal, direct12Bytes.copyOfRange(12, direct12Bytes.size))
     }
 }
 

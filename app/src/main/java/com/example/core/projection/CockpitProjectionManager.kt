@@ -80,7 +80,9 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -125,10 +127,38 @@ object MediaProjectionTokenStore {
 }
 
 /**
- * Live telemetry of the VirtualDisplay + Hardware H.264 MediaCodec + Touch Injection pipeline.
+ * Selectable video input source for the H.264 `MediaCodec` pipeline:
+ * - [CANVAS_TEST_CARD]: Draws a bright 30fps synthetic test card directly onto `MediaCodec.createInputSurface()` without `VirtualDisplay`.
+ * - [VIRTUAL_DISPLAY]: Captures `VirtualDisplay` / `MediaProjection` + CarLife Launcher UI.
+ */
+enum class VideoSourceMode(
+    val id: String,
+    val title: String,
+    val subtitle: String
+) {
+    CANVAS_TEST_CARD(
+        id = "canvas_test_card",
+        title = "Режим A: «Тест-карта (Canvas)»",
+        subtitle = "Прямая отрисовка 30 fps в inputSurface без VirtualDisplay (JETTA VS7 TEST + время + FRAME #)"
+    ),
+    VIRTUAL_DISPLAY(
+        id = "virtual_display",
+        title = "Режим B: «Виртуальный экран (VD)»",
+        subtitle = "Захват VirtualDisplay / MediaProjection + лаунчер CarLife"
+    );
+
+    companion object {
+        fun fromId(id: String?): VideoSourceMode =
+            entries.firstOrNull { it.id == id } ?: CANVAS_TEST_CARD
+    }
+}
+
+/**
+ * Live telemetry of the Video Source + Hardware H.264 MediaCodec + Touch Injection pipeline.
  */
 data class ProjectionPipelineStats(
     val isRunning: Boolean = false,
+    val videoSourceMode: VideoSourceMode = VideoSourceMode.CANVAS_TEST_CARD,
     val usingMediaProjection: Boolean = false,
     val virtualDisplayId: Int = Display.DEFAULT_DISPLAY,
     val width: Int = 800,
@@ -142,8 +172,8 @@ data class ProjectionPipelineStats(
     val spsPpsConfigured: Boolean = false,
     val injectedTouches: Long = 0L,
     val lastTouchPoint: Pair<Float, Float>? = null,
-    val activeCockpitWidget: String = "Лаунчер ГУ CarLife активен",
-    val statusMessage: String = "Лаунчер ГУ готов (800×480 @ 1.2 Мбит/с, CBR 30fps)"
+    val activeCockpitWidget: String = "Тест-карта (Canvas) готова",
+    val statusMessage: String = "Тест-карта (Canvas) готова (800×480 @ 1.2 Мбит/с, CBR 30fps)"
 )
 
 /**
@@ -177,9 +207,12 @@ class CockpitProjectionManager(
     private val projectionMutex = Mutex()
     private val isEncoding = AtomicBoolean(false)
 
+    @Volatile
+    var videoSourceMode: VideoSourceMode = VideoSourceMode.CANVAS_TEST_CARD
+
     /**
      * Gate for channel `0x0002` video streaming:
-     * Remains `false` until USB AOA connects and receives `MSG_CMD_HU_PROTOCOL_VERSION (0x00010001)`.
+     * Remains `false` until USB AOA connects and receives `MSG_CMD_HU_PROTOCOL_VERSION (0x00018001)`.
      * Force-unlocked immediately upon proactive handshake completion (`unlockVideoChannelAndRequestSyncFrame`).
      */
     @Volatile
@@ -222,7 +255,8 @@ class CockpitProjectionManager(
         height: Int = 480,
         frameRate: Int = 30,
         bitRate: Int = 1_200_000,
-        densityDpi: Int = DisplayMetrics.DENSITY_MEDIUM
+        densityDpi: Int = DisplayMetrics.DENSITY_MEDIUM,
+        sourceMode: VideoSourceMode = this.videoSourceMode
     ): Boolean {
         val safeWidth = if (width in 480..3840) width else 800
         val safeHeight = if (height in 272..2160) height else 480
@@ -233,13 +267,14 @@ class CockpitProjectionManager(
             val current = _stats.value
             isEncoding.get() &&
                 mediaCodec != null &&
+                current.videoSourceMode == sourceMode &&
                 current.width == safeWidth &&
                 current.height == safeHeight &&
                 current.fps == safeFps &&
                 current.bitRateKbps == (safeBitRate / 1_000)
         }
         if (alreadyActive) return true
-        return startProjection(safeWidth, safeHeight, safeFps, safeBitRate, densityDpi)
+        return startProjection(safeWidth, safeHeight, safeFps, safeBitRate, densityDpi, sourceMode)
     }
 
     suspend fun startProjection(
@@ -247,10 +282,12 @@ class CockpitProjectionManager(
         height: Int = 480,
         frameRate: Int = 30,
         bitRate: Int = 1_200_000,
-        densityDpi: Int = DisplayMetrics.DENSITY_MEDIUM
+        densityDpi: Int = DisplayMetrics.DENSITY_MEDIUM,
+        sourceMode: VideoSourceMode = this.videoSourceMode
     ): Boolean = projectionMutex.withLock {
-        // Stop only the previous MediaCodec / Surface while preserving any live MediaProjection & VirtualDisplay
-        // so Android 14/15/16 single-use MediaProjection tokens are never invalidated on resolution switch!
+        videoSourceMode = sourceMode
+        // Stop only the previous MediaCodec / Surface (while preserving MediaProjection & VirtualDisplay in VD mode,
+        // or releasing VirtualDisplay when switching to pure Canvas Test Card mode).
         stopEncoderOnlyLocked()
 
         val safeWidth = if (width in 480..3840) width else 800
@@ -259,17 +296,28 @@ class CockpitProjectionManager(
         val safeBitRate = bitRate.coerceIn(400_000, 12_000_000)
         val effectiveDpi = if (safeWidth <= 1024) DisplayMetrics.DENSITY_MEDIUM else densityDpi
 
-        if (CarLifeLauncherRepository.installedApps.value.isEmpty()) {
+        if (sourceMode == VideoSourceMode.VIRTUAL_DISPLAY && CarLifeLauncherRepository.installedApps.value.isEmpty()) {
             externalScope.launch(Dispatchers.IO) {
                 CarLifeLauncherRepository.loadInstalledApps(appContext)
             }
         }
 
+        if (sourceMode == VideoSourceMode.CANVAS_TEST_CARD) {
+            // Mode A: Strictly DO NOT create or keep a VirtualDisplay; render 30fps test card directly to MediaCodec inputSurface.
+            withContext(Dispatchers.Main.immediate) {
+                runCatching { cockpitPresentation?.dismiss() }
+                cockpitPresentation = null
+            }
+            runCatching { virtualDisplay?.surface = null }
+            runCatching { virtualDisplay?.release() }
+            virtualDisplay = null
+        }
+
         var codec: MediaCodec? = null
         var inputSurface: Surface? = null
-        var vDisplay: VirtualDisplay? = virtualDisplay
-        var activeMp: MediaProjection? = mediaProjection
-        var usedMediaProjection = (vDisplay != null && activeMp != null)
+        var vDisplay: VirtualDisplay? = if (sourceMode == VideoSourceMode.VIRTUAL_DISPLAY) virtualDisplay else null
+        var activeMp: MediaProjection? = if (sourceMode == VideoSourceMode.VIRTUAL_DISPLAY) mediaProjection else null
+        var usedMediaProjection = (sourceMode == VideoSourceMode.VIRTUAL_DISPLAY && vDisplay != null && activeMp != null)
 
         return@withLock try {
             codec = configureLowLatencyAvcEncoder(safeWidth, safeHeight, safeFps, safeBitRate)
@@ -285,139 +333,19 @@ class CockpitProjectionManager(
                 drainHardwareEncoderLoop(codec, safeBitRate)
             }
 
-            if (usedMediaProjection && vDisplay != null) {
-                // Reuse existing VirtualDisplay on Android 14/15/16: resize to new resolution & swap Surface
-                runCatching {
-                    vDisplay!!.resize(safeWidth, safeHeight, effectiveDpi)
-                    vDisplay!!.surface = inputSurface
-                }.onFailure { e ->
-                    Log.w(TAG, "VirtualDisplay resize/setSurface failed (${e.message}), recreating")
-                    runCatching { vDisplay?.release() }
-                    vDisplay = null
-                    usedMediaProjection = false
-                }
-            }
-
-            // If no existing VirtualDisplay, check if user granted MediaProjection (Step 5)
-            if (!usedMediaProjection) {
-                val tokenData = MediaProjectionTokenStore.resultData
-                val tokenCode = MediaProjectionTokenStore.resultCode
-                if (tokenCode == Activity.RESULT_OK && tokenData != null) {
-                    runCatching {
-                        val mp = activeMp ?: mediaProjectionManager.getMediaProjection(tokenCode, Intent(tokenData))
-                        if (mp != null) {
-                            if (mediaProjectionCallback == null) {
-                                val callback = object : MediaProjection.Callback() {
-                                    override fun onStop() {
-                                        Log.w(TAG, "MediaProjection stopped by system")
-                                        MediaProjectionTokenStore.clearToken()
-                                    }
-                                }
-                                mp.registerCallback(callback, mainHandler)
-                                mediaProjectionCallback = callback
-                            }
-                            activeMp = mp
-
-                            vDisplay = mp.createVirtualDisplay(
-                                VIRTUAL_DISPLAY_NAME,
-                                safeWidth,
-                                safeHeight,
-                                effectiveDpi,
-                                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR or
-                                    DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or
-                                    DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION,
-                                inputSurface,
-                                null,
-                                mainHandler
-                            )
-                            usedMediaProjection = true
-                        }
-                    }.onFailure { e ->
-                        Log.w(TAG, "MediaProjection VirtualDisplay creation failed, switching to Canvas Surface Feeder: ${e.message}")
-                        MediaProjectionTokenStore.clearToken()
-                    }
-                }
-            }
-
-            if (usedMediaProjection && vDisplay != null) {
-                val createdDisplay = vDisplay!!.display
-                awaitDisplayRegistered(createdDisplay.displayId)
-
-                // Immediately render CarLife Launcher UI onto the VirtualDisplay via CockpitPresentation
-                if (cockpitPresentation == null || cockpitPresentation?.display?.displayId != createdDisplay.displayId) {
-                    runCatching {
-                        withContext(Dispatchers.Main.immediate) {
-                            runCatching { cockpitPresentation?.dismiss() }
-                            cockpitPresentation = null
-                        }
-                        val presentation = showPresentationWithRetry(createdDisplay)
-                        withContext(Dispatchers.Main.immediate) {
-                            cockpitPresentation = presentation
-                            presentation.window?.decorView?.postInvalidate()
-                        }
-                    }.onFailure { e ->
-                        Log.w(TAG, "Presentation overlay skipped (MediaProjection Auto-Mirror still active): ${e.message}")
-                    }
-                } else {
-                    withContext(Dispatchers.Main.immediate) {
-                        cockpitPresentation?.window?.decorView?.requestLayout()
-                        cockpitPresentation?.window?.decorView?.postInvalidate()
-                    }
-                }
-
-                mediaProjection = activeMp
-                virtualDisplay = vDisplay
-
-                // Periodically invalidate CockpitPresentation so VirtualDisplay continuously feeds MediaCodec
-                startPresentationRefreshLoop()
-
-                CarLifeLauncherRepository.markLauncherActiveOnDisplay(
-                    displayId = createdDisplay.displayId,
+            if (sourceMode == VideoSourceMode.CANVAS_TEST_CARD) {
+                startCanvasFeederLoopIfNeeded(
+                    surface = inputSurface,
                     width = safeWidth,
                     height = safeHeight,
-                    bitrateBps = safeBitRate
+                    frameRate = safeFps,
+                    sourceMode = VideoSourceMode.CANVAS_TEST_CARD
                 )
 
                 _stats.update {
                     it.copy(
                         isRunning = true,
-                        usingMediaProjection = true,
-                        virtualDisplayId = createdDisplay.displayId,
-                        width = safeWidth,
-                        height = safeHeight,
-                        fps = safeFps,
-                        bitRateMbps = (safeBitRate / 1_000_000).coerceAtLeast(1),
-                        bitRateKbps = safeBitRate / 1_000,
-                        activeCockpitWidget = "Лаунчер ГУ активен на VD #${createdDisplay.displayId} ($safeWidth×$safeHeight)",
-                        statusMessage = "Лаунчер ГУ активен на VD #${createdDisplay.displayId} ($safeWidth×$safeHeight @ ${safeBitRate / 1000} кбит/с)"
-                    )
-                }
-
-                // Watchdog: if MediaProjection hasn't pushed any video frame within 350ms,
-                // detach VirtualDisplay from inputSurface and start Canvas Feeder so 90% never hangs!
-                externalScope.launch(Dispatchers.IO) {
-                    delay(350L)
-                    if (isEncoding.get() && lastKeyFrameAnnexB == null) {
-                        Log.w(TAG, "MediaProjection produced 0 frames in 350ms; activating Canvas Surface Feeder fallback")
-                        runCatching { vDisplay?.surface = null }
-                        startCanvasFeederLoopIfNeeded(inputSurface, safeWidth, safeHeight, safeFps)
-                    }
-                }
-            } else {
-                // Guaranteed 30fps Canvas-to-Surface H.264 generator:
-                // Immediately draws the CarLife Launcher directly into MediaCodec's inputSurface
-                startCanvasFeederLoopIfNeeded(inputSurface, safeWidth, safeHeight, safeFps)
-
-                CarLifeLauncherRepository.markLauncherActiveOnDisplay(
-                    displayId = Display.DEFAULT_DISPLAY,
-                    width = safeWidth,
-                    height = safeHeight,
-                    bitrateBps = safeBitRate
-                )
-
-                _stats.update {
-                    it.copy(
-                        isRunning = true,
+                        videoSourceMode = VideoSourceMode.CANVAS_TEST_CARD,
                         usingMediaProjection = false,
                         virtualDisplayId = Display.DEFAULT_DISPLAY,
                         width = safeWidth,
@@ -425,9 +353,171 @@ class CockpitProjectionManager(
                         fps = safeFps,
                         bitRateMbps = (safeBitRate / 1_000_000).coerceAtLeast(1),
                         bitRateKbps = safeBitRate / 1_000,
-                        activeCockpitWidget = "Лаунчер ГУ активен ($safeWidth×$safeHeight)",
-                        statusMessage = "Лаунчер ГУ активен ($safeWidth×$safeHeight @ ${safeBitRate / 1000} кбит/с)"
+                        activeCockpitWidget = "Тест-карта Canvas (${safeWidth}×${safeHeight} @ ${safeFps}fps)",
+                        statusMessage = "Тест-карта (Canvas) активна (${safeWidth}×${safeHeight} @ ${safeBitRate / 1000} кбит/с, ${safeFps} fps)"
                     )
+                }
+            } else {
+                if (usedMediaProjection && vDisplay != null) {
+                    // Reuse existing VirtualDisplay on Android 14/15/16: resize to new resolution & swap Surface
+                    runCatching {
+                        vDisplay!!.resize(safeWidth, safeHeight, effectiveDpi)
+                        vDisplay!!.surface = inputSurface
+                    }.onFailure { e ->
+                        Log.w(TAG, "VirtualDisplay resize/setSurface failed (${e.message}), recreating")
+                        runCatching { vDisplay?.release() }
+                        vDisplay = null
+                        usedMediaProjection = false
+                    }
+                }
+
+                // If no existing VirtualDisplay, check if user granted MediaProjection (Step 5)
+                if (!usedMediaProjection) {
+                    val tokenData = MediaProjectionTokenStore.resultData
+                    val tokenCode = MediaProjectionTokenStore.resultCode
+                    if (tokenCode == Activity.RESULT_OK && tokenData != null) {
+                        runCatching {
+                            val mp = activeMp ?: mediaProjectionManager.getMediaProjection(tokenCode, Intent(tokenData))
+                            if (mp != null) {
+                                if (mediaProjectionCallback == null) {
+                                    val callback = object : MediaProjection.Callback() {
+                                        override fun onStop() {
+                                            Log.w(TAG, "MediaProjection stopped by system")
+                                            MediaProjectionTokenStore.clearToken()
+                                        }
+                                    }
+                                    mp.registerCallback(callback, mainHandler)
+                                    mediaProjectionCallback = callback
+                                }
+                                activeMp = mp
+
+                                vDisplay = mp.createVirtualDisplay(
+                                    VIRTUAL_DISPLAY_NAME,
+                                    safeWidth,
+                                    safeHeight,
+                                    effectiveDpi,
+                                    DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR or
+                                        DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or
+                                        DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION,
+                                    inputSurface,
+                                    null,
+                                    mainHandler
+                                )
+                                usedMediaProjection = true
+                            }
+                        }.onFailure { e ->
+                            Log.w(TAG, "MediaProjection VirtualDisplay creation failed, switching to Canvas Surface Feeder: ${e.message}")
+                            MediaProjectionTokenStore.clearToken()
+                        }
+                    }
+                }
+
+                if (usedMediaProjection && vDisplay != null) {
+                    val createdDisplay = vDisplay!!.display
+                    awaitDisplayRegistered(createdDisplay.displayId)
+
+                    // Immediately render CarLife Launcher UI onto the VirtualDisplay via CockpitPresentation
+                    if (cockpitPresentation == null || cockpitPresentation?.display?.displayId != createdDisplay.displayId) {
+                        runCatching {
+                            withContext(Dispatchers.Main.immediate) {
+                                runCatching { cockpitPresentation?.dismiss() }
+                                cockpitPresentation = null
+                            }
+                            val presentation = showPresentationWithRetry(createdDisplay)
+                            withContext(Dispatchers.Main.immediate) {
+                                cockpitPresentation = presentation
+                                presentation.window?.decorView?.postInvalidate()
+                            }
+                        }.onFailure { e ->
+                            Log.w(TAG, "Presentation overlay skipped (MediaProjection Auto-Mirror still active): ${e.message}")
+                        }
+                    } else {
+                        withContext(Dispatchers.Main.immediate) {
+                            cockpitPresentation?.window?.decorView?.requestLayout()
+                            cockpitPresentation?.window?.decorView?.postInvalidate()
+                        }
+                    }
+
+                    mediaProjection = activeMp
+                    virtualDisplay = vDisplay
+
+                    // Periodically invalidate CockpitPresentation so VirtualDisplay continuously feeds MediaCodec
+                    startPresentationRefreshLoop()
+
+                    CarLifeLauncherRepository.markLauncherActiveOnDisplay(
+                        displayId = createdDisplay.displayId,
+                        width = safeWidth,
+                        height = safeHeight,
+                        bitrateBps = safeBitRate
+                    )
+
+                    _stats.update {
+                        it.copy(
+                            isRunning = true,
+                            videoSourceMode = VideoSourceMode.VIRTUAL_DISPLAY,
+                            usingMediaProjection = true,
+                            virtualDisplayId = createdDisplay.displayId,
+                            width = safeWidth,
+                            height = safeHeight,
+                            fps = safeFps,
+                            bitRateMbps = (safeBitRate / 1_000_000).coerceAtLeast(1),
+                            bitRateKbps = safeBitRate / 1_000,
+                            activeCockpitWidget = "Лаунчер ГУ активен на VD #${createdDisplay.displayId} ($safeWidth×$safeHeight)",
+                            statusMessage = "Лаунчер ГУ активен на VD #${createdDisplay.displayId} ($safeWidth×$safeHeight @ ${safeBitRate / 1000} кбит/с)"
+                        )
+                    }
+
+                    // Watchdog: if MediaProjection hasn't pushed any video frame within 350ms,
+                    // detach VirtualDisplay from inputSurface and start Canvas Feeder so 90% never hangs!
+                    externalScope.launch(Dispatchers.IO) {
+                        delay(350L)
+                        if (isEncoding.get() &&
+                            videoSourceMode == VideoSourceMode.VIRTUAL_DISPLAY &&
+                            lastKeyFrameAnnexB == null
+                        ) {
+                            Log.w(TAG, "MediaProjection produced 0 frames in 350ms; activating Canvas Surface Feeder fallback")
+                            runCatching { vDisplay?.surface = null }
+                            startCanvasFeederLoopIfNeeded(
+                                surface = inputSurface,
+                                width = safeWidth,
+                                height = safeHeight,
+                                frameRate = safeFps,
+                                sourceMode = VideoSourceMode.VIRTUAL_DISPLAY
+                            )
+                        }
+                    }
+                } else {
+                    // Fallback Canvas Launcher feeder when VirtualDisplay/MediaProjection token is absent
+                    startCanvasFeederLoopIfNeeded(
+                        surface = inputSurface,
+                        width = safeWidth,
+                        height = safeHeight,
+                        frameRate = safeFps,
+                        sourceMode = VideoSourceMode.VIRTUAL_DISPLAY
+                    )
+
+                    CarLifeLauncherRepository.markLauncherActiveOnDisplay(
+                        displayId = Display.DEFAULT_DISPLAY,
+                        width = safeWidth,
+                        height = safeHeight,
+                        bitrateBps = safeBitRate
+                    )
+
+                    _stats.update {
+                        it.copy(
+                            isRunning = true,
+                            videoSourceMode = VideoSourceMode.VIRTUAL_DISPLAY,
+                            usingMediaProjection = false,
+                            virtualDisplayId = Display.DEFAULT_DISPLAY,
+                            width = safeWidth,
+                            height = safeHeight,
+                            fps = safeFps,
+                            bitRateMbps = (safeBitRate / 1_000_000).coerceAtLeast(1),
+                            bitRateKbps = safeBitRate / 1_000,
+                            activeCockpitWidget = "Лаунчер ГУ (Canvas-фолбэк VD) ($safeWidth×$safeHeight)",
+                            statusMessage = "Лаунчер ГУ активен (фолбэк VD: $safeWidth×$safeHeight @ ${safeBitRate / 1000} кбит/с)"
+                        )
+                    }
                 }
             }
 
@@ -441,6 +531,7 @@ class CockpitProjectionManager(
             _stats.update {
                 it.copy(
                     isRunning = false,
+                    videoSourceMode = sourceMode,
                     usingMediaProjection = false,
                     virtualDisplayId = Display.DEFAULT_DISPLAY,
                     spsPpsConfigured = false,
@@ -462,18 +553,24 @@ class CockpitProjectionManager(
     }
 
     /**
-     * Renders the CarLife Cockpit Launcher directly into [surface] (`MediaCodec` input surface)
-     * every `1000 / frameRate` ms (~33ms for 30fps) so `MediaCodec` is 100% guaranteed to emit
-     * `SPS + PPS` (`BUFFER_FLAG_CODEC_CONFIG`) and `IDR` keyframes immediately after `MSG_CMD_VIDEO_ENCODER_INIT`.
+     * Renders either the bright 30fps Synthetic Test Card ([VideoSourceMode.CANVAS_TEST_CARD])
+     * or the CarLife Cockpit Launcher ([VideoSourceMode.VIRTUAL_DISPLAY] fallback) directly into
+     * [surface] (`mediaCodec.createInputSurface()`) every ~33ms (`30 fps`) so `MediaCodec`
+     * continuously emits live `SPS + PPS` and changing `IDR / P` frames and never goes idle.
      */
     private fun startCanvasFeederLoopIfNeeded(
         surface: Surface,
         width: Int,
         height: Int,
-        frameRate: Int
+        frameRate: Int,
+        sourceMode: VideoSourceMode
     ) {
         if (canvasFeederJob?.isActive == true) return
-        val frameIntervalMs = (1_000L / frameRate.coerceIn(15, 60)).coerceAtLeast(16L)
+        val frameIntervalMs = if (frameRate == 30) {
+            33L
+        } else {
+            (1_000L / frameRate.coerceIn(15, 60)).coerceAtLeast(16L)
+        }
 
         canvasFeederJob = externalScope.launch(Dispatchers.Default) {
             val bgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -527,7 +624,9 @@ class CockpitProjectionManager(
                 textAlign = Paint.Align.CENTER
                 typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.NORMAL)
             }
+            val testCardPaint = Paint(Paint.ANTI_ALIAS_FLAG)
             val timeFmt = SimpleDateFormat("HH:mm", Locale.getDefault())
+            val testTimeFmt = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
 
             var frameSeq = 0L
             while (isActive && isEncoding.get() && surface.isValid) {
@@ -536,24 +635,36 @@ class CockpitProjectionManager(
                     val canvas: AndroidCanvas? = surface.lockCanvas(null)
                     if (canvas != null) {
                         try {
-                            drawCarLifeLauncherFrame(
-                                canvas = canvas,
-                                width = width,
-                                height = height,
-                                frameSeq = frameSeq++,
-                                timeString = timeFmt.format(Date()),
-                                bgPaint = bgPaint,
-                                cardPaint = cardPaint,
-                                tilePaint = tilePaint,
-                                borderPaint = borderPaint,
-                                accentPaint = accentPaint,
-                                emeraldBadgeBgPaint = emeraldBadgeBgPaint,
-                                emeraldTextPaint = emeraldTextPaint,
-                                clockPaint = clockPaint,
-                                titlePaint = titlePaint,
-                                subtitlePaint = subtitlePaint,
-                                appLabelPaint = appLabelPaint
-                            )
+                            val currentSeq = frameSeq++
+                            if (sourceMode == VideoSourceMode.CANVAS_TEST_CARD) {
+                                drawTestCardFrame(
+                                    canvas = canvas,
+                                    width = width,
+                                    height = height,
+                                    frameSeq = currentSeq,
+                                    timeWithMsString = testTimeFmt.format(Date()),
+                                    paint = testCardPaint
+                                )
+                            } else {
+                                drawCarLifeLauncherFrame(
+                                    canvas = canvas,
+                                    width = width,
+                                    height = height,
+                                    frameSeq = currentSeq,
+                                    timeString = timeFmt.format(Date()),
+                                    bgPaint = bgPaint,
+                                    cardPaint = cardPaint,
+                                    tilePaint = tilePaint,
+                                    borderPaint = borderPaint,
+                                    accentPaint = accentPaint,
+                                    emeraldBadgeBgPaint = emeraldBadgeBgPaint,
+                                    emeraldTextPaint = emeraldTextPaint,
+                                    clockPaint = clockPaint,
+                                    titlePaint = titlePaint,
+                                    subtitlePaint = subtitlePaint,
+                                    appLabelPaint = appLabelPaint
+                                )
+                            }
                         } finally {
                             surface.unlockCanvasAndPost(canvas)
                         }
@@ -568,6 +679,129 @@ class CockpitProjectionManager(
                 delay(sleepMs)
             }
         }
+    }
+
+    /**
+     * Bright 30fps synthetic Test Card rendered onto `MediaCodec.createInputSurface()`:
+     * - Vibrant blue & green split backdrop + 7-color SMPTE bars at top and bottom
+     * - Moving horizontal progress bar driven by [frameSeq] so every single frame changes pixels
+     * - Large centered white text: `"JETTA VS7 TEST"`, current timestamp, and `"FRAME #<seq>"`.
+     */
+    fun drawTestCardFrame(
+        canvas: AndroidCanvas,
+        width: Int,
+        height: Int,
+        frameSeq: Long,
+        timeWithMsString: String,
+        paint: Paint = Paint(Paint.ANTI_ALIAS_FLAG)
+    ) {
+        val w = width.toFloat().coerceAtLeast(1f)
+        val h = height.toFloat().coerceAtLeast(1f)
+        val scale = (h / 480f).coerceIn(0.6f, 2.5f)
+
+        // 1. Bright split background: deep cobalt blue (left) + vivid emerald green (right)
+        paint.style = Paint.Style.FILL
+        paint.setShadowLayer(0f, 0f, 0f, AndroidColor.TRANSPARENT)
+        paint.color = AndroidColor.rgb(0, 82, 204) // Bright blue
+        canvas.drawRect(0f, 0f, w * 0.5f, h, paint)
+        paint.color = AndroidColor.rgb(0, 148, 86) // Bright green
+        canvas.drawRect(w * 0.5f, 0f, w, h, paint)
+
+        // 2. Color bars (top 16% and bottom 16%)
+        val barColors = intArrayOf(
+            AndroidColor.WHITE,
+            AndroidColor.rgb(255, 214, 0),   // Yellow
+            AndroidColor.rgb(0, 229, 255),   // Cyan
+            AndroidColor.rgb(0, 230, 118),   // Bright Green
+            AndroidColor.rgb(255, 0, 229),   // Magenta
+            AndroidColor.rgb(255, 23, 68),   // Red
+            AndroidColor.rgb(41, 121, 255)   // Blue
+        )
+        val topBandH = h * 0.16f
+        val bottomBandTop = h * 0.84f
+        val barW = w / barColors.size.toFloat()
+        for (i in barColors.indices) {
+            paint.color = barColors[i]
+            val left = i * barW
+            val right = if (i == barColors.lastIndex) w else (i + 1) * barW
+            canvas.drawRect(left, 0f, right, topBandH, paint)
+            canvas.drawRect(
+                left,
+                bottomBandTop,
+                right,
+                h,
+                paint.apply { color = barColors[barColors.lastIndex - i] }
+            )
+        }
+
+        // 3. Moving frame sweep bar across top & bottom transitions so every 33ms frame has motion
+        val sweepPos = ((frameSeq % 60L).toFloat() / 60f) * w
+        val sweepW = (w * 0.12f).coerceAtLeast(24f)
+        paint.color = AndroidColor.YELLOW
+        canvas.drawRect(sweepPos, topBandH, (sweepPos + sweepW).coerceAtMost(w), topBandH + 10f * scale, paint)
+        paint.color = AndroidColor.CYAN
+        val revPos = w - sweepPos - sweepW
+        canvas.drawRect(revPos.coerceAtLeast(0f), bottomBandTop - 10f * scale, (revPos + sweepW).coerceAtMost(w), bottomBandTop, paint)
+
+        // 4. Crisp outer frame border
+        paint.style = Paint.Style.STROKE
+        paint.strokeWidth = 4f * scale
+        paint.color = AndroidColor.WHITE
+        canvas.drawRect(2f * scale, 2f * scale, w - 2f * scale, h - 2f * scale, paint)
+
+        // 5. Semi-opaque dark center badge for maximum contrast of white text
+        paint.style = Paint.Style.FILL
+        paint.color = AndroidColor.argb(175, 8, 16, 32)
+        val boxMarginX = w * 0.10f
+        val boxTop = topBandH + 22f * scale
+        val boxBottom = bottomBandTop - 22f * scale
+        canvas.drawRoundRect(
+            RectF(boxMarginX, boxTop, w - boxMarginX, boxBottom),
+            24f * scale,
+            24f * scale,
+            paint
+        )
+        paint.style = Paint.Style.STROKE
+        paint.strokeWidth = 3f * scale
+        paint.color = AndroidColor.WHITE
+        canvas.drawRoundRect(
+            RectF(boxMarginX, boxTop, w - boxMarginX, boxBottom),
+            24f * scale,
+            24f * scale,
+            paint
+        )
+
+        // 6. Centered bold white text: "JETTA VS7 TEST", current time, and FRAME #N
+        paint.style = Paint.Style.FILL
+        paint.textAlign = Paint.Align.CENTER
+        paint.color = AndroidColor.WHITE
+        paint.setShadowLayer(4f * scale, 2f * scale, 2f * scale, AndroidColor.BLACK)
+
+        val centerX = w * 0.5f
+        val centerY = h * 0.5f
+
+        paint.typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
+        paint.textSize = 54f * scale
+        canvas.drawText("JETTA VS7 TEST", centerX, centerY - 46f * scale, paint)
+
+        paint.typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+        paint.textSize = 32f * scale
+        canvas.drawText("TIME $timeWithMsString", centerX, centerY + 12f * scale, paint)
+
+        paint.color = AndroidColor.rgb(255, 245, 157) // High-contrast bright warm white/yellow
+        paint.textSize = 42f * scale
+        canvas.drawText("FRAME #$frameSeq", centerX, centerY + 66f * scale, paint)
+
+        paint.color = AndroidColor.WHITE
+        paint.typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.NORMAL)
+        paint.textSize = 18f * scale
+        canvas.drawText(
+            "CANVAS INPUT SURFACE • ${width}x${height} • 30 FPS CBR",
+            centerX,
+            centerY + 104f * scale,
+            paint
+        )
+        paint.setShadowLayer(0f, 0f, 0f, AndroidColor.TRANSPARENT)
     }
 
     private fun drawCarLifeLauncherFrame(
@@ -1050,14 +1284,19 @@ class CockpitProjectionManager(
         stopProjectionLocked(updateStatus = true)
     }
 
-    private fun stopEncoderOnlyLocked() {
+    private suspend fun stopEncoderOnlyLocked() {
         isEncoding.set(false)
         presentationRefreshJob?.cancel()
         presentationRefreshJob = null
-        canvasFeederJob?.cancel()
+        val feeder = canvasFeederJob
         canvasFeederJob = null
-        encoderDrainJob?.cancel()
+        val drainer = encoderDrainJob
         encoderDrainJob = null
+
+        withContext(NonCancellable) {
+            runCatching { feeder?.cancelAndJoin() }
+            runCatching { drainer?.cancelAndJoin() }
+        }
 
         runCatching { virtualDisplay?.surface = null }
 
@@ -1112,9 +1351,27 @@ class CockpitProjectionManager(
         bitRate: Int
     ): MediaCodec {
         val codec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
+        val caps = runCatching {
+            codec.codecInfo.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC)
+        }.getOrNull()
 
-        // Stage 1: Strict Jetta VS7 format — AVCProfileBaseline + AVCLevel31 + BITRATE_MODE_CBR + KEY_I_FRAME_INTERVAL = 1
-        val baselineLevel31CbrFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
+        val supportsBaseline = caps?.profileLevels?.any {
+            it.profile == MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline
+        } ?: true
+        val supportsBaselineLevel31 = caps?.profileLevels?.any {
+            it.profile == MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline &&
+                it.level >= MediaCodecInfo.CodecProfileLevel.AVCLevel31
+        } ?: true
+        val supportsCbr = caps?.encoderCapabilities?.isBitrateModeSupported(
+            MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR
+        ) ?: true
+
+        fun createBaseFormat(
+            includeBaselineProfile: Boolean,
+            includeLevel31: Boolean,
+            includeCbr: Boolean,
+            includeOptionalTimingKeys: Boolean
+        ): MediaFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
             setInteger(
                 MediaFormat.KEY_COLOR_FORMAT,
                 MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
@@ -1122,101 +1379,101 @@ class CockpitProjectionManager(
             setInteger(MediaFormat.KEY_BIT_RATE, bitRate)
             setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-            setInteger(
-                MediaFormat.KEY_PROFILE,
-                MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline
-            )
-            setInteger(
-                MediaFormat.KEY_LEVEL,
-                MediaCodecInfo.CodecProfileLevel.AVCLevel31
-            )
-            setInteger(
-                MediaFormat.KEY_BITRATE_MODE,
-                MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR
-            )
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
-                setInteger(MediaFormat.KEY_PREPEND_HEADER_TO_SYNC_FRAMES, 1)
+            if (includeBaselineProfile) {
+                setInteger(
+                    MediaFormat.KEY_PROFILE,
+                    MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline
+                )
+                if (includeLevel31) {
+                    setInteger(
+                        MediaFormat.KEY_LEVEL,
+                        MediaCodecInfo.CodecProfileLevel.AVCLevel31
+                    )
+                }
             }
-            setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000L)
+            if (includeCbr) {
+                setInteger(
+                    MediaFormat.KEY_BITRATE_MODE,
+                    MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR
+                )
+            }
+            // Note: Do NOT set KEY_PREPEND_HEADER_TO_SYNC_FRAMES — many CCodec encoders reject it with
+            // err 0xffffffea (BAD_VALUE). SPS/PPS are cached from csd-0/csd-1 and BUFFER_FLAG_CODEC_CONFIG
+            // and emitted explicitly before every IDR frame in emitSeparateSpsPpsAndIdr().
+            if (includeOptionalTimingKeys) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
+                }
+                setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000L)
+            }
         }
 
-        // Stage 2: AVCProfileBaseline + BITRATE_MODE_CBR (without explicit level)
-        val baselineCbrFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
-            setInteger(
-                MediaFormat.KEY_COLOR_FORMAT,
-                MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
-            )
-            setInteger(MediaFormat.KEY_BIT_RATE, bitRate)
-            setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-            setInteger(
-                MediaFormat.KEY_PROFILE,
-                MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline
-            )
-            setInteger(
-                MediaFormat.KEY_BITRATE_MODE,
-                MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR
-            )
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
+        val candidates = buildList {
+            if (supportsBaseline && supportsBaselineLevel31 && supportsCbr) {
+                add(
+                    "AVCProfileBaseline+Level31+CBR" to createBaseFormat(
+                        includeBaselineProfile = true,
+                        includeLevel31 = true,
+                        includeCbr = true,
+                        includeOptionalTimingKeys = true
+                    )
+                )
             }
-            setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000L)
+            if (supportsBaseline && supportsCbr) {
+                add(
+                    "AVCProfileBaseline+CBR" to createBaseFormat(
+                        includeBaselineProfile = true,
+                        includeLevel31 = false,
+                        includeCbr = true,
+                        includeOptionalTimingKeys = true
+                    )
+                )
+            }
+            if (supportsCbr) {
+                add(
+                    "GenericAVC+CBR" to createBaseFormat(
+                        includeBaselineProfile = false,
+                        includeLevel31 = false,
+                        includeCbr = true,
+                        includeOptionalTimingKeys = true
+                    )
+                )
+            }
+            add(
+                "GenericAVC+DefaultBitrateMode" to createBaseFormat(
+                    includeBaselineProfile = false,
+                    includeLevel31 = false,
+                    includeCbr = false,
+                    includeOptionalTimingKeys = true
+                )
+            )
+            add(
+                "MinimalAVC" to createBaseFormat(
+                    includeBaselineProfile = false,
+                    includeLevel31 = false,
+                    includeCbr = false,
+                    includeOptionalTimingKeys = false
+                )
+            )
         }
 
-        // Stage 3: Generic AVC + BITRATE_MODE_CBR + KEY_I_FRAME_INTERVAL = 1
-        val genericCbrFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
-            setInteger(
-                MediaFormat.KEY_COLOR_FORMAT,
-                MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
-            )
-            setInteger(MediaFormat.KEY_BIT_RATE, bitRate)
-            setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-            setInteger(
-                MediaFormat.KEY_BITRATE_MODE,
-                MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR
-            )
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
-            }
-            setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000L)
-        }
-
-        val candidates = listOf(
-            "AVCProfileBaseline+Level31+CBR" to baselineLevel31CbrFormat,
-            "AVCProfileBaseline+CBR" to baselineCbrFormat,
-            "GenericAVC+CBR" to genericCbrFormat
-        )
-
-        for ((label, candidate) in candidates) {
+        var lastError: Exception? = null
+        candidates.forEachIndexed { index, (label, candidate) ->
             try {
-                codec.reset()
+                if (index > 0) {
+                    codec.reset()
+                }
                 codec.configure(candidate, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-                Log.i(TAG, "Configured H.264 encoder in $label ($width×$height @ ${frameRate}fps, ${bitRate / 1000}kbps CBR)")
+                Log.i(TAG, "Configured H.264 encoder in $label ($width×$height @ ${frameRate}fps, ${bitRate / 1000}kbps)")
                 return codec
             } catch (e: Exception) {
+                lastError = e
                 Log.w(TAG, "H.264 config candidate $label rejected (${e.message}), trying next...")
             }
         }
 
-        // Final fallback if running on a software codec that rejects BITRATE_MODE_CBR
-        val fallbackFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
-            setInteger(
-                MediaFormat.KEY_COLOR_FORMAT,
-                MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
-            )
-            setInteger(MediaFormat.KEY_BIT_RATE, bitRate)
-            setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
-            }
-            setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000L)
-        }
-        codec.reset()
-        codec.configure(fallbackFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-        return codec
+        runCatching { codec.release() }
+        throw lastError ?: IllegalStateException("Failed to configure H.264 MediaCodec encoder")
     }
 
     private fun cacheConfigNalUnits(buffer: ByteArray) {
