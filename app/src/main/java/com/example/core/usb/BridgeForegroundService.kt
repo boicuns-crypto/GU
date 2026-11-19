@@ -136,7 +136,7 @@ object BridgeTelemetryBus {
         _runtimeState.update {
             it.copy(
                 handshakeTestProfile = profile,
-                lastProtocolEvent = "Профиль 0x00010001 выбран: ${profile.shortTitle}"
+                lastProtocolEvent = "Профиль 0x00018001 выбран: ${profile.shortTitle}"
             )
         }
     }
@@ -283,10 +283,8 @@ class BridgeForegroundService : Service() {
 
     /**
      * Gate for channel `0x0002` H.264 streaming:
-     * Starts `false` until USB AOA connects and receives `MSG_CMD_HU_PROTOCOL_VERSION (0x00010001)`.
-     * Forced to `true` immediately inside `triggerAutoVideoEncoderStart()` right after sending
-     * `MD_INFO`, `AUDIO_INIT`, `VIDEO_ENCODER_INIT_DONE`, `START_DONE`, `FOREGROUND`, `SCREEN_ON`,
-     * and never reverted back to `false` within the same USB AOA session.
+     * Starts `false` until USB AOA connects and receives `MSG_CMD_HU_PROTOCOL_VERSION (0x00018001)`
+     * and the active handshake/video negotiation unlocks streaming.
      */
     @Volatile
     var isVideoChannelReadyForStreaming: Boolean = false
@@ -408,7 +406,7 @@ class BridgeForegroundService : Service() {
 
     /**
      * Mandatory Jetta VS7 Audio-Init before video streaming:
-     * Immediately after `MSG_CMD_MD_INFO (0x00018003)`, sends empty 12-byte audio frames
+     * Immediately after `MSG_CMD_MD_INFO (0x00010004)`, sends empty 12-byte audio frames
      * with a valid `SystemClock.uptimeMillis()` timestamp:
      * - `0x0003` (Media Audio): `[00 00 00 03][00 00 00 00][ts (4B)]`
      * - `0x0004` (TTS Audio): `[00 00 00 04][00 00 00 00][ts (4B)]`
@@ -435,13 +433,12 @@ class BridgeForegroundService : Service() {
     }
 
     /**
-     * Proactive Video Start chain fired IMMEDIATELY upon `MSG_CMD_HU_PROTOCOL_VERSION (0x00010001)`
-     * after `MATCH_STATUS (0x00018002)` -> `MD_INFO (0x00018003)` -> `AUDIO_INIT (0x0003 & 0x0004)`:
-     * 5. `MSG_CMD_VIDEO_ENCODER_INIT_DONE (0x00018008, 800x480@30fps)`
-     * 6. `MSG_CMD_VIDEO_ENCODER_START_DONE (0x0001800A)`
-     * 7. `MSG_CMD_FOREGROUND (0x00018025)`
-     * 8. `MSG_CMD_SCREEN_ON (0x00018018)`
-     * 9. Immediately sets `isVideoChannelReadyForStreaming = true`, requests `SYNC_FRAME`, and streams NAL units.
+     * Proactive Video Start chain upon `MSG_CMD_HU_PROTOCOL_VERSION (0x00018001)`:
+     * after `MATCH_STATUS (0x00010002)` -> `MD_INFO (0x00010004)` -> `AUDIO_INIT (0x0003 & 0x0004)`:
+     * 5. `MSG_CMD_VIDEO_ENCODER_INIT_DONE (0x00010008, 800x480@30fps)`
+     * 6. `MSG_CMD_VIDEO_ENCODER_START_DONE (0x0001000A)`
+     * 7. Optional `MSG_CMD_FOREGROUND (0x00010025)` & `MSG_CMD_SCREEN_ON (0x00010018)`
+     * 8. Immediately sets `isVideoChannelReadyForStreaming = true`, requests `SYNC_FRAME`, and streams NAL units.
      */
     private suspend fun triggerAutoVideoEncoderStart(
         reason: String,
@@ -607,7 +604,7 @@ class BridgeForegroundService : Service() {
                 configuredWidth = activeWidth,
                 configuredHeight = activeHeight,
                 configuredBitrateBps = activeBitrateBps,
-                lastProtocolEvent = "BridgeForegroundService active (800×480 @ 1.2Mbps CBR 30fps, Direct 12B; Proactive Handshake on 0x00010001)"
+                lastProtocolEvent = "BridgeForegroundService active (800×480 @ 1.2Mbps CBR 30fps, Direct 12B; Awaiting 0x00018001)"
             )
         }
 
@@ -669,7 +666,7 @@ class BridgeForegroundService : Service() {
                                 lastProtocolEvent = if (alreadyHandshakedThisSession) {
                                     current.lastProtocolEvent
                                 } else {
-                                    "AOA Connected: ${newState.accessory.manufacturer} ${newState.accessory.model} (fd=${newState.fdNumber}) — Awaiting 0x00010001"
+                                    "AOA Connected: ${newState.accessory.manufacturer} ${newState.accessory.model} (fd=${newState.fdNumber}) — Awaiting 0x00018001"
                                 }
                             )
                         }
@@ -1096,7 +1093,7 @@ class BridgeForegroundService : Service() {
                             protocolNote = "Auto-Reply: ${reply.parseCommandMessageOrNull()?.serviceName ?: "Frame"}"
                         )
                         // Strictly send Audio-Init after MD_INFO ONLY in Test 4 (Tests 1-3 omit Audio-Init cleanly)
-                        if (replyService == CarLifeMsgType.MSG_CMD_MD_INFO_03 &&
+                        if (replyService == CarLifeMsgType.MSG_CMD_MD_INFO &&
                             !hasSentAudioInitInSession &&
                             activeProfile == HandshakeTestProfile.TEST_4_AUDIO_VIDEO_NO_SCREEN
                         ) {
@@ -1128,8 +1125,7 @@ class BridgeForegroundService : Service() {
                         }
                     }
 
-                    CarLifeMsgType.MSG_CMD_HU_INFO,
-                    CarLifeMsgType.MSG_CMD_HU_INFO_ALT -> {
+                    CarLifeMsgType.MSG_CMD_HU_INFO -> {
                         hasSentMdInfoInSession = true
                         if (isVideoChannelReadyForStreaming) {
                             projectionManager.requestInstantIdrKeyFrame()
@@ -1138,8 +1134,8 @@ class BridgeForegroundService : Service() {
 
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT,
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT_ALT -> {
-                        // HU explicitly sent VIDEO_ENCODER_INIT after/during handshake: ensure encoder is running
-                        // and keep/unlock 0x0002 streaming with an immediate SYNC_FRAME without stopping active video.
+                        // HU sent 0x00018007 (VIDEO_ENCODER_INIT): ensure encoder is running
+                        // and unlock 0x0002 streaming with an immediate SYNC_FRAME.
                         val targetW = activeWidth.coerceIn(480, 3840)
                         val targetH = activeHeight.coerceIn(272, 2160)
                         controlStateMachine.setPreferredResolution(targetW, targetH)
@@ -1160,6 +1156,8 @@ class BridgeForegroundService : Service() {
 
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START,
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_ALT -> {
+                        // HU sent 0x00018009 (VIDEO_ENCODER_START): ensure encoder is running,
+                        // open 0x0002 gate, and immediately push SPS/PPS + IDR.
                         val targetW = activeWidth.coerceIn(480, 3840)
                         val targetH = activeHeight.coerceIn(272, 2160)
                         controlStateMachine.setPreferredResolution(targetW, targetH)
@@ -1170,6 +1168,7 @@ class BridgeForegroundService : Service() {
                             bitRate = activeBitrateBps
                         )
                         if (!isVideoChannelReadyForStreaming) {
+                            resetVideoLogFlags()
                             setVideoStreamingReady(true)
                             projectionManager.unlockVideoChannelAndRequestSyncFrame()
                         } else {
@@ -1177,7 +1176,16 @@ class BridgeForegroundService : Service() {
                         }
                     }
 
-                    CarLifeMsgType.MSG_CMD_AUTHEN_REQUEST_0A,
+                    CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_PAUSE -> {
+                        setVideoStreamingReady(false)
+                    }
+
+                    CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_RESET -> {
+                        if (isVideoChannelReadyForStreaming) {
+                            projectionManager.requestInstantIdrKeyFrame()
+                        }
+                    }
+
                     CarLifeMsgType.MSG_CMD_AUTHEN_REQUEST_0B,
                     CarLifeMsgType.MSG_CMD_AUTHEN_REQUEST_0C,
                     CarLifeMsgType.MSG_CMD_AUTHEN_REQUEST_0D,
@@ -1198,8 +1206,7 @@ class BridgeForegroundService : Service() {
                     CarLifeMsgType.MSG_CMD_MODULE_CONTROL_ALT,
                     CarLifeMsgType.MSG_CMD_HU_BT_OOB_INFO,
                     CarLifeMsgType.MSG_CMD_HU_BT_OOB_INFO_ALT -> {
-                        // Mock auth / stats / module negotiation response already sent via transition.outboundFrames;
-                        // keep 0x0002 gated until VIDEO_ENCODER_START (0x00010009) completes the command pool!
+                        // Auth / stats / module negotiation response already sent via transition.outboundFrames.
                     }
 
                     else -> {

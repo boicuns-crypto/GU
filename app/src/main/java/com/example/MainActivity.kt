@@ -1512,7 +1512,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                             )
                             Spacer(modifier = Modifier.height(2.dp))
                             Text(
-                                text = "Режим ответа на MSG_CMD_HU_PROTOCOL_VERSION (0x00010001) от ГУ Jetta VS7",
+                                text = "Режим ответа на MSG_CMD_HU_PROTOCOL_VERSION (0x00018001) от ГУ Jetta VS7",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = TextSecondary
                             )
@@ -1784,7 +1784,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                             )
                             Spacer(modifier = Modifier.height(2.dp))
                             Text(
-                                text = "При получении 0x00010001 сразу отправляются MATCH_STATUS, MD_INFO, Audio-Init (0x0003, 0x0004), INIT_DONE (800×480@30fps), START_DONE, FOREGROUND, SCREEN_ON и запускаются раздельные NAL в Direct 12B.",
+                                text = "При получении 0x00018001 отправляются MATCH_STATUS (0x00010002), MD_INFO (0x00010004), Audio-Init (0x0003, 0x0004), INIT_DONE (0x00010008), START_DONE (0x0001000A) и раздельные NAL в Direct 12B.",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = TextSecondary
                             )
@@ -2094,9 +2094,9 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                     "Режим 2: Direct 12B ([0x0002][nalSize][ts])"
                                 }
                                 val gateStatusLabel = if (state.isVideoChannelReadyForStreaming) {
-                                    "Шлюз 0x0002: ОТКРЫТ (после 0x00010001 -> поток 0x0002 активен)"
+                                    "Шлюз 0x0002: ОТКРЫТ (поток 0x0002 активен)"
                                 } else {
-                                    "Шлюз 0x0002: ЗАКРЫТ (ожидание 0x00010001 от ГУ)"
+                                    "Шлюз 0x0002: ЗАКРЫТ (ожидание 0x00018001 / 0x00018007 от ГУ)"
                                 }
                                 Surface(
                                     color = ObsidianSurfaceHigh,

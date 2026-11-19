@@ -49,6 +49,7 @@ object CarLifeProtocolConstants {
 
     // =========================================================================
     // 2. CHANNEL 1 (CONTROL / CMD) MESSAGE IDs
+    // Direction bit 0x8000: HU -> MD (RX) = 0x000180xx, MD -> HU (TX) = 0x000100xx
     // =========================================================================
     const val MSG_CMD_HU_PROTOCOL_VERSION: Int = 0x00018001
     const val MSG_CMD_PROTOCOL_VERSION_MATCH_STATUS: Int = 0x00010002
@@ -59,33 +60,34 @@ object CarLifeProtocolConstants {
     const val MSG_CMD_VIDEO_ENCODER_INIT: Int = 0x00018007
     const val MSG_CMD_VIDEO_ENCODER_INIT_DONE: Int = 0x00010008
     const val MSG_CMD_VIDEO_ENCODER_START: Int = 0x00018009
-    const val MSG_CMD_VIDEO_ENCODER_PAUSE: Int = 0x0001800A
-    const val MSG_CMD_VIDEO_ENCODER_RESET: Int = 0x0001800B
-    const val MSG_CMD_VIDEO_ENCODER_FRAME_RATE_CHANGE: Int = 0x0001800C
-    const val MSG_CMD_VIDEO_ENCODER_FRAME_RATE_CHANGE_DONE: Int = 0x0001000D
+    const val MSG_CMD_VIDEO_ENCODER_START_DONE: Int = 0x0001000A
+    const val MSG_CMD_VIDEO_ENCODER_PAUSE: Int = 0x0001800B
+    const val MSG_CMD_VIDEO_ENCODER_RESET: Int = 0x0001800C
+    const val MSG_CMD_VIDEO_ENCODER_FRAME_RATE_CHANGE: Int = 0x0001800D
+    const val MSG_CMD_VIDEO_ENCODER_FRAME_RATE_CHANGE_DONE: Int = 0x0001000E
     const val MSG_CMD_PAUSE_MEDIA: Int = 0x0001800E
     const val MSG_CMD_CAR_VELOCITY: Int = 0x0001800F
     const val MSG_CMD_CAR_GPS: Int = 0x00018010
     const val MSG_CMD_CAR_GYROSCOPE: Int = 0x00018011
     const val MSG_CMD_CAR_ACCELERATION: Int = 0x00018012
     const val MSG_CMD_CAR_OIL: Int = 0x00018013
-    const val MSG_CMD_LAUNCH_MODE_NORMAL: Int = 0x00018014
-    const val MSG_CMD_LAUNCH_MODE_PHONE: Int = 0x00018015
-    const val MSG_CMD_LAUNCH_MODE_MAP: Int = 0x00018016
-    const val MSG_CMD_LAUNCH_MODE_MUSIC: Int = 0x00018017
-    const val MSG_CMD_SCREEN_ON: Int = 0x00018018
-    const val MSG_CMD_SCREEN_OFF: Int = 0x00018019
-    const val MSG_CMD_SCREEN_USER_PRESENT: Int = 0x0001801A
-    const val MSG_CMD_FOREGROUND: Int = 0x0001801B
-    const val MSG_CMD_BACKGROUND: Int = 0x0001801C
-    const val MSG_CMD_GO_TO_DESKTOP: Int = 0x0001801E
-    const val MSG_CMD_MIC_RECORD_WAKEUP_START: Int = 0x0001801F
-    const val MSG_CMD_MIC_RECORD_END: Int = 0x00018020
-    const val MSG_CMD_MIC_RECORD_RECOG_START: Int = 0x00018021
-    const val MSG_CMD_GO_TO_FOREGROUND: Int = 0x00018022
-    const val MSG_CMD_MODULE_STATUS: Int = 0x00018023
+    const val MSG_CMD_LAUNCH_MODE_NORMAL: Int = 0x00010014
+    const val MSG_CMD_LAUNCH_MODE_PHONE: Int = 0x00010015
+    const val MSG_CMD_LAUNCH_MODE_MAP: Int = 0x00010016
+    const val MSG_CMD_LAUNCH_MODE_MUSIC: Int = 0x00010017
+    const val MSG_CMD_SCREEN_ON: Int = 0x00010018
+    const val MSG_CMD_SCREEN_OFF: Int = 0x00010019
+    const val MSG_CMD_SCREEN_USER_PRESENT: Int = 0x0001001A
+    const val MSG_CMD_BACKGROUND: Int = 0x0001001C
+    const val MSG_CMD_GO_TO_DESKTOP: Int = 0x0001001E
+    const val MSG_CMD_MIC_RECORD_WAKEUP_START: Int = 0x0001001F
+    const val MSG_CMD_MIC_RECORD_END: Int = 0x00010020
+    const val MSG_CMD_MIC_RECORD_RECOG_START: Int = 0x00010021
+    const val MSG_CMD_GO_TO_FOREGROUND: Int = 0x00010022
+    const val MSG_CMD_MODULE_STATUS: Int = 0x00010023
     const val MSG_CMD_STATISTIC_INFO: Int = 0x00018024
-    const val MSG_CMD_MODULE_CONTROL: Int = 0x00018025
+    const val MSG_CMD_FOREGROUND: Int = 0x00010025
+    const val MSG_CMD_MODULE_CONTROL: Int = 0x00018026
 
     // =========================================================================
     // 3. CHANNEL 2 (VIDEO) MESSAGE IDs
