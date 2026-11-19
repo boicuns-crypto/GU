@@ -1285,14 +1285,18 @@ class BridgeForegroundService : Service() {
     }
 
     private fun acquireWakeLock() {
-        if (wakeLock?.isHeld == true) return
-        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-        wakeLock = pm.newWakeLock(
-            PowerManager.PARTIAL_WAKE_LOCK,
-            "CarLifeBridge::UsbAoaStreamingWakeLock"
-        ).apply {
-            setReferenceCounted(false)
-            acquire(8 * 60 * 60 * 1000L)
+        runCatching {
+            if (wakeLock?.isHeld == true) return
+            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+            wakeLock = pm.newWakeLock(
+                PowerManager.PARTIAL_WAKE_LOCK,
+                "CarLifeBridge::UsbAoaStreamingWakeLock"
+            ).apply {
+                setReferenceCounted(false)
+                acquire(8 * 60 * 60 * 1000L)
+            }
+        }.onFailure { e ->
+            Log.w(TAG, "Partial WakeLock unavailable: ${e.message}")
         }
     }
 
@@ -1309,24 +1313,28 @@ class BridgeForegroundService : Service() {
         val notification = buildNotification(state)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             val hasMpToken = MediaProjectionTokenStore.hasValidToken.value
-            val desiredType = if (hasMpToken) {
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
-            } else {
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+            val isUsbSessionActive = state is UsbTransportState.Connected || state is UsbTransportState.Connecting
+
+            var desiredType = ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+            if (isUsbSessionActive) {
+                desiredType = desiredType or ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
             }
+            if (hasMpToken) {
+                desiredType = desiredType or ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+            }
+
             try {
                 startForeground(NOTIFICATION_ID, notification, desiredType)
-            } catch (se: SecurityException) {
-                Log.w(TAG, "FGS promotion with type=$desiredType failed (${se.message}); falling back to connectedDevice")
+            } catch (e: RuntimeException) {
+                Log.w(TAG, "FGS promotion with type=$desiredType failed (${e.message}); falling back to dataSync")
                 runCatching {
                     startForeground(
                         NOTIFICATION_ID,
                         notification,
-                        ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
                     )
-                }.onFailure {
-                    runCatching { startForeground(NOTIFICATION_ID, notification) }
+                }.onFailure { fallbackErr ->
+                    Log.e(TAG, "FGS dataSync fallback failed: ${fallbackErr.message}")
                 }
             }
         } else {
@@ -1470,10 +1478,14 @@ class BridgeForegroundService : Service() {
                 putExtra(EXTRA_FPS, 30)
                 putExtra(EXTRA_BITRATE, 1_200_000)
             }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(intent)
-            } else {
-                context.startService(intent)
+            runCatching {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    context.startForegroundService(intent)
+                } else {
+                    context.startService(intent)
+                }
+            }.onFailure { e ->
+                Log.w(TAG, "startDefaultProjection skipped: ${e.message}")
             }
         }
 
@@ -1488,10 +1500,14 @@ class BridgeForegroundService : Service() {
                 putExtra(EXTRA_HEIGHT, currentState.configuredHeight)
                 putExtra(EXTRA_BITRATE, currentState.configuredBitrateBps)
             }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(intent)
-            } else {
-                context.startService(intent)
+            runCatching {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    context.startForegroundService(intent)
+                } else {
+                    context.startService(intent)
+                }
+            }.onFailure { e ->
+                Log.w(TAG, "grantMediaProjection service start failed: ${e.message}")
             }
         }
 
@@ -1502,10 +1518,14 @@ class BridgeForegroundService : Service() {
                     putExtra(UsbManager.EXTRA_ACCESSORY, accessory)
                 }
             }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(intent)
-            } else {
-                context.startService(intent)
+            runCatching {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    context.startForegroundService(intent)
+                } else {
+                    context.startService(intent)
+                }
+            }.onFailure { e ->
+                Log.w(TAG, "startWithAccessory skipped: ${e.message}")
             }
         }
     }

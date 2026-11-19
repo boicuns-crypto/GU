@@ -199,7 +199,7 @@ class MainActivity : ComponentActivity() {
                         val stopIntent = Intent(this, BridgeForegroundService::class.java).apply {
                             action = BridgeForegroundService.ACTION_DISCONNECT_STOP
                         }
-                        startService(stopIntent)
+                        safeStartService(this, stopIntent)
                     },
                     onStartProjection = { width, height, fps ->
                         if (!MediaProjectionTokenStore.hasValidToken.value) {
@@ -213,18 +213,14 @@ class MainActivity : ComponentActivity() {
                                 putExtra(BridgeForegroundService.EXTRA_FPS, fps)
                                 putExtra(BridgeForegroundService.EXTRA_BITRATE, currentBitrate)
                             }
-                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                                startForegroundService(intent)
-                            } else {
-                                startService(intent)
-                            }
+                            safeStartService(this, intent, foreground = true)
                         }
                     },
                     onStopProjection = {
                         val intent = Intent(this, BridgeForegroundService::class.java).apply {
                             action = BridgeForegroundService.ACTION_STOP_PROJECTION
                         }
-                        startService(intent)
+                        safeStartService(this, intent)
                     },
                     onInjectTouch = { x, y ->
                         val intent = Intent(this, BridgeForegroundService::class.java).apply {
@@ -232,7 +228,7 @@ class MainActivity : ComponentActivity() {
                             putExtra(BridgeForegroundService.EXTRA_TOUCH_X, x)
                             putExtra(BridgeForegroundService.EXTRA_TOUCH_Y, y)
                         }
-                        startService(intent)
+                        safeStartService(this, intent)
                     }
                 )
             }
@@ -270,6 +266,20 @@ class MainActivity : ComponentActivity() {
             if (!MediaProjectionTokenStore.hasValidToken.value) {
                 requestScreenCapturePermission()
             }
+        }
+    }
+}
+
+private fun safeStartService(
+    context: Context,
+    intent: Intent,
+    foreground: Boolean = false
+) {
+    runCatching {
+        if (foreground && Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            context.startForegroundService(intent)
+        } else {
+            context.startService(intent)
         }
     }
 }
@@ -683,7 +693,7 @@ fun CarLifeBridgeApp(
                                 putExtra(BridgeForegroundService.EXTRA_HEIGHT, h)
                                 putExtra(BridgeForegroundService.EXTRA_BITRATE, currentBitrate)
                             }
-                            context.startService(cfgIntent)
+                            safeStartService(context, cfgIntent)
                         },
                         onSelectBitrate = { kbps ->
                             configuredBitrateKbps = kbps
@@ -705,7 +715,7 @@ fun CarLifeBridgeApp(
                                 putExtra(BridgeForegroundService.EXTRA_HEIGHT, h)
                                 putExtra(BridgeForegroundService.EXTRA_BITRATE, bps)
                             }
-                            context.startService(cfgIntent)
+                            safeStartService(context, cfgIntent)
                         },
                         onToggleProjection = {
                             if (runtimeState.projectionStats.isRunning) {
@@ -1471,7 +1481,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                         action = BridgeForegroundService.ACTION_SET_HANDSHAKE_PROFILE
                         putExtra(BridgeForegroundService.EXTRA_HANDSHAKE_PROFILE_ID, profile.id)
                     }
-                    context.startService(intent)
+                    safeStartService(context, intent)
                 }
             }
 
@@ -1717,7 +1727,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                 action = BridgeForegroundService.ACTION_TOGGLE_VIDEO_HEADER_MODE
                                 putExtra(BridgeForegroundService.EXTRA_USE_NESTED_VIDEO_HEADER, useAoA20B)
                             }
-                            context.startService(intent)
+                            safeStartService(context, intent)
                         }
                     }
 
