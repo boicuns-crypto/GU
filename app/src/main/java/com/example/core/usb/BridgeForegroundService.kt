@@ -105,7 +105,7 @@ data class BridgeRuntimeState(
     val projectionStats: ProjectionPipelineStats = ProjectionPipelineStats(),
     val isVideoChannelReadyForStreaming: Boolean = false,
     val useNestedVideoMsgHeader: Boolean = false,
-    val handshakeTestProfile: HandshakeTestProfile = HandshakeTestProfile.TEST_1_MATCH_ONLY,
+    val handshakeTestProfile: HandshakeTestProfile = HandshakeTestProfile.TEST_4_AUDIO_VIDEO_NO_SCREEN,
     val configuredWidth: Int = 800,
     val configuredHeight: Int = 480,
     val configuredBitrateBps: Int = 1_200_000,
@@ -544,7 +544,8 @@ class BridgeForegroundService : Service() {
         acquireWakeLock()
 
         // Default Jetta VS7 Mode 2: Direct 12B ([00 00 00 02][nalSize][ts] + [00 00 00 01 Annex-B])
-        CarLifeFrameCodec.useNestedVideoMsgHeader = false
+        val currentNestedMode = BridgeTelemetryBus.runtimeState.value.useNestedVideoMsgHeader
+        CarLifeFrameCodec.useNestedVideoMsgHeader = currentNestedMode
         isVideoChannelReadyForStreaming = false
 
         usbTransport = UsbAccessoryTransport(
@@ -600,7 +601,7 @@ class BridgeForegroundService : Service() {
                 isServiceRunning = true,
                 wakeLockHeld = wakeLock?.isHeld == true,
                 isVideoChannelReadyForStreaming = false,
-                useNestedVideoMsgHeader = false,
+                useNestedVideoMsgHeader = currentNestedMode,
                 configuredWidth = activeWidth,
                 configuredHeight = activeHeight,
                 configuredBitrateBps = activeBitrateBps,
@@ -838,11 +839,9 @@ class BridgeForegroundService : Service() {
                             bitRate = bitrate
                         )
                         if (wasReady && usbTransport.state.value is UsbTransportState.Connected) {
-                            val includeScreen = BridgeTelemetryBus.runtimeState.value.handshakeTestProfile !=
-                                HandshakeTestProfile.TEST_4_AUDIO_VIDEO_NO_SCREEN
                             triggerAutoVideoEncoderStart(
                                 reason = "Resolution/Bitrate Updated (${width}×${height})",
-                                includeForegroundAndScreenOn = includeScreen
+                                includeForegroundAndScreenOn = true
                             )
                         }
                     }
@@ -979,7 +978,7 @@ class BridgeForegroundService : Service() {
             ACTION_SET_HANDSHAKE_PROFILE -> {
                 val profileId = intent.getIntExtra(
                     EXTRA_HANDSHAKE_PROFILE_ID,
-                    HandshakeTestProfile.TEST_1_MATCH_ONLY.id
+                    HandshakeTestProfile.TEST_4_AUDIO_VIDEO_NO_SCREEN.id
                 )
                 val profile = HandshakeTestProfile.fromId(profileId)
                 controlStateMachine.handshakeTestProfile = profile
@@ -1112,9 +1111,9 @@ class BridgeForegroundService : Service() {
                         if (activeProfile == HandshakeTestProfile.TEST_4_AUDIO_VIDEO_NO_SCREEN) {
                             hasSentMdInfoInSession = true
                             triggerAutoVideoEncoderStart(
-                                reason = "Тест 4: Audio + Video Init (без FG/ScreenOn)",
+                                reason = "Тест 4: Audio + Video + FG + ScreenOn",
                                 sendAudioInitIfNeeded = false,
-                                includeForegroundAndScreenOn = false
+                                includeForegroundAndScreenOn = true
                             )
                             setVideoStreamingReady(true)
                             projectionManager.unlockVideoChannelAndRequestSyncFrame()
@@ -1127,7 +1126,19 @@ class BridgeForegroundService : Service() {
 
                     CarLifeMsgType.MSG_CMD_HU_INFO -> {
                         hasSentMdInfoInSession = true
-                        if (isVideoChannelReadyForStreaming) {
+                        if (activeProfile == HandshakeTestProfile.TEST_4_AUDIO_VIDEO_NO_SCREEN) {
+                            // После 0x00018003 (HU_INFO) и отправки полного MD_INFO (0x00010004):
+                            // AUDIO_INIT (0x0003/0x0004) -> INIT_DONE (0x00010008) -> START_DONE (0x0001000A) ->
+                            // FOREGROUND (0x00010025) -> SCREEN_ON (0x00010018) -> шлюз 0x0002 + SYNC_FRAME.
+                            sendAudioMultiplexerInitPackets()
+                            triggerAutoVideoEncoderStart(
+                                reason = "Пост-HU_INFO (0x00018003): Audio + Video + FG + ScreenOn",
+                                sendAudioInitIfNeeded = false,
+                                includeForegroundAndScreenOn = true
+                            )
+                            setVideoStreamingReady(true)
+                            projectionManager.unlockVideoChannelAndRequestSyncFrame()
+                        } else if (isVideoChannelReadyForStreaming) {
                             projectionManager.requestInstantIdrKeyFrame()
                         }
                     }

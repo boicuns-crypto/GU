@@ -44,13 +44,13 @@ enum class HandshakeTestProfile(
     ),
     TEST_4_AUDIO_VIDEO_NO_SCREEN(
         id = 4,
-        shortTitle = "Тест 4: Без FOREGROUND/SCREEN_ON (Audio + Video)",
-        description = "Отправить MATCH_STATUS + MD_INFO (0x00010004) + AUDIO_INIT (0x0003/0x0004) + INIT_DONE (0x00010008) + START_DONE (0x0001000A) и открыть 0x0002."
+        shortTitle = "Тест 4: Полный запуск (Audio + Video + FG + ScreenOn)",
+        description = "Рабочий профиль по умолчанию: полный MD_INFO (0x00010004) + AUDIO_INIT (0x0003/0x0004) + INIT_DONE (0x00010008) + START_DONE (0x0001000A) + FOREGROUND (0x00010025) + SCREEN_ON (0x00010018)."
     );
 
     companion object {
         fun fromId(id: Int): HandshakeTestProfile =
-            entries.firstOrNull { it.id == id } ?: TEST_1_MATCH_ONLY
+            entries.firstOrNull { it.id == id } ?: TEST_4_AUDIO_VIDEO_NO_SCREEN
     }
 }
 
@@ -88,7 +88,7 @@ class CarLifeControlStateMachine(
     private val mobileDeviceInfo: CarlifeDeviceInfoProto = CarlifeDeviceInfoProto(),
     @Volatile var preferredVideoWidth: Int = 800,
     @Volatile var preferredVideoHeight: Int = 480,
-    @Volatile var handshakeTestProfile: HandshakeTestProfile = HandshakeTestProfile.TEST_1_MATCH_ONLY
+    @Volatile var handshakeTestProfile: HandshakeTestProfile = HandshakeTestProfile.TEST_4_AUDIO_VIDEO_NO_SCREEN
 ) {
     private val _sessionState = MutableStateFlow(
         CarLifeControlSessionState(
@@ -414,7 +414,7 @@ class CarLifeControlStateMachine(
             HandshakeTestProfile.TEST_3_MATCH_MIN_MD_INFO_BT_OOB ->
                 "HU Protocol v${versionProto.majorVersion}.${versionProto.minorVersion} [Тест 3] -> TX MATCH_STATUS (0x00010002) + min MD_INFO (0x00010004) + empty BT_OOB (0x00010006)"
             HandshakeTestProfile.TEST_4_AUDIO_VIDEO_NO_SCREEN ->
-                "HU Protocol v${versionProto.majorVersion}.${versionProto.minorVersion} [Тест 4] -> TX MATCH_STATUS (0x00010002) + MD_INFO (0x00010004) + Audio + Video Init (no Screen/FG)"
+                "HU Protocol v${versionProto.majorVersion}.${versionProto.minorVersion} [Тест 4] -> TX MATCH_STATUS (0x00010002) + full MD_INFO (0x00010004) + Audio/Video + FG + ScreenOn"
         }
 
         _sessionState.update {

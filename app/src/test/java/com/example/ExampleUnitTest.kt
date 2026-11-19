@@ -518,20 +518,50 @@ class ExampleUnitTest {
         assertEquals(CarLifeMsgType.MSG_CMD_MD_BT_OOB_INFO, bt3.serviceType)
         assertEquals(0, bt3.body.size)
 
-        // Test 4: MATCH_STATUS + MD_INFO + Audio/Video Init WITHOUT FOREGROUND / SCREEN_ON
+        // Test 4 (Default Working Profile): MATCH_STATUS + full MD_INFO + Audio/Video Init + FOREGROUND + SCREEN_ON
         val sm4 = CarLifeControlStateMachine(handshakeTestProfile = HandshakeTestProfile.TEST_4_AUDIO_VIDEO_NO_SCREEN)
+        assertEquals(HandshakeTestProfile.TEST_4_AUDIO_VIDEO_NO_SCREEN, HandshakeTestProfile.fromId(99))
         val res4 = sm4.onControlFrame(versionFrame)
         assertEquals(2, res4.outboundFrames.size)
-        val initStartNoScreen = sm4.buildAutoVideoEncoderInitAndStartFrames(
+        val fullMdCmd = res4.outboundFrames[1].parseCommandMessageOrNull()!!
+        assertEquals(CarLifeMsgType.MSG_CMD_MD_INFO, fullMdCmd.serviceType)
+        assertTrue(fullMdCmd.body.size > 100)
+
+        val initStartWithFgScreen = sm4.buildAutoVideoEncoderInitAndStartFrames(
             width = 800,
             height = 480,
             fps = 30,
             reason = "Тест 4",
-            includeForegroundAndScreenOn = false
+            includeForegroundAndScreenOn = true
         )
-        assertEquals(2, initStartNoScreen.outboundFrames.size)
-        assertEquals(CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT_DONE, initStartNoScreen.outboundFrames[0].parseCommandMessageOrNull()?.serviceType)
-        assertEquals(CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_DONE, initStartNoScreen.outboundFrames[1].parseCommandMessageOrNull()?.serviceType)
+        assertEquals(4, initStartWithFgScreen.outboundFrames.size)
+        assertEquals(CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT_DONE, initStartWithFgScreen.outboundFrames[0].parseCommandMessageOrNull()?.serviceType)
+        assertEquals(CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_DONE, initStartWithFgScreen.outboundFrames[1].parseCommandMessageOrNull()?.serviceType)
+        assertEquals(CarLifeMsgType.MSG_CMD_FOREGROUND, initStartWithFgScreen.outboundFrames[2].parseCommandMessageOrNull()?.serviceType)
+        assertEquals(CarLifeMsgType.MSG_CMD_SCREEN_ON, initStartWithFgScreen.outboundFrames[3].parseCommandMessageOrNull()?.serviceType)
+
+        // Exact 16-byte wire format for FOREGROUND (0x00010025) and SCREEN_ON (0x00010018)
+        assertArrayEquals(
+            byteArrayOf(
+                0x00, 0x00, 0x00, 0x01,
+                0x00, 0x00, 0x00, 0x08,
+                0x00, 0x00, 0x00, 0x00,
+                0x00, 0x01, 0x00, 0x25
+            ),
+            CarLifeFrameCodec.encodeFrame(initStartWithFgScreen.outboundFrames[2])
+        )
+        assertArrayEquals(
+            byteArrayOf(
+                0x00, 0x00, 0x00, 0x01,
+                0x00, 0x00, 0x00, 0x08,
+                0x00, 0x00, 0x00, 0x00,
+                0x00, 0x01, 0x00, 0x18
+            ),
+            CarLifeFrameCodec.encodeFrame(initStartWithFgScreen.outboundFrames[3])
+        )
+
+        // Default video framing is Direct 12B, switchable to AOA 20B on the fly
+        assertFalse(CarLifeFrameCodec.useNestedVideoMsgHeader)
 
         // Full RX HEX without truncation even for >256B packets
         val largeRxPayload = ByteArray(320) { (it and 0xFF).toByte() }
