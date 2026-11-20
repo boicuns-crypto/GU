@@ -24,11 +24,13 @@ import android.os.Looper
 import android.os.SystemClock
 import android.util.DisplayMetrics
 import android.util.Log
+import android.content.res.Configuration
 import android.view.Display
 import android.view.InputDevice
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.Surface
+import android.view.ViewGroup
 import android.view.WindowManager
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
@@ -63,6 +65,7 @@ import androidx.savedstate.setViewTreeSavedStateRegistryOwner
 import com.example.core.carlife.CarLifeHardKeyPacket
 import com.example.core.carlife.CarLifeTouchPacket
 import com.example.core.input.CarLifeTouchAccessibilityService
+import com.example.feature.cockpit.AppLaunchMode
 import com.example.feature.cockpit.CarLifeAppLauncherScreen
 import com.example.feature.cockpit.CarLifeLauncherRepository
 import com.example.feature.cockpit.MediaControllerRepository
@@ -166,7 +169,7 @@ data class ProjectionPipelineStats(
     val height: Int = 720,
     val fps: Int = 30,
     val bitRateMbps: Int = 2,
-    val bitRateKbps: Int = 1800,
+    val bitRateKbps: Int = 2000,
     val encodedNalFrames: Long = 0L,
     val encodedBytes: Long = 0L,
     val lastIdrBytes: Int = 0,
@@ -174,7 +177,7 @@ data class ProjectionPipelineStats(
     val injectedTouches: Long = 0L,
     val lastTouchPoint: Pair<Float, Float>? = null,
     val activeCockpitWidget: String = "Тест-карта (Canvas) готова",
-    val statusMessage: String = "Тест-карта (Canvas) готова (1280×720 @ 1.8 Мбит/с, CBR 30fps)"
+    val statusMessage: String = "Тест-карта (Canvas) готова (1280×720 @ 2.0 Мбит/с, CBR 30fps, 160 dpi)"
 )
 
 /**
@@ -202,6 +205,9 @@ class CockpitProjectionManager(
     private var mediaCodec: MediaCodec? = null
     private var encoderInputSurface: Surface? = null
     private var virtualDisplay: VirtualDisplay? = null
+    private var virtualDisplayWidth: Int = 0
+    private var virtualDisplayHeight: Int = 0
+    private var virtualDisplayDpi: Int = 0
     private var cockpitPresentation: CockpitPresentation? = null
     private var encoderDrainJob: Job? = null
     private var canvasFeederJob: Job? = null
@@ -211,6 +217,32 @@ class CockpitProjectionManager(
 
     @Volatile
     var videoSourceMode: VideoSourceMode = VideoSourceMode.CANVAS_TEST_CARD
+
+    @Volatile
+    var appLaunchMode: AppLaunchMode = CarLifeLauncherRepository.appLaunchMode.value
+        private set
+
+    init {
+        CarLifeLauncherRepository.onFallbackToPhoneScreen = {
+            if (_stats.value.usingMediaProjection) {
+                mainHandler.post {
+                    runCatching { cockpitPresentation?.dismiss() }
+                    cockpitPresentation = null
+                }
+            }
+        }
+    }
+
+    fun setAppLaunchMode(mode: AppLaunchMode) {
+        appLaunchMode = mode
+        CarLifeLauncherRepository.setAppLaunchMode(mode)
+        if (mode == AppLaunchMode.SCREEN_MIRRORING) {
+            mainHandler.post {
+                runCatching { cockpitPresentation?.dismiss() }
+                cockpitPresentation = null
+            }
+        }
+    }
 
     /**
      * Gate for channel `0x0002` video streaming:
@@ -259,8 +291,8 @@ class CockpitProjectionManager(
         width: Int = 1280,
         height: Int = 720,
         frameRate: Int = 30,
-        bitRate: Int = 1_800_000,
-        densityDpi: Int = DisplayMetrics.DENSITY_MEDIUM,
+        bitRate: Int = DEFAULT_BITRATE_BPS,
+        densityDpi: Int = FIXED_VIRTUAL_DISPLAY_DPI,
         sourceMode: VideoSourceMode = this.videoSourceMode
     ): Boolean {
         val safeWidth = if (width in 480..3840) width else 1280
@@ -279,27 +311,28 @@ class CockpitProjectionManager(
                 current.bitRateKbps == (safeBitRate / 1_000)
         }
         if (alreadyActive) return true
-        return startProjection(safeWidth, safeHeight, safeFps, safeBitRate, densityDpi, sourceMode)
+        return startProjection(safeWidth, safeHeight, safeFps, safeBitRate, FIXED_VIRTUAL_DISPLAY_DPI, sourceMode)
     }
 
     suspend fun startProjection(
         width: Int = 1280,
         height: Int = 720,
         frameRate: Int = 30,
-        bitRate: Int = 1_800_000,
-        densityDpi: Int = DisplayMetrics.DENSITY_MEDIUM,
+        bitRate: Int = DEFAULT_BITRATE_BPS,
+        densityDpi: Int = FIXED_VIRTUAL_DISPLAY_DPI,
         sourceMode: VideoSourceMode = this.videoSourceMode
     ): Boolean = projectionMutex.withLock {
         videoSourceMode = sourceMode
-        // Stop only the previous MediaCodec / Surface (while preserving MediaProjection & VirtualDisplay in VD mode,
-        // or releasing VirtualDisplay when switching to pure Canvas Test Card mode).
+        // Stop only the previous MediaCodec / Surface (while preserving MediaProjection & VirtualDisplay in VD mode
+        // ONLY if its exact dimensions and 160 dpi already match — zero intermediate resizes).
         stopEncoderOnlyLocked()
 
         val safeWidth = if (width in 480..3840) width else 1280
         val safeHeight = if (height in 272..2160) height else 720
         val safeFps = if (frameRate in 15..60) frameRate else 30
         val safeBitRate = bitRate.coerceIn(400_000, 12_000_000)
-        val effectiveDpi = if (safeWidth <= 1024) DisplayMetrics.DENSITY_MEDIUM else densityDpi
+        // Hard-lock VirtualDisplay density to 160 dpi (DisplayMetrics.DENSITY_MEDIUM) for sharp 1280×720 proportions.
+        val effectiveDpi = FIXED_VIRTUAL_DISPLAY_DPI
 
         if (sourceMode == VideoSourceMode.VIRTUAL_DISPLAY && CarLifeLauncherRepository.installedApps.value.isEmpty()) {
             externalScope.launch(Dispatchers.IO) {
@@ -316,6 +349,9 @@ class CockpitProjectionManager(
             runCatching { virtualDisplay?.surface = null }
             runCatching { virtualDisplay?.release() }
             virtualDisplay = null
+            virtualDisplayWidth = 0
+            virtualDisplayHeight = 0
+            virtualDisplayDpi = 0
         }
 
         var codec: MediaCodec? = null
@@ -364,14 +400,35 @@ class CockpitProjectionManager(
                 }
             } else {
                 if (usedMediaProjection && vDisplay != null) {
-                    // Reuse existing VirtualDisplay on Android 14/15/16: resize to new resolution & swap Surface
-                    runCatching {
-                        vDisplay!!.resize(safeWidth, safeHeight, effectiveDpi)
-                        vDisplay!!.surface = inputSurface
-                    }.onFailure { e ->
-                        Log.w(TAG, "VirtualDisplay resize/setSurface failed (${e.message}), recreating")
+                    val exactSizeMatches =
+                        virtualDisplayWidth == safeWidth &&
+                            virtualDisplayHeight == safeHeight &&
+                            virtualDisplayDpi == effectiveDpi
+                    if (exactSizeMatches) {
+                        // Reuse VirtualDisplay ONLY when exact (width, height, 160 dpi) already match — zero intermediate resize.
+                        runCatching {
+                            vDisplay!!.surface = inputSurface
+                        }.onFailure { e ->
+                            Log.w(TAG, "VirtualDisplay setSurface failed (${e.message}), recreating cleanly")
+                            runCatching { vDisplay?.release() }
+                            vDisplay = null
+                            virtualDisplayWidth = 0
+                            virtualDisplayHeight = 0
+                            virtualDisplayDpi = 0
+                            usedMediaProjection = false
+                        }
+                    } else {
+                        // Dimensions or DPI changed: recreate VirtualDisplay cleanly at exact synchronized size (no resize drift).
+                        withContext(Dispatchers.Main.immediate) {
+                            runCatching { cockpitPresentation?.dismiss() }
+                            cockpitPresentation = null
+                        }
+                        runCatching { vDisplay?.surface = null }
                         runCatching { vDisplay?.release() }
                         vDisplay = null
+                        virtualDisplayWidth = 0
+                        virtualDisplayHeight = 0
+                        virtualDisplayDpi = 0
                         usedMediaProjection = false
                     }
                 }
@@ -408,6 +465,9 @@ class CockpitProjectionManager(
                                     null,
                                     mainHandler
                                 )
+                                virtualDisplayWidth = safeWidth
+                                virtualDisplayHeight = safeHeight
+                                virtualDisplayDpi = effectiveDpi
                                 usedMediaProjection = true
                             }
                         }.onFailure { e ->
@@ -421,14 +481,29 @@ class CockpitProjectionManager(
                     val createdDisplay = vDisplay!!.display
                     awaitDisplayRegistered(createdDisplay.displayId)
 
-                    // Immediately render CarLife Launcher UI onto the VirtualDisplay via CockpitPresentation
-                    if (cockpitPresentation == null || cockpitPresentation?.display?.displayId != createdDisplay.displayId) {
+                    // Only attach CockpitPresentation in VIRTUAL_DISPLAY_IF_AVAILABLE mode;
+                    // in SCREEN_MIRRORING mode leave MediaProjection unobstructed so the phone screen mirrors directly.
+                    if (appLaunchMode == AppLaunchMode.SCREEN_MIRRORING) {
+                        withContext(Dispatchers.Main.immediate) {
+                            runCatching { cockpitPresentation?.dismiss() }
+                            cockpitPresentation = null
+                        }
+                    } else if (
+                        cockpitPresentation == null ||
+                        cockpitPresentation?.display?.displayId != createdDisplay.displayId ||
+                        cockpitPresentation?.targetWidth != safeWidth ||
+                        cockpitPresentation?.targetHeight != safeHeight
+                    ) {
                         runCatching {
                             withContext(Dispatchers.Main.immediate) {
                                 runCatching { cockpitPresentation?.dismiss() }
                                 cockpitPresentation = null
                             }
-                            val presentation = showPresentationWithRetry(createdDisplay)
+                            val presentation = showPresentationWithRetry(
+                                display = createdDisplay,
+                                targetWidth = safeWidth,
+                                targetHeight = safeHeight
+                            )
                             withContext(Dispatchers.Main.immediate) {
                                 cockpitPresentation = presentation
                                 presentation.window?.decorView?.postInvalidate()
@@ -985,7 +1060,11 @@ class CockpitProjectionManager(
         }
     }
 
-    private suspend fun showPresentationWithRetry(display: Display): CockpitPresentation {
+    private suspend fun showPresentationWithRetry(
+        display: Display,
+        targetWidth: Int,
+        targetHeight: Int
+    ): CockpitPresentation {
         var lastError: Throwable? = null
         val isPrivateDisplay = (display.flags and Display.FLAG_PRIVATE) != 0
         val windowType = if (isPrivateDisplay) {
@@ -997,13 +1076,25 @@ class CockpitProjectionManager(
         for (attempt in 0 until 3) {
             try {
                 return withContext(Dispatchers.Main.immediate) {
-                    // Try standard appContext / displayContext first so Presentation attaches cleanly
-                    val displayContext = runCatching { appContext.createDisplayContext(display) }.getOrElse { appContext }
+                    val baseDisplayContext = runCatching { appContext.createDisplayContext(display) }.getOrElse { appContext }
+                    // Synchronize Presentation densityDpi = 160 and exact targetWidth x targetHeight (1280x720)
+                    val fixedConfig = Configuration(baseDisplayContext.resources.configuration).apply {
+                        densityDpi = FIXED_VIRTUAL_DISPLAY_DPI
+                        screenWidthDp = targetWidth
+                        screenHeightDp = targetHeight
+                        smallestScreenWidthDp = minOf(targetWidth, targetHeight)
+                    }
+                    val displayContext = runCatching {
+                        baseDisplayContext.createConfigurationContext(fixedConfig)
+                    }.getOrElse { baseDisplayContext }
+
                     val presentation = runCatching {
                         CockpitPresentation(
                             outerContext = displayContext,
                             display = display,
-                            statsFlow = _stats
+                            statsFlow = _stats,
+                            targetWidth = targetWidth,
+                            targetHeight = targetHeight
                         ).also { it.show() }
                     }.getOrElse {
                         val winContext = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -1016,7 +1107,9 @@ class CockpitProjectionManager(
                         CockpitPresentation(
                             outerContext = winContext,
                             display = display,
-                            statsFlow = _stats
+                            statsFlow = _stats,
+                            targetWidth = targetWidth,
+                            targetHeight = targetHeight
                         ).also { it.show() }
                     }
                     presentation
@@ -1337,6 +1430,9 @@ class CockpitProjectionManager(
 
         runCatching { virtualDisplay?.release() }
         virtualDisplay = null
+        virtualDisplayWidth = 0
+        virtualDisplayHeight = 0
+        virtualDisplayDpi = 0
 
         runCatching {
             mediaProjectionCallback?.let { cb ->
@@ -1655,21 +1751,11 @@ class CockpitProjectionManager(
                                 lastCodecFrameElapsedMs = SystemClock.elapsedRealtime()
                                 awaitingFirstIdrAfterGateOpen.set(false)
                                 // Send ONE combined packet: cachedSpsPps + idrBytes (unless already prepended)
-                                val totalIdrSize = emitCombinedSpsPpsAndIdr(
+                                // Keep steady configured CBR bitrate (2 000 000 bps default) for crisp 1280×720 clarity.
+                                emitCombinedSpsPpsAndIdr(
                                     idrBytes = rawNal,
                                     timestampMs = timestampMs
                                 )
-
-                                // If hardware rate-controller produced an IDR > 45 KB, dynamically lower target bitrate smoothly (floor 800 kbps)
-                                if (totalIdrSize > 45_000 && currentDynamicBitrate > 800_000) {
-                                    currentDynamicBitrate = (currentDynamicBitrate * 80 / 100).coerceAtLeast(800_000)
-                                    runCatching {
-                                        val b = Bundle().apply {
-                                            putInt(MediaCodec.PARAMETER_KEY_VIDEO_BITRATE, currentDynamicBitrate)
-                                        }
-                                        codec.setParameters(b)
-                                    }
-                                }
                             } else if (!awaitingFirstIdrAfterGateOpen.get()) {
                                 lastCodecFrameElapsedMs = SystemClock.elapsedRealtime()
                                 // Regular P-frame (Slice): send as-is in ONE packet without splitting
@@ -1733,6 +1819,10 @@ class CockpitProjectionManager(
         private const val DEQUEUE_TIMEOUT_US = 10_000L
         private const val WINDOW_TYPE_PRIVATE_PRESENTATION = 2030
         private const val WINDOW_TYPE_PRESENTATION = 2037
+        const val DEFAULT_WIDTH = 1280
+        const val DEFAULT_HEIGHT = 720
+        const val DEFAULT_BITRATE_BPS = 2_000_000
+        const val FIXED_VIRTUAL_DISPLAY_DPI = DisplayMetrics.DENSITY_MEDIUM // 160 dpi
     }
 }
 
@@ -1781,17 +1871,22 @@ private class PresentationLifecycleOwner :
 class CockpitPresentation(
     outerContext: Context,
     display: Display,
-    private val statsFlow: StateFlow<ProjectionPipelineStats>
+    private val statsFlow: StateFlow<ProjectionPipelineStats>,
+    val targetWidth: Int = CockpitProjectionManager.DEFAULT_WIDTH,
+    val targetHeight: Int = CockpitProjectionManager.DEFAULT_HEIGHT
 ) : Presentation(outerContext, display) {
 
     private val lifecycleOwner = PresentationLifecycleOwner()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        window?.setFlags(
-            WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
-            WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED
-        )
+        window?.apply {
+            setFlags(
+                WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
+                WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED
+            )
+            setLayout(targetWidth, targetHeight)
+        }
 
         lifecycleOwner.onCreate()
 
@@ -1802,6 +1897,7 @@ class CockpitPresentation(
 
         val targetDisplayId = display.displayId
         val composeView = ComposeView(context).apply {
+            layoutParams = ViewGroup.LayoutParams(targetWidth, targetHeight)
             setViewTreeLifecycleOwner(lifecycleOwner)
             setViewTreeViewModelStoreOwner(lifecycleOwner)
             setViewTreeSavedStateRegistryOwner(lifecycleOwner)
@@ -1817,7 +1913,8 @@ class CockpitPresentation(
                 }
             }
         }
-        setContentView(composeView)
+        setContentView(composeView, ViewGroup.LayoutParams(targetWidth, targetHeight))
+        window?.setLayout(targetWidth, targetHeight)
     }
 
     override fun onStart() {

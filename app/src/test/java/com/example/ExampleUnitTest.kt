@@ -4,9 +4,11 @@ import android.view.MotionEvent
 import com.example.core.carlife.CarLifePacketBuilder
 import com.example.core.carlife.CarLifeProtocolConstants
 import com.example.core.carlife.CarLifeTouchPacket
+import com.example.core.projection.CockpitProjectionManager
 import com.example.core.projection.ProjectionPipelineStats
 import com.example.core.projection.VideoSourceMode
 import com.example.core.usb.BridgeRuntimeState
+import com.example.feature.cockpit.AppLaunchMode
 import com.example.protocol.carlife.CarLifeChannel
 import com.example.protocol.carlife.CarLifeControlStateMachine
 import com.example.protocol.carlife.CarLifeFrameCodec
@@ -360,7 +362,7 @@ class ExampleUnitTest {
         assertEquals(1, profiles.size)
         assertEquals(1280, profiles[0].width)
         assertEquals(720, profiles[0].height)
-        assertEquals(1_800_000, profiles[0].bitrateBps)
+        assertEquals(2_000_000, profiles[0].bitrateBps)
         assertEquals(true, profiles[0].useNestedVideoHeader)
         assertEquals(true, profiles[0].forceAudioMultiplexerInit)
 
@@ -841,17 +843,21 @@ class ExampleUnitTest {
 
     @Test
     fun dynamicTouchScaling_andDefault1280x720Resolution_andHfpTelephonyBlocked() {
-        // 1. Default resolution 1280x720@30fps (1800 kbps) and huTouchMax 1280x720
+        // 1. Default resolution 1280x720@30fps (2 000 000 bps / 2 Mbps), 160 dpi, and huTouchMax 1280x720
         val defaultRuntime = BridgeRuntimeState()
         assertEquals(1280, defaultRuntime.configuredWidth)
         assertEquals(720, defaultRuntime.configuredHeight)
-        assertEquals(1_800_000, defaultRuntime.configuredBitrateBps)
+        assertEquals(2_000_000, defaultRuntime.configuredBitrateBps)
+        assertEquals(AppLaunchMode.VIRTUAL_DISPLAY_IF_AVAILABLE, defaultRuntime.appLaunchMode)
+        assertEquals(AppLaunchMode.SCREEN_MIRRORING, AppLaunchMode.fromId("screen_mirroring"))
 
         val defaultStats = ProjectionPipelineStats()
         assertEquals(1280, defaultStats.width)
         assertEquals(720, defaultStats.height)
         assertEquals(30, defaultStats.fps)
-        assertEquals(1800, defaultStats.bitRateKbps)
+        assertEquals(2000, defaultStats.bitRateKbps)
+        assertEquals(160, CockpitProjectionManager.FIXED_VIRTUAL_DISPLAY_DPI)
+        assertEquals(2_000_000, CockpitProjectionManager.DEFAULT_BITRATE_BPS)
 
         assertEquals(1280f, CarLifeTouchDecoder.DEFAULT_HU_TOUCH_MAX_X, 0.01f)
         assertEquals(720f, CarLifeTouchDecoder.DEFAULT_HU_TOUCH_MAX_Y, 0.01f)

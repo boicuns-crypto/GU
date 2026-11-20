@@ -27,6 +27,8 @@ import com.example.core.projection.CockpitProjectionManager
 import com.example.core.projection.MediaProjectionTokenStore
 import com.example.core.projection.ProjectionPipelineStats
 import com.example.core.projection.VideoSourceMode
+import com.example.feature.cockpit.AppLaunchMode
+import com.example.feature.cockpit.CarLifeLauncherRepository
 import com.example.protocol.carlife.CarLifeChannel
 import com.example.protocol.carlife.CarLifeControlSessionState
 import com.example.protocol.carlife.CarLifeControlStateMachine
@@ -89,9 +91,9 @@ data class AutoTestState(
     val isRunning: Boolean = false,
     val currentStep: Int = 0,
     val totalSteps: Int = 0,
-    val activeProfileLabel: String = "1280×720 • 1.8 Мбит/с • CBR 30fps • AOA 20B (0x00020001) + Audio Init",
-    val statusMessage: String = "Авто-тестер отключён: зафиксирован профиль Jetta VS7 (1280×720 • 1.8 Мбит/с • CBR 30fps • AOA 20B + Audio Init)",
-    val matchedProfileLabel: String? = "1280×720 • 1.8 Мбит/с • CBR 30fps • AOA 20B (0x00020001) + Audio Init",
+    val activeProfileLabel: String = "1280×720 • 2.0 Мбит/с • CBR 30fps • 160 dpi • AOA 20B (0x00020001)",
+    val statusMessage: String = "Авто-тестер отключён: зафиксирован профиль Jetta VS7 (1280×720 • 2.0 Мбит/с • CBR 30fps • 160 dpi • AOA 20B)",
+    val matchedProfileLabel: String? = "1280×720 • 2.0 Мбит/с • CBR 30fps • 160 dpi • AOA 20B (0x00020001)",
     val audioInitForced: Boolean = true
 )
 
@@ -107,10 +109,11 @@ data class BridgeRuntimeState(
     val isVideoChannelReadyForStreaming: Boolean = false,
     val useNestedVideoMsgHeader: Boolean = true,
     val videoSourceMode: VideoSourceMode = VideoSourceMode.CANVAS_TEST_CARD,
+    val appLaunchMode: AppLaunchMode = AppLaunchMode.VIRTUAL_DISPLAY_IF_AVAILABLE,
     val handshakeTestProfile: HandshakeTestProfile = HandshakeTestProfile.TEST_4_AUDIO_VIDEO_NO_SCREEN,
     val configuredWidth: Int = 1280,
     val configuredHeight: Int = 720,
-    val configuredBitrateBps: Int = 1_800_000,
+    val configuredBitrateBps: Int = 2_000_000,
     val autoTestState: AutoTestState = AutoTestState(),
     val lastTouchOrKeyEvent: String = "None — Waiting for Touch/Hardkey Channel (0x0006)",
     val rxBytes: Long = 0L,
@@ -148,6 +151,16 @@ object BridgeTelemetryBus {
             it.copy(
                 videoSourceMode = mode,
                 lastProtocolEvent = "Источник видео: ${mode.title}"
+            )
+        }
+    }
+
+    fun setAppLaunchMode(mode: AppLaunchMode) {
+        CarLifeLauncherRepository.setAppLaunchMode(mode)
+        _runtimeState.update {
+            it.copy(
+                appLaunchMode = mode,
+                lastProtocolEvent = "Режим запуска приложений: ${mode.title}"
             )
         }
     }
@@ -317,7 +330,7 @@ class BridgeForegroundService : Service() {
     private var activeHeight: Int = 720
 
     @Volatile
-    private var activeBitrateBps: Int = 1_800_000
+    private var activeBitrateBps: Int = 2_000_000
 
     @Volatile
     private var hasSentMdInfoInSession: Boolean = false
@@ -568,7 +581,7 @@ class BridgeForegroundService : Service() {
         CarLifeFrameCodec.useNestedVideoMsgHeader = true
         activeWidth = 1280
         activeHeight = 720
-        activeBitrateBps = 1_800_000
+        activeBitrateBps = 2_000_000
         forceAudioInitForSession = true
         controlStateMachine.setPreferredResolution(1280, 720)
 
@@ -576,18 +589,18 @@ class BridgeForegroundService : Service() {
             current.copy(
                 configuredWidth = 1280,
                 configuredHeight = 720,
-                configuredBitrateBps = 1_800_000,
+                configuredBitrateBps = 2_000_000,
                 useNestedVideoMsgHeader = true,
                 autoTestState = AutoTestState(
                     isRunning = false,
                     currentStep = 0,
                     totalSteps = 0,
-                    activeProfileLabel = "1280×720 • 1.8 Мбит/с • CBR 30fps • AOA 20B (0x00020001) + Audio Init",
-                    statusMessage = "Авто-тестер отключён: зафиксирован профиль Jetta VS7 (1280×720 • 1.8 Мбит/с • CBR 30fps • AOA 20B + Audio Init)",
-                    matchedProfileLabel = "1280×720 • 1.8 Мбит/с • CBR 30fps • AOA 20B (0x00020001) + Audio Init",
+                    activeProfileLabel = "1280×720 • 2.0 Мбит/с • CBR 30fps • 160 dpi • AOA 20B (0x00020001)",
+                    statusMessage = "Авто-тестер отключён: зафиксирован профиль Jetta VS7 (1280×720 • 2.0 Мбит/с • CBR 30fps • 160 dpi • AOA 20B)",
+                    matchedProfileLabel = "1280×720 • 2.0 Мбит/с • CBR 30fps • 160 dpi • AOA 20B (0x00020001)",
                     audioInitForced = true
                 ),
-                lastProtocolEvent = "Locked Jetta VS7 Profile: 1280×720 @ 1.8 Mbps CBR 30fps, AOA 20B (0x00020001) + Audio Init"
+                lastProtocolEvent = "Locked Jetta VS7 Profile: 1280×720 @ 2.0 Mbps CBR 30fps (160 dpi), AOA 20B (0x00020001) + Audio Init"
             )
         }
 
@@ -596,7 +609,7 @@ class BridgeForegroundService : Service() {
                 width = 1280,
                 height = 720,
                 frameRate = 30,
-                bitRate = 1_800_000,
+                bitRate = 2_000_000,
                 sourceMode = activeVideoSourceMode
             )
             if (usbTransport.state.value is UsbTransportState.Connected) {
@@ -971,6 +984,24 @@ class BridgeForegroundService : Service() {
                     if (effectiveReadyBeforeStart || isVideoChannelReadyForStreaming || hasSentMdInfoInSession) {
                         setVideoStreamingReady(true)
                         projectionManager.unlockVideoChannelAndRequestSyncFrame()
+                    }
+                }
+            }
+
+            ACTION_SET_APP_LAUNCH_MODE -> {
+                val modeId = intent.getStringExtra(EXTRA_APP_LAUNCH_MODE)
+                val selectedMode = AppLaunchMode.fromId(modeId)
+                projectionManager.setAppLaunchMode(selectedMode)
+                BridgeTelemetryBus.setAppLaunchMode(selectedMode)
+                if (activeVideoSourceMode == VideoSourceMode.VIRTUAL_DISPLAY && projectionManager.stats.value.isRunning) {
+                    serviceScope.launch {
+                        projectionManager.startProjection(
+                            width = activeWidth,
+                            height = activeHeight,
+                            frameRate = 30,
+                            bitRate = activeBitrateBps,
+                            sourceMode = activeVideoSourceMode
+                        )
                     }
                 }
             }
@@ -1568,6 +1599,7 @@ class BridgeForegroundService : Service() {
         const val ACTION_SEND_VIDEO_HEARTBEAT = "com.example.core.usb.action.SEND_VIDEO_HEARTBEAT"
         const val ACTION_TOGGLE_VIDEO_HEADER_MODE = "com.example.core.usb.action.TOGGLE_VIDEO_HEADER_MODE"
         const val ACTION_SET_VIDEO_SOURCE_MODE = "com.example.core.usb.action.SET_VIDEO_SOURCE_MODE"
+        const val ACTION_SET_APP_LAUNCH_MODE = "com.example.core.usb.action.SET_APP_LAUNCH_MODE"
         const val ACTION_SET_HANDSHAKE_PROFILE = "com.example.core.usb.action.SET_HANDSHAKE_PROFILE"
         const val ACTION_START_AUTO_TEST = "com.example.core.usb.action.START_AUTO_TEST"
         const val ACTION_STOP_AUTO_TEST = "com.example.core.usb.action.STOP_AUTO_TEST"
@@ -1583,6 +1615,7 @@ class BridgeForegroundService : Service() {
         const val EXTRA_TOUCH_Y = "extra_touch_y"
         const val EXTRA_USE_NESTED_VIDEO_HEADER = "extra_use_nested_video_header"
         const val EXTRA_VIDEO_SOURCE_MODE = "extra_video_source_mode"
+        const val EXTRA_APP_LAUNCH_MODE = "extra_app_launch_mode"
         const val EXTRA_HANDSHAKE_PROFILE_ID = "extra_handshake_profile_id"
 
         const val AUTO_TEST_STEP_TIMEOUT_MS = 1_500L
@@ -1592,10 +1625,10 @@ class BridgeForegroundService : Service() {
         val AUTO_TEST_PROFILES: List<AutoTestProfile> = listOf(
             AutoTestProfile(
                 stepNumber = 1,
-                label = "1280×720 • 1.8 Мбит/с • CBR 30fps • AOA 20B (0x00020001) + Audio Init (0x0003/0x0004)",
+                label = "1280×720 • 2.0 Мбит/с • CBR 30fps • 160 dpi • AOA 20B (0x00020001) + Audio Init (0x0003/0x0004)",
                 width = 1280,
                 height = 720,
-                bitrateBps = 1_800_000,
+                bitrateBps = 2_000_000,
                 useNestedVideoHeader = true,
                 forceAudioMultiplexerInit = true
             )
@@ -1607,7 +1640,7 @@ class BridgeForegroundService : Service() {
                 putExtra(EXTRA_WIDTH, 1280)
                 putExtra(EXTRA_HEIGHT, 720)
                 putExtra(EXTRA_FPS, 30)
-                putExtra(EXTRA_BITRATE, 1_800_000)
+                putExtra(EXTRA_BITRATE, 2_000_000)
             }
             runCatching {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {

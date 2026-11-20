@@ -112,8 +112,34 @@ data class InstalledAppInfo(
 )
 
 /**
+ * Selectable launch strategy for apps clicked inside «CarLife Кокпит».
+ */
+enum class AppLaunchMode(
+    val id: String,
+    val title: String,
+    val subtitle: String
+) {
+    VIRTUAL_DISPLAY_IF_AVAILABLE(
+        id = "virtual_display",
+        title = "На VirtualDisplay (если доступно)",
+        subtitle = "Сначала запуск через ActivityOptions(launchDisplayId); при SecurityException — мгновенный запасной запуск без ActivityOptions."
+    ),
+    SCREEN_MIRRORING(
+        id = "screen_mirroring",
+        title = "Зеркалирование экрана (MediaProjection)",
+        subtitle = "Запуск приложений сразу на основном экране телефона без ActivityOptions для зеркалирования через MediaProjection."
+    );
+
+    companion object {
+        fun fromId(id: String?): AppLaunchMode =
+            entries.firstOrNull { it.id == id } ?: VIRTUAL_DISPLAY_IF_AVAILABLE
+    }
+}
+
+/**
  * Repository that queries all installed `CATEGORY_LAUNCHER` applications on the smartphone
- * and launches any selected application onto the target CarLife `VirtualDisplay` (`displayId`).
+ * and launches any selected application onto the target CarLife `VirtualDisplay` (`displayId`)
+ * or directly onto the default display without `ActivityOptions` on fallback / Screen Mirroring.
  */
 object CarLifeLauncherRepository {
     private const val TAG = "CarLifeLauncherRepo"
@@ -140,6 +166,17 @@ object CarLifeLauncherRepository {
         "Лаунчер ГУ активен — готов к выводу на VirtualDisplay автомобиля"
     )
     val lastLaunchStatus: StateFlow<String> = _lastLaunchStatus.asStateFlow()
+
+    private val _appLaunchMode = MutableStateFlow(AppLaunchMode.VIRTUAL_DISPLAY_IF_AVAILABLE)
+    val appLaunchMode: StateFlow<AppLaunchMode> = _appLaunchMode.asStateFlow()
+
+    @Volatile
+    var onFallbackToPhoneScreen: (() -> Unit)? = null
+
+    fun setAppLaunchMode(mode: AppLaunchMode) {
+        _appLaunchMode.value = mode
+        _lastLaunchStatus.value = "Режим запуска: ${mode.title}"
+    }
 
     fun markLauncherActiveOnDisplay(
         displayId: Int,
@@ -221,20 +258,9 @@ object CarLifeLauncherRepository {
         }
     }
 
-    /**
-     * Launches [app] using `packageManager.getLaunchIntentForPackage(pkg)` with
-     * `FLAG_ACTIVITY_NEW_TASK or FLAG_ACTIVITY_RESET_TASK_IF_NEEDED`.
-     * When a CarLife `VirtualDisplay` is active ([targetDisplayId] != [Display.DEFAULT_DISPLAY]),
-     * attempts `ActivityOptions.makeBasic().setLaunchDisplayId(targetDisplayId).toBundle()` first
-     * and automatically falls back to a standard default-display launch with a short Toast + log
-     * if Android 16 rejects VirtualDisplay launch.
-     */
-    fun launchAppOnVirtualDisplay(
-        context: Context,
-        app: InstalledAppInfo,
-        targetDisplayId: Int
-    ): Boolean {
-        val launchIntent = context.packageManager.getLaunchIntentForPackage(app.packageName)
+    private fun buildLaunchIntent(context: Context, app: InstalledAppInfo): Intent? {
+        val pm = (context.applicationContext ?: context).packageManager
+        val intent = pm.getLaunchIntentForPackage(app.packageName)
             ?: if (app.activityName.isNotBlank()) {
                 Intent(Intent.ACTION_MAIN).apply {
                     addCategory(Intent.CATEGORY_LAUNCHER)
@@ -243,7 +269,60 @@ object CarLifeLauncherRepository {
             } else {
                 null
             }
+        return intent?.apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED)
+        }
+    }
 
+    private fun resolveDefaultDisplayContext(context: Context): Context {
+        val isNonDefaultDisplayContext = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            runCatching { context.display?.displayId }.getOrNull().let {
+                it != null && it != Display.DEFAULT_DISPLAY
+            }
+        } else {
+            false
+        }
+        return if (isNonDefaultDisplayContext) {
+            context.applicationContext ?: context
+        } else {
+            context
+        }
+    }
+
+    private fun startOnDefaultDisplayWithoutOptions(
+        context: Context,
+        launchIntent: Intent
+    ) {
+        val primaryFallbackCtx = resolveDefaultDisplayContext(context)
+        try {
+            primaryFallbackCtx.startActivity(launchIntent)
+        } catch (sec: SecurityException) {
+            val appCtx = context.applicationContext
+            if (appCtx != null && appCtx !== primaryFallbackCtx) {
+                appCtx.startActivity(launchIntent)
+            } else {
+                throw sec
+            }
+        }
+    }
+
+    /**
+     * Launches [app] using `packageManager.getLaunchIntentForPackage(pkg)` with
+     * `FLAG_ACTIVITY_NEW_TASK or FLAG_ACTIVITY_RESET_TASK_IF_NEEDED`.
+     *
+     * - In [AppLaunchMode.VIRTUAL_DISPLAY_IF_AVAILABLE]:
+     *   1. First tries `context.startActivity(intent, ActivityOptions.makeBasic().setLaunchDisplayId(targetDisplayId).toBundle())`.
+     *   2. On `SecurityException` (e.g. Android 16 Permission Denial) or any launch failure, does NOT stop at Toast:
+     *      immediately runs fallback `startActivity(intent)` WITHOUT `ActivityOptions` on the default display.
+     * - In [AppLaunchMode.SCREEN_MIRRORING]:
+     *   Launches directly on the phone's default display without `ActivityOptions` for MediaProjection mirroring.
+     */
+    fun launchAppOnVirtualDisplay(
+        context: Context,
+        app: InstalledAppInfo,
+        targetDisplayId: Int
+    ): Boolean {
+        val launchIntent = buildLaunchIntent(context, app)
         if (launchIntent == null) {
             val reason = "Не найден LaunchIntent для ${app.label} (${app.packageName})"
             Log.w(TAG, reason)
@@ -252,11 +331,13 @@ object CarLifeLauncherRepository {
             return false
         }
 
-        launchIntent.addFlags(
-            Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED
-        )
+        val currentMode = _appLaunchMode.value
+        val shouldTryVirtualDisplay =
+            currentMode == AppLaunchMode.VIRTUAL_DISPLAY_IF_AVAILABLE &&
+                Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+                targetDisplayId != Display.DEFAULT_DISPLAY
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && targetDisplayId != Display.DEFAULT_DISPLAY) {
+        if (shouldTryVirtualDisplay) {
             try {
                 val options = ActivityOptions.makeBasic()
                     .setLaunchDisplayId(targetDisplayId)
@@ -264,16 +345,38 @@ object CarLifeLauncherRepository {
                 context.startActivity(launchIntent, options)
                 _lastLaunchStatus.value = "Запущено: ${app.label} (${app.packageName}) -> VirtualDisplay #$targetDisplayId"
                 return true
+            } catch (secErr: SecurityException) {
+                val vdReason = secErr.message ?: "Permission Denial"
+                Log.w(
+                    TAG,
+                    "SecurityException launching ${app.packageName} on VD #$targetDisplayId ($vdReason) — executing immediate fallback startActivity(intent) without ActivityOptions",
+                    secErr
+                )
+                return try {
+                    onFallbackToPhoneScreen?.invoke()
+                    startOnDefaultDisplayWithoutOptions(context, launchIntent)
+                    val fallbackMsg = "VD #$targetDisplayId отклонён (Permission Denial): ${app.label} запущено на экране телефона"
+                    _lastLaunchStatus.value = fallbackMsg
+                    showLaunchToast(context, fallbackMsg)
+                    true
+                } catch (fallbackError: Throwable) {
+                    val errMsg = "Ошибка запасного запуска ${app.label}: ${fallbackError.message ?: fallbackError.javaClass.simpleName}"
+                    Log.e(TAG, "Fallback launch failed for ${app.packageName}", fallbackError)
+                    _lastLaunchStatus.value = errMsg
+                    showLaunchToast(context, errMsg)
+                    false
+                }
             } catch (vdError: Throwable) {
                 val vdReason = vdError.message ?: vdError.javaClass.simpleName
                 Log.w(
                     TAG,
-                    "VirtualDisplay #$targetDisplayId launch rejected for ${app.packageName} ($vdReason) — falling back to default display",
+                    "VirtualDisplay #$targetDisplayId launch failed for ${app.packageName} ($vdReason) — executing fallback startActivity(intent) without ActivityOptions",
                     vdError
                 )
                 return try {
-                    context.startActivity(launchIntent)
-                    val fallbackMsg = "VD #$targetDisplayId отклонён ($vdReason): ${app.label} открыто на телефоне"
+                    onFallbackToPhoneScreen?.invoke()
+                    startOnDefaultDisplayWithoutOptions(context, launchIntent)
+                    val fallbackMsg = "VD #$targetDisplayId недоступен ($vdReason): ${app.label} запущено на экране телефона"
                     _lastLaunchStatus.value = fallbackMsg
                     showLaunchToast(context, fallbackMsg)
                     true
@@ -288,8 +391,13 @@ object CarLifeLauncherRepository {
         }
 
         return try {
-            context.startActivity(launchIntent)
-            _lastLaunchStatus.value = "Запущено: ${app.label} (${app.packageName}) -> Default Display (0)"
+            startOnDefaultDisplayWithoutOptions(context, launchIntent)
+            val modeSuffix = if (currentMode == AppLaunchMode.SCREEN_MIRRORING) {
+                "Зеркалирование экрана (MediaProjection)"
+            } else {
+                "Default Display (0)"
+            }
+            _lastLaunchStatus.value = "Запущено: ${app.label} (${app.packageName}) -> $modeSuffix"
             true
         } catch (t: Throwable) {
             val errMsg = "Ошибка запуска ${app.label}: ${t.message ?: t.javaClass.simpleName}"

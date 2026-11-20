@@ -122,6 +122,7 @@ import com.example.core.usb.BridgeRuntimeState
 import com.example.core.usb.BridgeTelemetryBus
 import com.example.core.usb.PacketLogEntry
 import com.example.core.usb.UsbTransportState
+import com.example.feature.cockpit.AppLaunchMode
 import com.example.feature.cockpit.CarLifeAppLauncherScreen
 import com.example.feature.cockpit.CarLifeLauncherRepository
 import com.example.feature.cockpit.MediaControllerRepository
@@ -380,7 +381,7 @@ fun CarLifeBridgeApp(
 
     var configuredWidth by rememberSaveable { mutableIntStateOf(1280) }
     var configuredHeight by rememberSaveable { mutableIntStateOf(720) }
-    var configuredBitrateKbps by rememberSaveable { mutableIntStateOf(1800) }
+    var configuredBitrateKbps by rememberSaveable { mutableIntStateOf(2000) }
 
     var checklistStatus by remember {
         mutableStateOf(
@@ -1618,6 +1619,136 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
             }
         }
 
+        // 1.35 Карточка «Режим запуска приложений» (На VirtualDisplay / Зеркалирование экрана MediaProjection)
+        item {
+            val activeLaunchMode = state.appLaunchMode
+            fun selectAppLaunchMode(mode: AppLaunchMode) {
+                BridgeTelemetryBus.setAppLaunchMode(mode)
+                if (state.isServiceRunning) {
+                    val intent = Intent(context, BridgeForegroundService::class.java).apply {
+                        action = BridgeForegroundService.ACTION_SET_APP_LAUNCH_MODE
+                        putExtra(BridgeForegroundService.EXTRA_APP_LAUNCH_MODE, mode.id)
+                    }
+                    safeStartService(context, intent)
+                }
+            }
+
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("app_launch_mode_card"),
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(containerColor = ObsidianSurface),
+                border = BorderStroke(1.dp, ElectricCyan.copy(alpha = 0.7f))
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Режим запуска приложений",
+                                style = MaterialTheme.typography.titleMedium,
+                                color = TextPrimary
+                            )
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Text(
+                                text = "При SecurityException на VD выполняется мгновенный запасной запуск без ActivityOptions",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = TextSecondary
+                            )
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Surface(
+                            color = ElectricCyan.copy(alpha = 0.16f),
+                            shape = RoundedCornerShape(8.dp),
+                            border = BorderStroke(1.dp, ElectricCyan.copy(alpha = 0.65f))
+                        ) {
+                            Text(
+                                text = if (activeLaunchMode == AppLaunchMode.VIRTUAL_DISPLAY_IF_AVAILABLE) "VD" else "MIRROR",
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    fontWeight = FontWeight.SemiBold
+                                ),
+                                color = ElectricCyan,
+                                softWrap = false,
+                                maxLines = 1,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                            )
+                        }
+                    }
+
+                    AppLaunchMode.entries.forEach { mode ->
+                        val isSelected = activeLaunchMode == mode
+                        val rowBg = if (isSelected) {
+                            ElectricCyan.copy(alpha = 0.12f)
+                        } else {
+                            ObsidianBackground
+                        }
+                        val rowBorder = if (isSelected) {
+                            ElectricCyan
+                        } else {
+                            ObsidianBorder
+                        }
+                        val tag = if (mode == AppLaunchMode.VIRTUAL_DISPLAY_IF_AVAILABLE) {
+                            "launch_mode_vd_btn"
+                        } else {
+                            "launch_mode_mirror_btn"
+                        }
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(min = 48.dp)
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(rowBg)
+                                .border(1.dp, rowBorder, RoundedCornerShape(12.dp))
+                                .selectable(
+                                    selected = isSelected,
+                                    onClick = { selectAppLaunchMode(mode) },
+                                    role = Role.RadioButton
+                                )
+                                .padding(horizontal = 12.dp, vertical = 10.dp)
+                                .testTag(tag),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            RadioButton(
+                                selected = isSelected,
+                                onClick = null,
+                                colors = RadioButtonDefaults.colors(
+                                    selectedColor = ElectricCyan,
+                                    unselectedColor = TextMuted
+                                )
+                            )
+                            Spacer(modifier = Modifier.width(10.dp))
+                            Column(
+                                modifier = Modifier.weight(1f),
+                                verticalArrangement = Arrangement.spacedBy(2.dp)
+                            ) {
+                                Text(
+                                    text = mode.title,
+                                    style = MaterialTheme.typography.labelLarge.copy(
+                                        fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Medium
+                                    ),
+                                    color = if (isSelected) ElectricCyan else TextPrimary
+                                )
+                                Text(
+                                    text = mode.subtitle,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = TextSecondary
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // 1.5 Карточка «Тест рукопожатия 0x0001» (4 строгих профиля ответа на MSG_CMD_HU_PROTOCOL_VERSION)
         item {
             val activeProfile = state.handshakeTestProfile
@@ -1786,7 +1917,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                     }
 
                     Text(
-                        text = "Разрешение виртуального дисплея и кодека (1280×720 по умолчанию для Jetta VS7)",
+                        text = "Разрешение виртуального дисплея, Presentation и кодека (1280×720 • 160 dpi по умолчанию)",
                         style = MaterialTheme.typography.labelMedium,
                         color = TextSecondary
                     )
@@ -1819,7 +1950,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                     }
 
                     Text(
-                        text = "Битрейт кодека (AVCProfileBaseline CBR, 30fps, I=1s, 1.8 Мбит/с по умолчанию)",
+                        text = "Битрейт кодека (AVCProfileBaseline CBR, 30fps, I=1s, 2.0 Мбит/с по умолчанию)",
                         style = MaterialTheme.typography.labelMedium,
                         color = TextSecondary
                     )
@@ -1843,10 +1974,10 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                             modifier = Modifier.weight(1f)
                         )
                         SelectableOptionButton(
-                            label = "1.8 Мбит/с",
-                            selected = configuredBitrateKbps == 1800,
+                            label = "2.0 Мбит/с",
+                            selected = configuredBitrateKbps == 2000,
                             testTag = "bitrate_6m_btn",
-                            onClick = { onSelectBitrate(1800) },
+                            onClick = { onSelectBitrate(2000) },
                             modifier = Modifier.weight(1f)
                         )
                     }
@@ -1991,7 +2122,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
-                            text = "Стартовать VD (1280×720 • 1.8 Мбит/с • 30fps)",
+                            text = "Стартовать VD (1280×720 • 2.0 Мбит/с • 160 dpi)",
                             fontWeight = FontWeight.SemiBold,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis

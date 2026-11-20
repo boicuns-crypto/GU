@@ -11,6 +11,7 @@ import com.example.core.projection.CockpitProjectionManager
 import com.example.core.projection.VideoSourceMode
 import com.example.core.usb.BridgeForegroundService
 import com.example.core.usb.BridgeTelemetryBus
+import com.example.feature.cockpit.AppLaunchMode
 import com.example.feature.cockpit.CarLifeLauncherRepository
 import com.example.feature.cockpit.InstalledAppInfo
 import org.junit.Assert.assertEquals
@@ -176,6 +177,7 @@ class ExampleRobolectricTest {
       iconBitmap = null
     )
 
+    CarLifeLauncherRepository.setAppLaunchMode(AppLaunchMode.VIRTUAL_DISPLAY_IF_AVAILABLE)
     val launched = CarLifeLauncherRepository.launchAppOnVirtualDisplay(
       context = wrappedContext,
       app = testApp,
@@ -185,9 +187,23 @@ class ExampleRobolectricTest {
     assertTrue(launched)
     assertTrue("Expected VirtualDisplay ActivityOptions attempt first", vdAttempted)
     val launchedIntent = fallbackIntent
-    assertTrue("Expected fallback startActivity(intent) call", launchedIntent != null)
+    assertTrue("Expected fallback startActivity(intent) call without ActivityOptions", launchedIntent != null)
     val expectedFlags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED
     assertEquals(expectedFlags, launchedIntent!!.flags and expectedFlags)
     assertTrue(CarLifeLauncherRepository.lastLaunchStatus.value.contains("VD #2"))
+
+    // Mode 2: SCREEN_MIRRORING must skip ActivityOptions entirely and call startActivity(intent) directly
+    vdAttempted = false
+    fallbackIntent = null
+    CarLifeLauncherRepository.setAppLaunchMode(AppLaunchMode.SCREEN_MIRRORING)
+    val mirroredLaunched = CarLifeLauncherRepository.launchAppOnVirtualDisplay(
+      context = wrappedContext,
+      app = testApp,
+      targetDisplayId = 2
+    )
+    assertTrue(mirroredLaunched)
+    assertTrue("SCREEN_MIRRORING must NOT pass VirtualDisplay ActivityOptions", !vdAttempted)
+    assertTrue("SCREEN_MIRRORING must launch directly on default display", fallbackIntent != null)
+    CarLifeLauncherRepository.setAppLaunchMode(AppLaunchMode.VIRTUAL_DISPLAY_IF_AVAILABLE)
   }
 }
