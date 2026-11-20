@@ -1931,7 +1931,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                             )
                             Spacer(modifier = Modifier.height(2.dp))
                             Text(
-                                text = "После 0x00018001 / 0x00018003 отправляются MATCH_STATUS (0x00010002), полный MD_INFO (0x00010004), Audio-Init (0x0003, 0x0004), INIT_DONE (0x00010008), START_DONE (0x0001000A), FOREGROUND (0x00010025), SCREEN_ON (0x00010018) и раздельные NAL в Direct 12B.",
+                                text = "После 0x00018001 / 0x00018003 отправляются MATCH_STATUS (0x00010002), полный MD_INFO (0x00010004), Audio-Init (0x0003, 0x0004), INIT_DONE (0x00010008), SCREEN_ON (0x00010018), USERPRESENT (0x0001001A), FOREGROUND (0x0001001B), REQ_FG (0x00010038) и поток 0x0002 (в AOA 20B с HEARTBEAT 0x00020002 раз в 1 с).",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = TextSecondary
                             )

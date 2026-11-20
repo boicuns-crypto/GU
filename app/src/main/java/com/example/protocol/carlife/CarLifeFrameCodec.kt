@@ -62,8 +62,8 @@ object CarLifeMsgType {
     const val MSG_CMD_VIDEO_ENCODER_INIT_DONE = 0x00010008
     const val MSG_CMD_VIDEO_ENCODER_START = 0x00018009
     const val MSG_CMD_VIDEO_ENCODER_START_ALT = 0x00010009
-    const val MSG_CMD_VIDEO_ENCODER_START_DONE = 0x0001000A
-    const val MSG_CMD_VIDEO_ENCODER_PAUSE = 0x0001800B
+    const val MSG_CMD_VIDEO_ENCODER_PAUSE = 0x0001800A
+    const val MSG_CMD_VIDEO_ENCODER_PAUSE_ALT = 0x0001800B
     const val MSG_CMD_VIDEO_ENCODER_RESET = 0x0001800C
     const val MSG_CMD_VIDEO_ENCODER_FRAME_RATE_CHANGE = 0x0001800D
     const val MSG_CMD_VIDEO_ENCODER_FRAME_RATE_CHANGE_DONE = 0x0001000E
@@ -86,21 +86,22 @@ object CarLifeMsgType {
     const val MSG_CMD_LAUNCH_MODE_MUSIC = 0x00010017
     const val MSG_CMD_SCREEN_ON = 0x00010018
     const val MSG_CMD_SCREEN_OFF = 0x00010019
+    const val MSG_CMD_SCREEN_USERPRESENT = 0x0001001A
     const val MSG_CMD_SCREEN_USER_PRESENT = 0x0001001A
-    const val MSG_CMD_FOREGROUND_LEGACY = 0x0001001B
+    const val MSG_CMD_FOREGROUND = 0x0001001B
     const val MSG_CMD_BACKGROUND = 0x0001001C
     const val MSG_CMD_GO_TO_DESKTOP = 0x0001001E
     const val MSG_CMD_MIC_RECORD_WAKEUP_START = 0x0001001F
     const val MSG_CMD_MIC_RECORD_END = 0x00010020
     const val MSG_CMD_MIC_RECORD_RECOG_START = 0x00010021
-    const val MSG_CMD_GO_TO_FOREGROUND = 0x00010022
     const val MSG_CMD_MODULE_STATUS = 0x00010023
     const val MSG_CMD_MODULE_STATUS_ALT = 0x00018023
-    const val MSG_CMD_STATISTIC_INFO = 0x00018024
-    const val MSG_CMD_FOREGROUND = 0x00010025
-    const val MSG_CMD_FOREGROUND_ALT = 0x00018025
+    const val MSG_CMD_STATISTIC_INFO_ALT = 0x00018024
+    const val MSG_CMD_GO_TO_FOREGROUND = 0x00018025
     const val MSG_CMD_MODULE_CONTROL = 0x00018026
     const val MSG_CMD_MODULE_CONTROL_ALT = 0x00010026
+    const val MSG_CMD_STATISTIC_INFO = 0x00018027
+    const val MSG_CMD_REQUEST_GO_TO_FOREGROUND = 0x00010038
     const val MSG_CMD_HU_RSA_PUBLIC_KEY_REQUEST = 0x00018040
     const val MSG_CMD_HU_RSA_PUBLIC_KEY_RESPONSE = 0x00010040
     const val MSG_CMD_VEHICLE_CERTIFICATE_REQUEST = 0x00018041
@@ -167,22 +168,23 @@ object CarLifeMsgType {
         MSG_CMD_VIDEO_ENCODER_INIT_DONE -> "MSG_CMD_VIDEO_ENCODER_INIT_DONE"
         MSG_CMD_VIDEO_ENCODER_START,
         MSG_CMD_VIDEO_ENCODER_START_ALT -> "MSG_CMD_VIDEO_ENCODER_START"
-        MSG_CMD_VIDEO_ENCODER_START_DONE -> "MSG_CMD_VIDEO_ENCODER_START_DONE"
-        MSG_CMD_VIDEO_ENCODER_PAUSE -> "MSG_CMD_VIDEO_ENCODER_PAUSE"
+        MSG_CMD_VIDEO_ENCODER_PAUSE,
+        MSG_CMD_VIDEO_ENCODER_PAUSE_ALT -> "MSG_CMD_VIDEO_ENCODER_PAUSE"
         MSG_CMD_VIDEO_ENCODER_RESET -> "MSG_CMD_VIDEO_ENCODER_RESET"
         MSG_CMD_VIDEO_ENCODER_FRAME_RATE_CHANGE -> "MSG_CMD_VIDEO_ENCODER_FRAME_RATE_CHANGE"
         MSG_CMD_VIDEO_ENCODER_FRAME_RATE_CHANGE_DONE -> "MSG_CMD_VIDEO_ENCODER_FRAME_RATE_CHANGE_DONE"
         MSG_CMD_SCREEN_ON -> "MSG_CMD_SCREEN_ON"
         MSG_CMD_SCREEN_OFF -> "MSG_CMD_SCREEN_OFF"
-        MSG_CMD_FOREGROUND,
-        MSG_CMD_FOREGROUND_ALT,
-        MSG_CMD_FOREGROUND_LEGACY -> "MSG_CMD_FOREGROUND"
+        MSG_CMD_SCREEN_USERPRESENT -> "MSG_CMD_SCREEN_USERPRESENT"
+        MSG_CMD_FOREGROUND -> "MSG_CMD_FOREGROUND"
         MSG_CMD_BACKGROUND -> "MSG_CMD_BACKGROUND"
         MSG_CMD_GO_TO_DESKTOP -> "MSG_CMD_GO_TO_DESKTOP"
         MSG_CMD_GO_TO_FOREGROUND -> "MSG_CMD_GO_TO_FOREGROUND"
+        MSG_CMD_REQUEST_GO_TO_FOREGROUND -> "MSG_CMD_REQUEST_GO_TO_FOREGROUND"
         MSG_CMD_MODULE_STATUS,
         MSG_CMD_MODULE_STATUS_ALT -> "MSG_CMD_MODULE_STATUS"
-        MSG_CMD_STATISTIC_INFO -> "MSG_CMD_STATISTIC_INFO"
+        MSG_CMD_STATISTIC_INFO,
+        MSG_CMD_STATISTIC_INFO_ALT -> "MSG_CMD_STATISTIC_INFO"
         MSG_CMD_MODULE_CONTROL,
         MSG_CMD_MODULE_CONTROL_ALT -> "MSG_CMD_MODULE_CONTROL"
         MSG_CMD_HU_RSA_PUBLIC_KEY_REQUEST -> "AUTH / HU_RSA_PUBLIC_KEY (0x00018040)"
@@ -331,9 +333,12 @@ data class CarLifeFrame(
         val word1 = buf.getInt(4) // wire bytes[12..15]
         val word2 = if (payload.size >= 12) buf.getInt(8) else 0 // wire bytes[16..19]
 
-        // Special check for AOA 20B Video Packet: [nalSize:4B][timestampMs:4B][0x00020001:4B][h264Data]
+        // Special check for AOA 20B Video Packet: [nalSize:4B][timestampMs:4B][0x00020001 / 0x00020002:4B][h264Data]
         if (channel == CarLifeChannel.VIDEO && payload.size >= 12 &&
-            (word2 == CarLifeMsgType.MSG_VIDEO_DATA || word2 == CarLifeMsgType.MSG_VIDEO_DATA_ALT)
+            (word2 == CarLifeMsgType.MSG_VIDEO_DATA ||
+                word2 == CarLifeMsgType.MSG_VIDEO_DATA_ALT ||
+                word2 == CarLifeMsgType.MSG_VIDEO_HEARTBEAT ||
+                word2 == CarLifeMsgType.MSG_VIDEO_HEARTBEAT_ALT)
         ) {
             val avail = payload.size - 12
             val safeLen = if (word0 in 0..avail) word0 else avail
@@ -588,7 +593,10 @@ object CarLifeFrameCodec {
             val tsMs = innerBuf.int.toLong() and 0xFFFF_FFFFL
             val serviceId = innerBuf.int
             if (nalSize == base.payloadLength - 12 &&
-                (serviceId == CarLifeMsgType.MSG_VIDEO_DATA || serviceId == CarLifeMsgType.MSG_VIDEO_DATA_ALT)
+                (serviceId == CarLifeMsgType.MSG_VIDEO_DATA ||
+                    serviceId == CarLifeMsgType.MSG_VIDEO_DATA_ALT ||
+                    serviceId == CarLifeMsgType.MSG_VIDEO_HEARTBEAT ||
+                    serviceId == CarLifeMsgType.MSG_VIDEO_HEARTBEAT_ALT)
             ) {
                 val payload = ByteArray(base.payloadLength)
                 System.arraycopy(rawBytes, offset + STANDARD_HEADER_SIZE, payload, 0, base.payloadLength)
@@ -732,7 +740,11 @@ object CarLifeFrameCodec {
             readFully(input, fullPayload, 4, baseHeader.payloadLength - 4)
             val ts = parseMediaTimestamp(fullPayload, 4)
             val serviceId = ByteBuffer.wrap(fullPayload, 8, 4).order(ByteOrder.BIG_ENDIAN).int
-            if (serviceId == CarLifeMsgType.MSG_VIDEO_DATA || serviceId == CarLifeMsgType.MSG_VIDEO_DATA_ALT) {
+            if (serviceId == CarLifeMsgType.MSG_VIDEO_DATA ||
+                serviceId == CarLifeMsgType.MSG_VIDEO_DATA_ALT ||
+                serviceId == CarLifeMsgType.MSG_VIDEO_HEARTBEAT ||
+                serviceId == CarLifeMsgType.MSG_VIDEO_HEARTBEAT_ALT
+            ) {
                 return CarLifeFrame(
                     header = baseHeader.copy(timestamp = ts, includeOuterTimestamp = false),
                     payload = fullPayload
@@ -827,6 +839,36 @@ object CarLifeFrameCodec {
             put(annexB)                           // Bytes [20..N]: Raw H.264 Annex-B (00 00 00 01 ...)
         }.array()
     }
+
+    /**
+     * Builds a 20-byte USB AOA Video Heartbeat frame (`MSG_VIDEO_HEARTBEAT = 0x00020002`):
+     * - Outer 8B AOA Header: `[00 00 00 02][00 00 00 0C]`
+     * - Inner 12B Video Header: `[00 00 00 00 (len=0)][timestampMs (4B)][00 02 00 02]`
+     */
+    fun createVideoHeartbeatFrame(
+        timestampMs: Long = (android.os.SystemClock.uptimeMillis().takeIf { it > 0L } ?: System.currentTimeMillis()) and 0x7FFF_FFFFL
+    ): CarLifeFrame {
+        val safeTs = timestampMs and 0x7FFF_FFFFL
+        val innerHeartbeat = ByteBuffer.allocate(12)
+            .order(ByteOrder.BIG_ENDIAN)
+            .putInt(0)
+            .putInt(safeTs.toInt())
+            .putInt(CarLifeMsgType.MSG_VIDEO_HEARTBEAT)
+            .array()
+        return CarLifeFrame(
+            header = CarLifeHeader(
+                channel = CarLifeChannel.VIDEO,
+                rawChannelId = CarLifeChannel.VIDEO.id,
+                payloadLength = innerHeartbeat.size,
+                timestamp = safeTs,
+                includeOuterTimestamp = false
+            ),
+            payload = innerHeartbeat
+        )
+    }
+
+    fun buildAoAVideoHeartbeatPacket(timestampMs: Int): ByteArray =
+        encodeFrame(createVideoHeartbeatFrame(timestampMs.toLong() and 0x7FFF_FFFFL))
 
     /**
      * Packs a Control (`0x0001`) or Touch (`0x0006`) frame using the exact Baidu CarLife wire layout:
@@ -1331,15 +1373,16 @@ class CarLifeStreamAssembler(initialCapacity: Int = 65_536) {
                         CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START,
                         CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_ALT,
                         CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_PAUSE,
+                        CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_PAUSE_ALT,
                         CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_RESET,
                         CarLifeMsgType.MSG_CMD_SCREEN_ON,
                         CarLifeMsgType.MSG_CMD_SCREEN_OFF,
+                        CarLifeMsgType.MSG_CMD_SCREEN_USERPRESENT,
                         CarLifeMsgType.MSG_CMD_FOREGROUND,
-                        CarLifeMsgType.MSG_CMD_FOREGROUND_ALT,
-                        CarLifeMsgType.MSG_CMD_FOREGROUND_LEGACY,
                         CarLifeMsgType.MSG_CMD_BACKGROUND,
                         CarLifeMsgType.MSG_CMD_GO_TO_DESKTOP,
-                        CarLifeMsgType.MSG_CMD_GO_TO_FOREGROUND -> true
+                        CarLifeMsgType.MSG_CMD_GO_TO_FOREGROUND,
+                        CarLifeMsgType.MSG_CMD_REQUEST_GO_TO_FOREGROUND -> true
                         else -> false
                     }
                     if (nextHeaderStartsAt12 || isNoArgStartOrLifecycleCmd) {

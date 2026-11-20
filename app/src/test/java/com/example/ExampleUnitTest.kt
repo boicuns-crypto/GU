@@ -163,18 +163,22 @@ class ExampleUnitTest {
         )
         val step3 = sm.onControlFrame(videoStartFrame)
         assertEquals(CarLifeSessionPhase.VIDEO_STREAMING, step3.updatedState.phase)
-        assertEquals(3, step3.outboundFrames.size)
+        assertEquals(4, step3.outboundFrames.size)
         assertEquals(
-            CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_DONE,
+            CarLifeMsgType.MSG_CMD_SCREEN_ON,
             step3.outboundFrames[0].parseCommandMessageOrNull()?.serviceType
         )
         assertEquals(
-            CarLifeMsgType.MSG_CMD_FOREGROUND,
+            CarLifeMsgType.MSG_CMD_SCREEN_USERPRESENT,
             step3.outboundFrames[1].parseCommandMessageOrNull()?.serviceType
         )
         assertEquals(
-            CarLifeMsgType.MSG_CMD_SCREEN_ON,
+            CarLifeMsgType.MSG_CMD_FOREGROUND,
             step3.outboundFrames[2].parseCommandMessageOrNull()?.serviceType
+        )
+        assertEquals(
+            CarLifeMsgType.MSG_CMD_REQUEST_GO_TO_FOREGROUND,
+            step3.outboundFrames[3].parseCommandMessageOrNull()?.serviceType
         )
 
         // Verify Auth bypass (0x0001000B -> 0x0001800C, 0x00018004 -> 0x00010004)
@@ -317,31 +321,35 @@ class ExampleUnitTest {
         assertNotNull(parsed)
         assertEquals(CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT, parsed!!.serviceType)
 
-        // Verify START_DONE (0x0001000A) vs unknown (0x0001800A) and auto-start sequence
-        assertEquals("MSG_CMD_VIDEO_ENCODER_START_DONE", CarLifeMsgType.nameOf(0x0001000A))
-        assertEquals("AUTH / UNKNOWN (0x0001800A)", CarLifeMsgType.nameOf(0x0001800A))
+        // Verify 0x0001800A is PAUSE (per CommonParams.smali), 0x0001000A does not exist, and auto-start sequence omits 0x0001000A
+        assertEquals("MSG_CMD_VIDEO_ENCODER_PAUSE", CarLifeMsgType.nameOf(0x0001800A))
+        assertEquals("AUTH / UNKNOWN (0x0001000A)", CarLifeMsgType.nameOf(0x0001000A))
         assertEquals("AUTH / UNKNOWN (0x00010077)", CarLifeMsgType.nameOf(0x00010077))
         val sm = CarLifeControlStateMachine()
         sm.setPreferredResolution(800, 480)
         val autoStart = sm.buildAutoVideoEncoderInitAndStartFrames(800, 480, 30)
-        assertEquals(4, autoStart.outboundFrames.size)
+        assertEquals(5, autoStart.outboundFrames.size)
         assertEquals(
             CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT_DONE,
             autoStart.outboundFrames[0].parseCommandMessageOrNull()?.serviceType
         )
         assertEquals(
-            CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_DONE,
+            CarLifeMsgType.MSG_CMD_SCREEN_ON,
             autoStart.outboundFrames[1].parseCommandMessageOrNull()?.serviceType
         )
         assertEquals(
-            CarLifeMsgType.MSG_CMD_FOREGROUND,
+            CarLifeMsgType.MSG_CMD_SCREEN_USERPRESENT,
             autoStart.outboundFrames[2].parseCommandMessageOrNull()?.serviceType
         )
         assertEquals(
-            CarLifeMsgType.MSG_CMD_SCREEN_ON,
+            CarLifeMsgType.MSG_CMD_FOREGROUND,
             autoStart.outboundFrames[3].parseCommandMessageOrNull()?.serviceType
         )
-        assertEquals(CarLifeChannel.VIDEO, sm.createHeartbeatFrame().channel)
+        assertEquals(
+            CarLifeMsgType.MSG_CMD_REQUEST_GO_TO_FOREGROUND,
+            autoStart.outboundFrames[4].parseCommandMessageOrNull()?.serviceType
+        )
+        assertEquals(CarLifeChannel.VIDEO, sm.createHeartbeatFrame(timestampMs = 1000L).channel)
     }
 
     @Test
@@ -449,11 +457,12 @@ class ExampleUnitTest {
         assertEquals(CarLifeMsgType.MSG_CMD_MD_INFO, step1.outboundFrames[1].parseCommandMessageOrNull()?.serviceType)
         val proactive = sm.buildAutoVideoEncoderInitAndStartFrames(800, 480, 30, "Proactive Handshake on 0x00018001")
         assertEquals(CarLifeSessionPhase.VIDEO_STREAMING, proactive.updatedState.phase)
-        assertEquals(4, proactive.outboundFrames.size)
+        assertEquals(5, proactive.outboundFrames.size)
         assertEquals(CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT_DONE, proactive.outboundFrames[0].parseCommandMessageOrNull()?.serviceType)
-        assertEquals(CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_DONE, proactive.outboundFrames[1].parseCommandMessageOrNull()?.serviceType)
-        assertEquals(CarLifeMsgType.MSG_CMD_FOREGROUND, proactive.outboundFrames[2].parseCommandMessageOrNull()?.serviceType)
-        assertEquals(CarLifeMsgType.MSG_CMD_SCREEN_ON, proactive.outboundFrames[3].parseCommandMessageOrNull()?.serviceType)
+        assertEquals(CarLifeMsgType.MSG_CMD_SCREEN_ON, proactive.outboundFrames[1].parseCommandMessageOrNull()?.serviceType)
+        assertEquals(CarLifeMsgType.MSG_CMD_SCREEN_USERPRESENT, proactive.outboundFrames[2].parseCommandMessageOrNull()?.serviceType)
+        assertEquals(CarLifeMsgType.MSG_CMD_FOREGROUND, proactive.outboundFrames[3].parseCommandMessageOrNull()?.serviceType)
+        assertEquals(CarLifeMsgType.MSG_CMD_REQUEST_GO_TO_FOREGROUND, proactive.outboundFrames[4].parseCommandMessageOrNull()?.serviceType)
 
         // Verify Direct 12B splits SPS + PPS + IDR into 3 separate 12-byte header frames
         val direct12Frames = CarLifeFrameCodec.createVideoFrames(
@@ -537,19 +546,30 @@ class ExampleUnitTest {
             reason = "Тест 4",
             includeForegroundAndScreenOn = true
         )
-        assertEquals(4, initStartWithFgScreen.outboundFrames.size)
+        assertEquals(5, initStartWithFgScreen.outboundFrames.size)
         assertEquals(CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT_DONE, initStartWithFgScreen.outboundFrames[0].parseCommandMessageOrNull()?.serviceType)
-        assertEquals(CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_DONE, initStartWithFgScreen.outboundFrames[1].parseCommandMessageOrNull()?.serviceType)
-        assertEquals(CarLifeMsgType.MSG_CMD_FOREGROUND, initStartWithFgScreen.outboundFrames[2].parseCommandMessageOrNull()?.serviceType)
-        assertEquals(CarLifeMsgType.MSG_CMD_SCREEN_ON, initStartWithFgScreen.outboundFrames[3].parseCommandMessageOrNull()?.serviceType)
+        assertEquals(CarLifeMsgType.MSG_CMD_SCREEN_ON, initStartWithFgScreen.outboundFrames[1].parseCommandMessageOrNull()?.serviceType)
+        assertEquals(CarLifeMsgType.MSG_CMD_SCREEN_USERPRESENT, initStartWithFgScreen.outboundFrames[2].parseCommandMessageOrNull()?.serviceType)
+        assertEquals(CarLifeMsgType.MSG_CMD_FOREGROUND, initStartWithFgScreen.outboundFrames[3].parseCommandMessageOrNull()?.serviceType)
+        assertEquals(CarLifeMsgType.MSG_CMD_REQUEST_GO_TO_FOREGROUND, initStartWithFgScreen.outboundFrames[4].parseCommandMessageOrNull()?.serviceType)
 
-        // Exact 16-byte wire format for FOREGROUND (0x00010025) and SCREEN_ON (0x00010018)
+        // Exact 16-byte wire format per CommonParams.smali:
+        // SCREEN_ON (0x00010018), SCREEN_USERPRESENT (0x0001001A), FOREGROUND (0x0001001B), REQUEST_GO_TO_FOREGROUND (0x00010038)
         assertArrayEquals(
             byteArrayOf(
                 0x00, 0x00, 0x00, 0x01,
                 0x00, 0x00, 0x00, 0x08,
                 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x01, 0x00, 0x25
+                0x00, 0x01, 0x00, 0x18
+            ),
+            CarLifeFrameCodec.encodeFrame(initStartWithFgScreen.outboundFrames[1])
+        )
+        assertArrayEquals(
+            byteArrayOf(
+                0x00, 0x00, 0x00, 0x01,
+                0x00, 0x00, 0x00, 0x08,
+                0x00, 0x00, 0x00, 0x00,
+                0x00, 0x01, 0x00, 0x1A
             ),
             CarLifeFrameCodec.encodeFrame(initStartWithFgScreen.outboundFrames[2])
         )
@@ -558,9 +578,18 @@ class ExampleUnitTest {
                 0x00, 0x00, 0x00, 0x01,
                 0x00, 0x00, 0x00, 0x08,
                 0x00, 0x00, 0x00, 0x00,
-                0x00, 0x01, 0x00, 0x18
+                0x00, 0x01, 0x00, 0x1B
             ),
             CarLifeFrameCodec.encodeFrame(initStartWithFgScreen.outboundFrames[3])
+        )
+        assertArrayEquals(
+            byteArrayOf(
+                0x00, 0x00, 0x00, 0x01,
+                0x00, 0x00, 0x00, 0x08,
+                0x00, 0x00, 0x00, 0x00,
+                0x00, 0x01, 0x00, 0x38
+            ),
+            CarLifeFrameCodec.encodeFrame(initStartWithFgScreen.outboundFrames[4])
         )
 
         // Default video framing is Direct 12B, switchable to AOA 20B on the fly
@@ -580,24 +609,27 @@ class ExampleUnitTest {
 
     @Test
     fun jettaVs7WireDump_directionBit0x8000Inverted_verifiesRxTxConstantsAndTest1() {
-        // Verify exact constants per Jetta VS7 wire specification:
+        // Verify exact constants per original CommonParams.smali & Jetta VS7 wire dump:
         // RX (HU -> MD): bit 0x8000 set
         assertEquals(0x00018001, CarLifeMsgType.MSG_CMD_HU_PROTOCOL_VERSION)
         assertEquals(0x00018003, CarLifeMsgType.MSG_CMD_HU_INFO)
         assertEquals(0x00018005, CarLifeMsgType.MSG_CMD_HU_BT_OOB_INFO)
         assertEquals(0x00018007, CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT)
         assertEquals(0x00018009, CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START)
-        assertEquals(0x0001800B, CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_PAUSE)
+        assertEquals(0x0001800A, CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_PAUSE)
         assertEquals(0x0001800C, CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_RESET)
+        assertEquals(0x00018025, CarLifeMsgType.MSG_CMD_GO_TO_FOREGROUND)
+        assertEquals(0x00018027, CarLifeMsgType.MSG_CMD_STATISTIC_INFO)
 
         // TX (MD -> HU): bit 0x8000 cleared
         assertEquals(0x00010002, CarLifeMsgType.MSG_CMD_PROTOCOL_VERSION_MATCH_STATUS)
         assertEquals(0x00010004, CarLifeMsgType.MSG_CMD_MD_INFO)
         assertEquals(0x00010006, CarLifeMsgType.MSG_CMD_MD_BT_OOB_INFO)
         assertEquals(0x00010008, CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT_DONE)
-        assertEquals(0x0001000A, CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_DONE)
         assertEquals(0x00010018, CarLifeMsgType.MSG_CMD_SCREEN_ON)
-        assertEquals(0x00010025, CarLifeMsgType.MSG_CMD_FOREGROUND)
+        assertEquals(0x0001001A, CarLifeMsgType.MSG_CMD_SCREEN_USERPRESENT)
+        assertEquals(0x0001001B, CarLifeMsgType.MSG_CMD_FOREGROUND)
+        assertEquals(0x00010038, CarLifeMsgType.MSG_CMD_REQUEST_GO_TO_FOREGROUND)
 
         // Sync CarLifeProtocolConstants as well
         assertEquals(0x00018001, CarLifeProtocolConstants.MSG_CMD_HU_PROTOCOL_VERSION)
@@ -609,11 +641,14 @@ class ExampleUnitTest {
         assertEquals(0x00018007, CarLifeProtocolConstants.MSG_CMD_VIDEO_ENCODER_INIT)
         assertEquals(0x00010008, CarLifeProtocolConstants.MSG_CMD_VIDEO_ENCODER_INIT_DONE)
         assertEquals(0x00018009, CarLifeProtocolConstants.MSG_CMD_VIDEO_ENCODER_START)
-        assertEquals(0x0001000A, CarLifeProtocolConstants.MSG_CMD_VIDEO_ENCODER_START_DONE)
-        assertEquals(0x0001800B, CarLifeProtocolConstants.MSG_CMD_VIDEO_ENCODER_PAUSE)
+        assertEquals(0x0001800A, CarLifeProtocolConstants.MSG_CMD_VIDEO_ENCODER_PAUSE)
         assertEquals(0x0001800C, CarLifeProtocolConstants.MSG_CMD_VIDEO_ENCODER_RESET)
         assertEquals(0x00010018, CarLifeProtocolConstants.MSG_CMD_SCREEN_ON)
-        assertEquals(0x00010025, CarLifeProtocolConstants.MSG_CMD_FOREGROUND)
+        assertEquals(0x0001001A, CarLifeProtocolConstants.MSG_CMD_SCREEN_USERPRESENT)
+        assertEquals(0x0001001B, CarLifeProtocolConstants.MSG_CMD_FOREGROUND)
+        assertEquals(0x00018025, CarLifeProtocolConstants.MSG_CMD_GO_TO_FOREGROUND)
+        assertEquals(0x00018027, CarLifeProtocolConstants.MSG_CMD_STATISTIC_INFO)
+        assertEquals(0x00010038, CarLifeProtocolConstants.MSG_CMD_REQUEST_GO_TO_FOREGROUND)
 
         // Exact RX wire dump from Jetta VS7 HU:
         // PAYLOAD[00 04 00 00 00 01 80 01 08 01 10 00] (outer ch=0x00000001, len=12)
@@ -647,6 +682,16 @@ class ExampleUnitTest {
             txMatchBytes
         )
 
+        // Incoming RX 0x00018027 (MSG_CMD_STATISTIC_INFO): log only, MUST NOT reply with 0x00010027
+        val statFrame = CarLifeFrameCodec.createCommandFrame(
+            channel = CarLifeChannel.CONTROL,
+            serviceType = 0x00018027,
+            commandBody = byteArrayOf(0x08, 0x01)
+        )
+        val statStep = sm.onControlFrame(statFrame)
+        assertTrue(statStep.outboundFrames.isEmpty())
+        assertTrue(statStep.summary.contains("MSG_CMD_STATISTIC_INFO"))
+
         // Subsequent HU_INFO (0x00018003) -> MD_INFO (0x00010004)
         val huInfoFrame = CarLifeFrameCodec.createCommandFrame(
             channel = CarLifeChannel.CONTROL,
@@ -668,21 +713,24 @@ class ExampleUnitTest {
         assertEquals(1, step3.outboundFrames.size)
         assertEquals(0x00010008, step3.outboundFrames[0].parseCommandMessageOrNull()?.serviceType)
 
-        // Subsequent VIDEO_ENCODER_START (0x00018009) -> START_DONE (0x0001000A) + FOREGROUND (0x00010025) + SCREEN_ON (0x00010018)
+        // Subsequent VIDEO_ENCODER_START (0x00018009) -> NEVER sends 0x0001000A!
+        // Sends exact 4 commands: SCREEN_ON (0x00010018), SCREEN_USERPRESENT (0x0001001A),
+        // FOREGROUND (0x0001001B), REQUEST_GO_TO_FOREGROUND (0x00010038).
         val videoStartFrame = CarLifeFrameCodec.createCommandFrame(
             channel = CarLifeChannel.CONTROL,
             serviceType = 0x00018009
         )
         val step4 = sm.onControlFrame(videoStartFrame)
         assertEquals(CarLifeSessionPhase.VIDEO_STREAMING, step4.updatedState.phase)
-        assertEquals(3, step4.outboundFrames.size)
-        assertEquals(0x0001000A, step4.outboundFrames[0].parseCommandMessageOrNull()?.serviceType)
-        assertEquals(0x00010025, step4.outboundFrames[1].parseCommandMessageOrNull()?.serviceType)
-        assertEquals(0x00010018, step4.outboundFrames[2].parseCommandMessageOrNull()?.serviceType)
+        assertEquals(4, step4.outboundFrames.size)
+        assertEquals(0x00010018, step4.outboundFrames[0].parseCommandMessageOrNull()?.serviceType)
+        assertEquals(0x0001001A, step4.outboundFrames[1].parseCommandMessageOrNull()?.serviceType)
+        assertEquals(0x0001001B, step4.outboundFrames[2].parseCommandMessageOrNull()?.serviceType)
+        assertEquals(0x00010038, step4.outboundFrames[3].parseCommandMessageOrNull()?.serviceType)
     }
 
     @Test
-    fun videoChannel0x0002_uses0x00020001WithoutDirectionBit_andDefaultsToCanvasTestCard() {
+    fun videoChannel0x0002_uses0x00020001WithoutDirectionBit_andBuilds20ByteHeartbeat0x00020002() {
         assertEquals(0x00020001, CarLifeMsgType.MSG_VIDEO_DATA)
         assertEquals(0x00020002, CarLifeMsgType.MSG_VIDEO_HEARTBEAT)
         assertEquals(CarLifeProtocolConstants.MSG_VIDEO_DATA, CarLifeMsgType.MSG_VIDEO_DATA)
@@ -703,6 +751,30 @@ class ExampleUnitTest {
             byteArrayOf(0x00, 0x02, 0x00, 0x01),
             aoa20Bytes.copyOfRange(16, 20)
         )
+
+        // AOA 20B Video Heartbeat (MSG_VIDEO_HEARTBEAT = 0x00020002):
+        // Outer 8B [00 00 00 02][00 00 00 0C] + Inner 12B [len=0][timestamp][00 02 00 02]
+        val hbTs = 0x11223344
+        val hbFrame = CarLifeFrameCodec.createVideoHeartbeatFrame(timestampMs = hbTs.toLong())
+        val hbWire = CarLifeFrameCodec.encodeFrame(hbFrame)
+        assertArrayEquals(
+            byteArrayOf(
+                0x00, 0x00, 0x00, 0x02,
+                0x00, 0x00, 0x00, 0x0C,
+                0x00, 0x00, 0x00, 0x00,
+                0x11, 0x22, 0x33, 0x44,
+                0x00, 0x02, 0x00, 0x02
+            ),
+            hbWire
+        )
+        assertArrayEquals(hbWire, CarLifeFrameCodec.buildAoAVideoHeartbeatPacket(hbTs))
+        val decodedHb = CarLifeFrameCodec.readNextFrame(ByteArrayInputStream(hbWire))
+        assertEquals(CarLifeChannel.VIDEO, decodedHb.channel)
+        assertEquals(hbTs.toLong(), decodedHb.header.timestamp)
+        val parsedHb = decodedHb.parseCommandMessageOrNull()
+        assertNotNull(parsedHb)
+        assertEquals(0x00020002, parsedHb!!.serviceType)
+        assertEquals(0, parsedHb.body.size)
 
         val direct12Frame = CarLifeFrameCodec.createVideoFrame(
             nalData = sampleNal,

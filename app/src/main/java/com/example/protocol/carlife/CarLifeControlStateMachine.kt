@@ -45,7 +45,7 @@ enum class HandshakeTestProfile(
     TEST_4_AUDIO_VIDEO_NO_SCREEN(
         id = 4,
         shortTitle = "Тест 4: Полный запуск (Audio + Video + FG + ScreenOn)",
-        description = "Рабочий профиль по умолчанию: полный MD_INFO (0x00010004) + AUDIO_INIT (0x0003/0x0004) + INIT_DONE (0x00010008) + START_DONE (0x0001000A) + FOREGROUND (0x00010025) + SCREEN_ON (0x00010018)."
+        description = "Рабочий профиль по умолчанию: полный MD_INFO (0x00010004) + AUDIO_INIT (0x0003/0x0004) + INIT_DONE (0x00010008) + SCREEN_ON (0x00010018) + USERPRESENT (0x0001001A) + FOREGROUND (0x0001001B) + REQ_FG (0x00010038)."
     );
 
     companion object {
@@ -119,9 +119,41 @@ class CarLifeControlStateMachine(
     }
 
     /**
-     * Auto-starts `MSG_CMD_VIDEO_ENCODER_INIT_DONE (0x00010008)`,
-     * `MSG_CMD_VIDEO_ENCODER_START_DONE (0x0001000A)`, `MSG_CMD_FOREGROUND (0x00010025)`,
-     * and `MSG_CMD_SCREEN_ON (0x00010018)` after `MSG_CMD_MD_INFO (0x00010004)`.
+     * Builds the exact 4 foreground/screen commands per original Baidu CarLife `CommonParams.smali`:
+     * 1. `MSG_CMD_SCREEN_ON (0x00010018)`
+     * 2. `MSG_CMD_SCREEN_USERPRESENT (0x0001001A)`
+     * 3. `MSG_CMD_FOREGROUND (0x0001001B)`
+     * 4. `MSG_CMD_REQUEST_GO_TO_FOREGROUND (0x00010038)`
+     */
+    fun buildForegroundAndScreenOnFrames(): List<CarLifeFrame> = listOf(
+        CarLifeFrameCodec.createCommandFrame(
+            channel = CarLifeChannel.CONTROL,
+            serviceType = CarLifeMsgType.MSG_CMD_SCREEN_ON, // 0x00010018
+            commandBody = ByteArray(0)
+        ),
+        CarLifeFrameCodec.createCommandFrame(
+            channel = CarLifeChannel.CONTROL,
+            serviceType = CarLifeMsgType.MSG_CMD_SCREEN_USERPRESENT, // 0x0001001A
+            commandBody = ByteArray(0)
+        ),
+        CarLifeFrameCodec.createCommandFrame(
+            channel = CarLifeChannel.CONTROL,
+            serviceType = CarLifeMsgType.MSG_CMD_FOREGROUND, // 0x0001001B
+            commandBody = ByteArray(0)
+        ),
+        CarLifeFrameCodec.createCommandFrame(
+            channel = CarLifeChannel.CONTROL,
+            serviceType = CarLifeMsgType.MSG_CMD_REQUEST_GO_TO_FOREGROUND, // 0x00010038
+            commandBody = ByteArray(0)
+        )
+    )
+
+    /**
+     * Auto-starts `MSG_CMD_VIDEO_ENCODER_INIT_DONE (0x00010008)` followed by
+     * `SCREEN_ON (0x00010018)`, `SCREEN_USERPRESENT (0x0001001A)`,
+     * `FOREGROUND (0x0001001B)`, and `REQUEST_GO_TO_FOREGROUND (0x00010038)`
+     * after `MSG_CMD_MD_INFO (0x00010004)`.
+     * Never sends non-existent `0x0001000A` (`0x0001800A` is `PAUSE`).
      */
     fun buildAutoVideoEncoderInitAndStartFrames(
         width: Int = preferredVideoWidth,
@@ -146,34 +178,19 @@ class CarLifeControlStateMachine(
             serviceType = CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT_DONE, // 0x00010008
             commandBody = negotiatedProto.encode()
         )
-        val startDoneFrame = CarLifeFrameCodec.createCommandFrame(
-            channel = CarLifeChannel.CONTROL,
-            serviceType = CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_DONE, // 0x0001000A
-            commandBody = ByteArray(0)
-        )
-        val outbound = ArrayList<CarLifeFrame>(4).apply {
+        val outbound = ArrayList<CarLifeFrame>(5).apply {
             add(initDoneFrame)
-            add(startDoneFrame)
             if (includeForegroundAndScreenOn) {
-                add(
-                    CarLifeFrameCodec.createCommandFrame(
-                        channel = CarLifeChannel.CONTROL,
-                        serviceType = CarLifeMsgType.MSG_CMD_FOREGROUND, // 0x00010025
-                        commandBody = ByteArray(0)
-                    )
-                )
-                add(
-                    CarLifeFrameCodec.createCommandFrame(
-                        channel = CarLifeChannel.CONTROL,
-                        serviceType = CarLifeMsgType.MSG_CMD_SCREEN_ON, // 0x00010018
-                        commandBody = ByteArray(0)
-                    )
-                )
+                addAll(buildForegroundAndScreenOnFrames())
             }
         }
 
-        val suffix = if (includeForegroundAndScreenOn) " + FOREGROUND + SCREEN_ON" else ""
-        val summary = "$reason (${safeW}x${safeH}@${safeFps}fps) -> TX INIT_DONE (0x00010008) + START_DONE (0x0001000A)$suffix"
+        val suffix = if (includeForegroundAndScreenOn) {
+            " + SCREEN_ON (0x00010018) + USERPRESENT (0x0001001A) + FOREGROUND (0x0001001B) + REQ_FG (0x00010038)"
+        } else {
+            ""
+        }
+        val summary = "$reason (${safeW}x${safeH}@${safeFps}fps) -> TX INIT_DONE (0x00010008)$suffix"
         _sessionState.update {
             it.copy(
                 phase = CarLifeSessionPhase.VIDEO_STREAMING,
@@ -193,8 +210,9 @@ class CarLifeControlStateMachine(
     }
 
     /**
-     * Builds `MSG_CMD_VIDEO_ENCODER_INIT_DONE (0x00010008)` (optional) +
-     * `MSG_CMD_VIDEO_ENCODER_START_DONE (0x0001000A)` + `FOREGROUND` + `SCREEN_ON`.
+     * Builds optional `MSG_CMD_VIDEO_ENCODER_INIT_DONE (0x00010008)` +
+     * `SCREEN_ON (0x00010018)` + `SCREEN_USERPRESENT (0x0001001A)` +
+     * `FOREGROUND (0x0001001B)` + `REQUEST_GO_TO_FOREGROUND (0x00010038)`.
      */
     fun buildStartDoneReplyFrames(
         includeInitDone: Boolean = true,
@@ -205,7 +223,7 @@ class CarLifeControlStateMachine(
         val safeW = width.coerceIn(480, 3840)
         val safeH = height.coerceIn(272, 2160)
         val safeFps = fps.coerceIn(15, 60)
-        val out = ArrayList<CarLifeFrame>(4)
+        val out = ArrayList<CarLifeFrame>(5)
         if (includeInitDone) {
             val negotiatedProto = CarlifeVideoEncoderInfoProto(
                 width = safeW,
@@ -215,32 +233,12 @@ class CarLifeControlStateMachine(
             out.add(
                 CarLifeFrameCodec.createCommandFrame(
                     channel = CarLifeChannel.CONTROL,
-                    serviceType = CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT_DONE, // 0x00018008
+                    serviceType = CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT_DONE, // 0x00010008
                     commandBody = negotiatedProto.encode()
                 )
             )
         }
-        out.add(
-            CarLifeFrameCodec.createCommandFrame(
-                channel = CarLifeChannel.CONTROL,
-                serviceType = CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_DONE, // 0x0001800A
-                commandBody = ByteArray(0)
-            )
-        )
-        out.add(
-            CarLifeFrameCodec.createCommandFrame(
-                channel = CarLifeChannel.CONTROL,
-                serviceType = CarLifeMsgType.MSG_CMD_FOREGROUND, // 0x00018025
-                commandBody = ByteArray(0)
-            )
-        )
-        out.add(
-            CarLifeFrameCodec.createCommandFrame(
-                channel = CarLifeChannel.CONTROL,
-                serviceType = CarLifeMsgType.MSG_CMD_SCREEN_ON, // 0x00018018
-                commandBody = ByteArray(0)
-            )
-        )
+        out.addAll(buildForegroundAndScreenOnFrames())
         _sessionState.update {
             it.copy(
                 phase = CarLifeSessionPhase.VIDEO_STREAMING,
@@ -282,7 +280,8 @@ class CarLifeControlStateMachine(
             CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT_ALT -> handleVideoEncoderInit(cmd.body)
             CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START,
             CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_ALT -> handleVideoEncoderStart(frame.totalFrameBytes)
-            CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_PAUSE -> handleVideoEncoderPause()
+            CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_PAUSE,
+            CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_PAUSE_ALT -> handleVideoEncoderPause()
             CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_RESET -> handleVideoEncoderReset()
             CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_FRAME_RATE_CHANGE -> handleFrameRateChange(cmd.body)
             CarLifeMsgType.MSG_CMD_AUTHEN_REQUEST_0B ->
@@ -298,6 +297,19 @@ class CarLifeControlStateMachine(
                 val hex = CarLifeFrameCodec.formatHexPreview(frame, maxPayloadBytes = 256)
                 val statusProto = CarlifeModuleStatusProto.decode(cmd.body)
                 val note = "RX MSG_CMD_MODULE_STATUS (module=${statusProto.moduleId}, status=${statusProto.statusId}) $hex"
+                _sessionState.update { it.copy(lastControlAction = note) }
+                ControlTransitionResult(
+                    updatedState = _sessionState.value,
+                    outboundFrames = emptyList(),
+                    summary = note
+                )
+            }
+            CarLifeMsgType.MSG_CMD_STATISTIC_INFO,
+            CarLifeMsgType.MSG_CMD_STATISTIC_INFO_ALT -> {
+                // RX 0x00018027 (MSG_CMD_STATISTIC_INFO): log only, NEVER reply with non-existent 0x00010027.
+                val hex = CarLifeFrameCodec.formatHexPreview(frame, maxPayloadBytes = Int.MAX_VALUE)
+                val idHex = "0x${cmd.serviceType.toUInt().toString(16).uppercase().padStart(8, '0')}"
+                val note = "RX MSG_CMD_STATISTIC_INFO ($idHex, ${frame.payload.size}B) $hex (logged only)"
                 _sessionState.update { it.copy(lastControlAction = note) }
                 ControlTransitionResult(
                     updatedState = _sessionState.value,
@@ -321,41 +333,28 @@ class CarLifeControlStateMachine(
             CarLifeMsgType.MSG_CMD_HU_AES_KEY_REQUEST -> handleAesKeyRequest(frame)
             CarLifeMsgType.MSG_CMD_SCREEN_ON -> updateScreenLifecycle(screenOn = true, eventName = "MSG_CMD_SCREEN_ON")
             CarLifeMsgType.MSG_CMD_SCREEN_OFF -> updateScreenLifecycle(screenOn = false, eventName = "MSG_CMD_SCREEN_OFF")
+            CarLifeMsgType.MSG_CMD_SCREEN_USERPRESENT -> updateScreenLifecycle(screenOn = true, eventName = "MSG_CMD_SCREEN_USERPRESENT")
             CarLifeMsgType.MSG_CMD_FOREGROUND,
-            CarLifeMsgType.MSG_CMD_FOREGROUND_ALT,
-            CarLifeMsgType.MSG_CMD_FOREGROUND_LEGACY -> updateForegroundLifecycle(foreground = true)
+            CarLifeMsgType.MSG_CMD_GO_TO_FOREGROUND -> updateForegroundLifecycle(foreground = true)
             CarLifeMsgType.MSG_CMD_BACKGROUND -> updateForegroundLifecycle(foreground = false)
             else -> handleUnknownOrAuthCommand(frame, cmd.serviceType)
         }
     }
 
     /**
-     * Builds a Video Channel (`0x0002`) Heartbeat frame (`MSG_VIDEO_HEARTBEAT = 0x00028002`)
-     * rather than sending a `0x0002xxxx` message ID inside Control Channel `0x0001`.
+     * Builds a 20-byte AOA Video Channel (`0x0002`) Heartbeat frame (`MSG_VIDEO_HEARTBEAT = 0x00020002`):
+     * Outer 8B (`[00 00 00 02][00 00 00 0C]`) + Inner 12B (`[00 00 00 00][timestampMs][00 02 00 02]`).
      */
-    fun createHeartbeatFrame(): CarLifeFrame {
+    fun createHeartbeatFrame(
+        timestampMs: Long = (android.os.SystemClock.uptimeMillis().takeIf { it > 0L } ?: System.currentTimeMillis()) and 0x7FFF_FFFFL
+    ): CarLifeFrame {
         _sessionState.update {
             it.copy(
                 heartbeatCount = it.heartbeatCount + 1L,
-                lastControlAction = "TX Video Heartbeat #${it.heartbeatCount + 1L}"
+                lastControlAction = "TX MSG_VIDEO_HEARTBEAT (0x00020002) #${it.heartbeatCount + 1L}"
             )
         }
-        val innerHeartbeat = java.nio.ByteBuffer.allocate(12)
-            .order(java.nio.ByteOrder.BIG_ENDIAN)
-            .putInt(0)
-            .putInt((System.currentTimeMillis() and 0x7FFF_FFFFL).toInt())
-            .putInt(CarLifeMsgType.MSG_VIDEO_HEARTBEAT)
-            .array()
-        return CarLifeFrame(
-            header = CarLifeHeader(
-                channel = CarLifeChannel.VIDEO,
-                rawChannelId = CarLifeChannel.VIDEO.id,
-                payloadLength = innerHeartbeat.size,
-                timestamp = System.currentTimeMillis() and 0x7FFF_FFFFL,
-                includeOuterTimestamp = false
-            ),
-            payload = innerHeartbeat
-        )
+        return CarLifeFrameCodec.createVideoHeartbeatFrame(timestampMs = timestampMs)
     }
 
     private fun handleProtocolVersion(body: ByteArray): ControlTransitionResult {
@@ -600,6 +599,7 @@ class CarLifeControlStateMachine(
         val serviceHex = "0x${serviceId.toUInt().toString(16).uppercase().padStart(8, '0')}"
         val isPassiveTelemetry = serviceId in CarLifeMsgType.MSG_CMD_CAR_VELOCITY..CarLifeMsgType.MSG_CMD_CAR_OIL ||
             serviceId == CarLifeMsgType.MSG_CMD_STATISTIC_INFO ||
+            serviceId == CarLifeMsgType.MSG_CMD_STATISTIC_INFO_ALT ||
             serviceId == CarLifeMsgType.MSG_CMD_PAUSE_MEDIA
         val isHuRequest = ((serviceId ushr 16) == 0x0001) && ((serviceId and 0x8000) != 0) && !isPassiveTelemetry
 
@@ -695,24 +695,14 @@ class CarLifeControlStateMachine(
     }
 
     private fun handleVideoEncoderStart(wireBytes: Int = 12): ControlTransitionResult {
-        // Send START_DONE (0x0001000A) + FOREGROUND (0x00010025) + SCREEN_ON (0x00010018),
-        // then immediately unlock 0x0002 and emit H.264 SYNC_FRAME.
-        val startDoneFrame = CarLifeFrameCodec.createCommandFrame(
-            channel = CarLifeChannel.CONTROL,
-            serviceType = CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_DONE, // 0x0001000A
-            commandBody = ByteArray(0)
-        )
-        val foregroundFrame = CarLifeFrameCodec.createCommandFrame(
-            channel = CarLifeChannel.CONTROL,
-            serviceType = CarLifeMsgType.MSG_CMD_FOREGROUND, // 0x00010025
-            commandBody = ByteArray(0)
-        )
-        val screenOnFrame = CarLifeFrameCodec.createCommandFrame(
-            channel = CarLifeChannel.CONTROL,
-            serviceType = CarLifeMsgType.MSG_CMD_SCREEN_ON, // 0x00010018
-            commandBody = ByteArray(0)
-        )
-        val summary = "RX MSG_CMD_VIDEO_ENCODER_START (0x00018009, ${wireBytes}B) -> TX START_DONE (0x0001000A) + FOREGROUND (0x00010025) + SCREEN_ON (0x00010018) -> Streaming 0x0002"
+        // Per CommonParams.smali: NEVER send non-existent 0x0001000A (0x0001800A is PAUSE).
+        // Immediately unlock video channel 0x0002 and send:
+        // 1. MSG_CMD_SCREEN_ON (0x00010018)
+        // 2. MSG_CMD_SCREEN_USERPRESENT (0x0001001A)
+        // 3. MSG_CMD_FOREGROUND (0x0001001B)
+        // 4. MSG_CMD_REQUEST_GO_TO_FOREGROUND (0x00010038)
+        val outbound = buildForegroundAndScreenOnFrames()
+        val summary = "RX MSG_CMD_VIDEO_ENCODER_START (0x00018009, ${wireBytes}B) -> TX SCREEN_ON (0x00010018) + USERPRESENT (0x0001001A) + FOREGROUND (0x0001001B) + REQ_FG (0x00010038) -> Streaming 0x0002"
         _sessionState.update {
             it.copy(
                 phase = CarLifeSessionPhase.VIDEO_STREAMING,
@@ -723,7 +713,7 @@ class CarLifeControlStateMachine(
         }
         return ControlTransitionResult(
             updatedState = _sessionState.value,
-            outboundFrames = listOf(startDoneFrame, foregroundFrame, screenOnFrame),
+            outboundFrames = outbound,
             summary = summary
         )
     }

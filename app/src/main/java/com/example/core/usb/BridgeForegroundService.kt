@@ -450,9 +450,9 @@ class BridgeForegroundService : Service() {
      * Proactive Video Start chain upon `MSG_CMD_HU_PROTOCOL_VERSION (0x00018001)`:
      * after `MATCH_STATUS (0x00010002)` -> `MD_INFO (0x00010004)` -> `AUDIO_INIT (0x0003 & 0x0004)`:
      * 5. `MSG_CMD_VIDEO_ENCODER_INIT_DONE (0x00010008, 800x480@30fps)`
-     * 6. `MSG_CMD_VIDEO_ENCODER_START_DONE (0x0001000A)`
-     * 7. Optional `MSG_CMD_FOREGROUND (0x00010025)` & `MSG_CMD_SCREEN_ON (0x00010018)`
-     * 8. Immediately sets `isVideoChannelReadyForStreaming = true`, requests `SYNC_FRAME`, and streams NAL units.
+     * 6. `MSG_CMD_SCREEN_ON (0x00010018)` + `MSG_CMD_SCREEN_USERPRESENT (0x0001001A)` +
+     *    `MSG_CMD_FOREGROUND (0x0001001B)` + `MSG_CMD_REQUEST_GO_TO_FOREGROUND (0x00010038)`
+     * 7. Immediately sets `isVideoChannelReadyForStreaming = true`, requests `SYNC_FRAME`, and streams NAL units.
      */
     private suspend fun triggerAutoVideoEncoderStart(
         reason: String,
@@ -740,18 +740,28 @@ class BridgeForegroundService : Service() {
             }
         }
 
-        // Periodic 1,000ms Heartbeat check ONLY when 0x0002 is unlocked and idle (>=2s since last video NAL TX)
+        // Periodic 1,000ms Video Heartbeat (MSG_VIDEO_HEARTBEAT = 0x00020002) in AOA 20B mode:
+        // sends 8B AOA header + 12B video header [len=0][timestampMs][0x00020002] once per second.
         serviceScope.launch {
             while (isActive) {
                 kotlinx.coroutines.delay(1_000L)
-                val nowElapsed = SystemClock.elapsedRealtime()
-                val isVideoIdle = lastVideoTxElapsedMs == 0L || (nowElapsed - lastVideoTxElapsedMs) >= 2_000L
                 if (usbTransport.state.value is UsbTransportState.Connected &&
                     isVideoChannelReadyForStreaming &&
-                    isVideoIdle
+                    CarLifeFrameCodec.useNestedVideoMsgHeader
                 ) {
                     val hb = controlStateMachine.createHeartbeatFrame()
-                    usbTransport.sendFrameImmediate(hb)
+                    if (usbTransport.sendFrameImmediate(hb)) {
+                        BridgeTelemetryBus.recordFrame(
+                            direction = "TX (S26U -> HU)",
+                            frame = hb,
+                            rxBytesTotal = usbTransport.rxBytes,
+                            txBytesTotal = usbTransport.txBytes,
+                            rxFramesTotal = usbTransport.rxFrames,
+                            txFramesTotal = usbTransport.txFrames,
+                            protocolNote = "TX MSG_VIDEO_HEARTBEAT (0x00020002, AOA 20B 1s)",
+                            serviceNameOverride = "MSG_VIDEO_HEARTBEAT (0x00020002)"
+                        )
+                    }
                 }
             }
         }
@@ -957,10 +967,7 @@ class BridgeForegroundService : Service() {
 
             ACTION_SEND_VIDEO_HEARTBEAT -> {
                 serviceScope.launch {
-                    val hbFrame = CarLifeFrameCodec.createVideoFrame(
-                        nalData = byteArrayOf(0x00, 0x00, 0x00, 0x01, 0x09, 0x10),
-                        timestampMs = System.currentTimeMillis() and 0xFFFF_FFFFL
-                    )
+                    val hbFrame = controlStateMachine.createHeartbeatFrame()
                     if (usbTransport.sendFrameImmediate(hbFrame)) {
                         BridgeTelemetryBus.recordFrame(
                             direction = "TX (S26U -> HU)",
@@ -969,7 +976,8 @@ class BridgeForegroundService : Service() {
                             txBytesTotal = usbTransport.txBytes,
                             rxFramesTotal = usbTransport.rxFrames,
                             txFramesTotal = usbTransport.txFrames,
-                            protocolNote = "Sent 12-byte Video NAL Access Unit Delimiter"
+                            protocolNote = "TX MSG_VIDEO_HEARTBEAT (0x00020002)",
+                            serviceNameOverride = "MSG_VIDEO_HEARTBEAT (0x00020002)"
                         )
                     }
                 }
@@ -1174,8 +1182,8 @@ class BridgeForegroundService : Service() {
                         hasSentMdInfoInSession = true
                         if (activeProfile == HandshakeTestProfile.TEST_4_AUDIO_VIDEO_NO_SCREEN) {
                             // После 0x00018003 (HU_INFO) и отправки полного MD_INFO (0x00010004):
-                            // AUDIO_INIT (0x0003/0x0004) -> INIT_DONE (0x00010008) -> START_DONE (0x0001000A) ->
-                            // FOREGROUND (0x00010025) -> SCREEN_ON (0x00010018) -> шлюз 0x0002 + SYNC_FRAME.
+                            // AUDIO_INIT (0x0003/0x0004) -> INIT_DONE (0x00010008) -> SCREEN_ON (0x00010018) ->
+                            // USERPRESENT (0x0001001A) -> FOREGROUND (0x0001001B) -> REQ_FG (0x00010038) -> 0x0002 + SYNC_FRAME.
                             sendAudioMultiplexerInitPackets()
                             triggerAutoVideoEncoderStart(
                                 reason = "Пост-HU_INFO (0x00018003): Audio + Video + FG + ScreenOn",
@@ -1215,7 +1223,7 @@ class BridgeForegroundService : Service() {
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START,
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_ALT -> {
                         // HU sent 0x00018009 (VIDEO_ENCODER_START): ensure encoder is running,
-                        // open 0x0002 gate, and immediately push SPS/PPS + IDR.
+                        // open 0x0002 gate immediately, and push SPS/PPS + IDR.
                         val targetW = activeWidth.coerceIn(480, 3840)
                         val targetH = activeHeight.coerceIn(272, 2160)
                         controlStateMachine.setPreferredResolution(targetW, targetH)
@@ -1223,7 +1231,8 @@ class BridgeForegroundService : Service() {
                             width = targetW,
                             height = targetH,
                             frameRate = 30,
-                            bitRate = activeBitrateBps
+                            bitRate = activeBitrateBps,
+                            sourceMode = activeVideoSourceMode
                         )
                         if (!isVideoChannelReadyForStreaming) {
                             resetVideoLogFlags()
@@ -1234,7 +1243,8 @@ class BridgeForegroundService : Service() {
                         }
                     }
 
-                    CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_PAUSE -> {
+                    CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_PAUSE,
+                    CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_PAUSE_ALT -> {
                         setVideoStreamingReady(false)
                     }
 
