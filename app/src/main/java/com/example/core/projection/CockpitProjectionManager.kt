@@ -245,6 +245,45 @@ class CockpitProjectionManager(
     }
 
     /**
+     * Active [MediaProjection] instance (when granted by the user) shared with
+     * `CarLifeAudioCaptureManager` for Android 10+ `AudioPlaybackCapture`.
+     */
+    val activeMediaProjection: MediaProjection?
+        get() = mediaProjection
+
+    /**
+     * Returns the active [MediaProjection], or lazily instantiates it from [MediaProjectionTokenStore]
+     * so `AudioPlaybackCapture` works even while video is in `CANVAS_TEST_CARD` mode.
+     */
+    suspend fun getOrCreateMediaProjectionForAudio(): MediaProjection? = projectionMutex.withLock {
+        mediaProjection?.let { return@withLock it }
+        val tokenCode = MediaProjectionTokenStore.resultCode
+        val tokenData = MediaProjectionTokenStore.resultData
+        if (tokenCode != Activity.RESULT_OK || tokenData == null) {
+            return@withLock null
+        }
+        return@withLock runCatching {
+            val mp = mediaProjectionManager.getMediaProjection(tokenCode, Intent(tokenData))
+            if (mp != null) {
+                if (mediaProjectionCallback == null) {
+                    val callback = object : MediaProjection.Callback() {
+                        override fun onStop() {
+                            Log.w(TAG, "MediaProjection stopped by system")
+                            MediaProjectionTokenStore.clearToken()
+                        }
+                    }
+                    mp.registerCallback(callback, mainHandler)
+                    mediaProjectionCallback = callback
+                }
+                mediaProjection = mp
+            }
+            mp
+        }.onFailure { e ->
+            Log.w(TAG, "Unable to create MediaProjection for audio capture: ${e.message}")
+        }.getOrNull()
+    }
+
+    /**
      * Gate for channel `0x0002` video streaming:
      * Remains `false` until USB AOA connects and receives `MSG_CMD_HU_PROTOCOL_VERSION (0x00018001)`.
      * Force-unlocked immediately upon proactive handshake completion (`unlockVideoChannelAndRequestSyncFrame`).

@@ -1,6 +1,7 @@
 package com.example
 
 import android.view.MotionEvent
+import com.example.core.audio.CarLifeAudioCaptureManager
 import com.example.core.carlife.CarLifePacketBuilder
 import com.example.core.carlife.CarLifeProtocolConstants
 import com.example.core.carlife.CarLifeTouchPacket
@@ -19,6 +20,7 @@ import com.example.protocol.carlife.CarLifeSessionPhase
 import com.example.protocol.carlife.CarLifeTouchDecoder
 import com.example.protocol.carlife.CarLifeTouchEventType
 import com.example.protocol.carlife.CarlifeDeviceInfoProto
+import com.example.protocol.carlife.CarlifeMusicInitProto
 import com.example.protocol.carlife.CarlifeProtocolVersionProto
 import com.example.protocol.carlife.CarlifeVideoEncoderInfoProto
 import com.example.protocol.carlife.HandshakeTestProfile
@@ -927,6 +929,106 @@ class ExampleUnitTest {
         )
         val resMid = sm.onControlFrame(rxHfpMid)
         assertTrue("HFP/telephony range 0x00010040..0x0001004F must NEVER be sent", resMid.outboundFrames.isEmpty())
+    }
+
+    @Test
+    fun mediaAudioChannel0x0003_aoa20BInitDataStop_andSilenceSuppression_verifySpec() {
+        // 1. Verify CarlifeMusicInitProto wire bytes:
+        //    Field 1 (sampleRate=48000, tag 0x08) -> 08 80 F7 02
+        //    Field 2 (channelConfig=2, tag 0x10)  -> 10 02
+        //    Field 3 (sampleFormat=16, tag 0x18)  -> 18 10
+        val musicInit = CarlifeMusicInitProto(sampleRate = 48_000, channelConfig = 2, sampleFormat = 16)
+        val protoBytes = musicInit.encode()
+        assertArrayEquals(
+            byteArrayOf(
+                0x08, 0x80.toByte(), 0xF7.toByte(), 0x02,
+                0x10, 0x02,
+                0x18, 0x10
+            ),
+            protoBytes
+        )
+        val decodedInitProto = CarlifeMusicInitProto.decode(protoBytes)
+        assertEquals(48_000, decodedInitProto.sampleRate)
+        assertEquals(2, decodedInitProto.channelConfig)
+        assertEquals(16, decodedInitProto.sampleFormat)
+
+        // 2. Verify MSG_MEDIA_INIT (0x00030001) in AOA 20B Big-Endian format
+        val tsInitSec = 1_700_000_000L
+        val initFrame = CarLifeFrameCodec.createMediaInitFrame(timestampSec = tsInitSec)
+        val initWire = CarLifeFrameCodec.encodeFrame(initFrame)
+        val expectedInitWire = CarLifeFrameCodec.buildAoAMediaAudioPacket(
+            serviceType = CarLifeMsgType.MSG_MEDIA_INIT,
+            payload = protoBytes,
+            timestampSec = tsInitSec.toInt()
+        )
+        assertArrayEquals(expectedInitWire, initWire)
+        assertEquals(20 + protoBytes.size, initWire.size)
+        val initBuf = ByteBuffer.wrap(initWire).order(ByteOrder.BIG_ENDIAN)
+        assertEquals(0x00000003, initBuf.int) // 8B AOA channel = 0x0003
+        assertEquals(protoBytes.size + 12, initBuf.int) // 8B AOA len = payloadLen + 12
+        assertEquals(protoBytes.size, initBuf.int) // 12B audio len = payloadLen
+        assertEquals(tsInitSec.toInt(), initBuf.int) // 12B audio timestampSec
+        assertEquals(CarLifeMsgType.MSG_MEDIA_INIT, initBuf.int) // 0x00030001
+
+        // Round-trip decode via both decodeFrame() and readNextFrame(InputStream)
+        val decodedInitDirect = CarLifeFrameCodec.decodeFrame(initWire)
+        assertEquals(CarLifeChannel.MEDIA_AUDIO, decodedInitDirect.channel)
+        assertEquals(tsInitSec, decodedInitDirect.header.timestamp)
+        assertEquals(CarLifeMsgType.MSG_MEDIA_INIT, decodedInitDirect.parseCommandMessageOrNull()?.serviceType)
+        assertArrayEquals(protoBytes, decodedInitDirect.parseCommandMessageOrNull()?.body)
+
+        val decodedInitStream = CarLifeFrameCodec.readNextFrame(ByteArrayInputStream(initWire))
+        assertEquals(CarLifeChannel.MEDIA_AUDIO, decodedInitStream.channel)
+        assertEquals(CarLifeMsgType.MSG_MEDIA_INIT, decodedInitStream.parseCommandMessageOrNull()?.serviceType)
+        assertArrayEquals(protoBytes, decodedInitStream.parseCommandMessageOrNull()?.body)
+        assertEquals("MSG_MEDIA_INIT", CarLifeMsgType.nameOf(CarLifeMsgType.MSG_MEDIA_INIT))
+
+        // 3. Verify MSG_MEDIA_DATA (0x00030006) with 4096-byte PCM chunk in AOA 20B format
+        val pcm4096 = ByteArray(CarLifeAudioCaptureManager.PCM_CHUNK_SIZE_BYTES) { idx ->
+            ((idx * 13 + 7) and 0xFF).toByte()
+        }
+        val tsDataSec = 1_700_000_001L
+        val dataFrame = CarLifeFrameCodec.createMediaDataFrame(pcmBytes = pcm4096, timestampSec = tsDataSec)
+        val dataWire = CarLifeFrameCodec.encodeFrame(dataFrame)
+        assertEquals(20 + 4096, dataWire.size)
+        val dataBuf = ByteBuffer.wrap(dataWire).order(ByteOrder.BIG_ENDIAN)
+        assertEquals(0x00000003, dataBuf.int)
+        assertEquals(4096 + 12, dataBuf.int)
+        assertEquals(4096, dataBuf.int)
+        assertEquals(tsDataSec.toInt(), dataBuf.int)
+        assertEquals(CarLifeMsgType.MSG_MEDIA_DATA, dataBuf.int) // 0x00030006
+
+        val decodedDataStream = CarLifeFrameCodec.readNextFrame(ByteArrayInputStream(dataWire))
+        assertEquals(CarLifeChannel.MEDIA_AUDIO, decodedDataStream.channel)
+        assertEquals(tsDataSec, decodedDataStream.header.timestamp)
+        val parsedData = decodedDataStream.parseCommandMessageOrNull()!!
+        assertEquals(CarLifeMsgType.MSG_MEDIA_DATA, parsedData.serviceType)
+        assertArrayEquals(pcm4096, parsedData.body)
+        assertEquals("MSG_MEDIA_DATA", CarLifeMsgType.nameOf(CarLifeMsgType.MSG_MEDIA_DATA))
+
+        // 4. Verify MSG_MEDIA_STOP (0x00030002) with empty payload in AOA 20B format
+        val tsStopSec = 1_700_000_002L
+        val stopFrame = CarLifeFrameCodec.createMediaStopFrame(timestampSec = tsStopSec)
+        val stopWire = CarLifeFrameCodec.encodeFrame(stopFrame)
+        assertEquals(20, stopWire.size)
+        val stopBuf = ByteBuffer.wrap(stopWire).order(ByteOrder.BIG_ENDIAN)
+        assertEquals(0x00000003, stopBuf.int)
+        assertEquals(12, stopBuf.int) // 0 + 12
+        assertEquals(0, stopBuf.int) // payloadLen = 0
+        assertEquals(tsStopSec.toInt(), stopBuf.int)
+        assertEquals(CarLifeMsgType.MSG_MEDIA_STOP, stopBuf.int) // 0x00030002
+
+        val decodedStopStream = CarLifeFrameCodec.readNextFrame(ByteArrayInputStream(stopWire))
+        assertEquals(CarLifeMsgType.MSG_MEDIA_STOP, decodedStopStream.parseCommandMessageOrNull()?.serviceType)
+        assertEquals(0, decodedStopStream.parseCommandMessageOrNull()?.body?.size)
+        assertEquals("MSG_MEDIA_STOP", CarLifeMsgType.nameOf(CarLifeMsgType.MSG_MEDIA_STOP))
+
+        // 5. Verify silence suppression helper
+        val silentBuf = ByteArray(4096)
+        assertTrue(CarLifeAudioCaptureManager.isBufferSilent(silentBuf, 4096))
+        silentBuf[4095] = 0x01
+        assertFalse(CarLifeAudioCaptureManager.isBufferSilent(silentBuf, 4096))
+        assertTrue(CarLifeAudioCaptureManager.isBufferSilent(silentBuf, 4095))
     }
 }
 

@@ -21,6 +21,8 @@ import android.view.MotionEvent
 import androidx.core.app.NotificationCompat
 import com.example.MainActivity
 import com.example.R
+import com.example.core.audio.AudioCaptureStats
+import com.example.core.audio.CarLifeAudioCaptureManager
 import com.example.core.carlife.CarLifeHardKeyPacket
 import com.example.core.carlife.CarLifeTouchPacket
 import com.example.core.projection.CockpitProjectionManager
@@ -106,6 +108,7 @@ data class BridgeRuntimeState(
     val transportState: UsbTransportState = UsbTransportState.Disconnected,
     val controlSession: CarLifeControlSessionState = CarLifeControlSessionState(),
     val projectionStats: ProjectionPipelineStats = ProjectionPipelineStats(),
+    val audioCaptureStats: AudioCaptureStats = AudioCaptureStats(),
     val isVideoChannelReadyForStreaming: Boolean = false,
     val useNestedVideoMsgHeader: Boolean = true,
     val videoSourceMode: VideoSourceMode = VideoSourceMode.CANVAS_TEST_CARD,
@@ -243,10 +246,25 @@ object BridgeTelemetryBus {
         rxFramesTotal: Long? = null,
         txFramesTotal: Long? = null
     ) {
+        recordFrameCountersOnly(
+            channel = CarLifeChannel.VIDEO,
+            rxBytesTotal = rxBytesTotal,
+            txBytesTotal = txBytesTotal,
+            rxFramesTotal = rxFramesTotal,
+            txFramesTotal = txFramesTotal
+        )
+    }
+
+    fun recordFrameCountersOnly(
+        channel: CarLifeChannel,
+        rxBytesTotal: Long? = null,
+        txBytesTotal: Long? = null,
+        rxFramesTotal: Long? = null,
+        txFramesTotal: Long? = null
+    ) {
         _runtimeState.update { current ->
             val updatedChannelCounts = current.channelFrameCounts.toMutableMap()
-            updatedChannelCounts[CarLifeChannel.VIDEO] =
-                (updatedChannelCounts[CarLifeChannel.VIDEO] ?: 0L) + 1L
+            updatedChannelCounts[channel] = (updatedChannelCounts[channel] ?: 0L) + 1L
             current.copy(
                 rxBytes = rxBytesTotal ?: current.rxBytes,
                 txBytes = txBytesTotal ?: current.txBytes,
@@ -295,6 +313,9 @@ class BridgeForegroundService : Service() {
     lateinit var projectionManager: CockpitProjectionManager
         private set
 
+    lateinit var audioCaptureManager: CarLifeAudioCaptureManager
+        private set
+
     private sealed interface VideoTxItem {
         data class VideoFrame(
             val nalBytes: ByteArray,
@@ -310,6 +331,7 @@ class BridgeForegroundService : Service() {
     private val videoTxQueue = Channel<VideoTxItem>(capacity = Channel.UNLIMITED)
     private val controlStateMachine = CarLifeControlStateMachine()
     private val videoPacketCounter = java.util.concurrent.atomic.AtomicLong(0L)
+    private val audioPacketCounter = java.util.concurrent.atomic.AtomicLong(0L)
 
     /**
      * Gate for channel `0x0002` H.264 streaming:
@@ -482,31 +504,36 @@ class BridgeForegroundService : Service() {
     }
 
     /**
-     * Mandatory Jetta VS7 Audio-Init before video streaming:
-     * Immediately after `MSG_CMD_MD_INFO (0x00010004)`, sends empty 12-byte audio frames
-     * with a valid `SystemClock.uptimeMillis()` timestamp:
-     * - `0x0003` (Media Audio): `[00 00 00 03][00 00 00 00][ts (4B)]`
-     * - `0x0004` (TTS Audio): `[00 00 00 04][00 00 00 00][ts (4B)]`
+     * Initializes Audio channel `0x0003` using official AOA 20B `MSG_MEDIA_INIT (0x00030001)`
+     * (`CarlifeMusicInit`: 48000 Hz, Stereo, 16-bit PCM) and optional `0x0004` TTS empty header.
      */
     private suspend fun sendAudioMultiplexerInitPackets() {
         if (usbTransport.state.value !is UsbTransportState.Connected) return
-        val ts = (SystemClock.uptimeMillis() and 0x7FFF_FFFFL).toInt()
-        val audioInitFrames = CarLifeFrameCodec.createAudioMultiplexerInitFrames(timestampMs = ts.toLong())
-        for (audioFrame in audioInitFrames) {
-            if (usbTransport.sendFrameImmediate(audioFrame)) {
-                BridgeTelemetryBus.recordFrame(
-                    direction = "TX (S26U -> HU)",
-                    frame = audioFrame,
-                    rxBytesTotal = usbTransport.rxBytes,
-                    txBytesTotal = usbTransport.txBytes,
-                    rxFramesTotal = usbTransport.rxFrames,
-                    txFramesTotal = usbTransport.txFrames,
-                    protocolNote = "Mandatory Audio-Init (0x%04X): [12B HDR | size=0, ts=${ts}ms]".format(audioFrame.channel.id),
-                    serviceNameOverride = "AUDIO_INIT (0x%04X)".format(audioFrame.channel.id)
-                )
-            }
+        if (::audioCaptureManager.isInitialized) {
+            audioCaptureManager.sendMediaInitPacket()
         }
         hasSentAudioInitInSession = true
+    }
+
+    /**
+     * Starts `AudioPlaybackCapture` (`48000 Hz`, Stereo, 16-bit PCM -> 4096B `MSG_MEDIA_DATA 0x00030006`)
+     * when USB AOA is connected, `MediaProjection` is granted, and `RECORD_AUDIO` permission is granted.
+     * Falls back gracefully to `MSG_MEDIA_INIT (0x00030001)` if permission/projection is pending.
+     */
+    private suspend fun startAudioCaptureIfReady(reason: String) {
+        if (usbTransport.state.value !is UsbTransportState.Connected) return
+        if (!::audioCaptureManager.isInitialized) return
+        val hasAudioPerm = audioCaptureManager.refreshPermissionState()
+        val mp = projectionManager.getOrCreateMediaProjectionForAudio()
+        if (mp != null && hasAudioPerm) {
+            val started = audioCaptureManager.startCapture(mp)
+            if (started) {
+                hasSentAudioInitInSession = true
+                Log.i(TAG, "AudioPlaybackCapture started on 0x0003 ($reason)")
+            }
+        } else if (!hasSentAudioInitInSession) {
+            sendAudioMultiplexerInitPackets()
+        }
     }
 
     /**
@@ -566,6 +593,7 @@ class BridgeForegroundService : Service() {
         resetVideoLogFlags()
         setVideoStreamingReady(true)
         projectionManager.unlockVideoChannelAndRequestSyncFrame()
+        startAudioCaptureIfReady(reason = reason)
     }
 
     /**
@@ -687,6 +715,54 @@ class BridgeForegroundService : Service() {
         projectionManager.videoSourceMode = activeVideoSourceMode
         projectionManager.setVideoChannelReady(false)
 
+        audioCaptureManager = CarLifeAudioCaptureManager(
+            context = applicationContext,
+            onSendAudioFrame = { audioFrame, isControlMsg ->
+                if (usbTransport.state.value !is UsbTransportState.Connected) {
+                    return@CarLifeAudioCaptureManager false
+                }
+                // Uses usbTransport.sendFrameImmediate which acquires the shared USB writeMutex + usbWriteLock,
+                // guaranteeing atomic, non-interleaved writes with video channel 0x0002.
+                val sent = usbTransport.sendFrameImmediate(audioFrame)
+                if (sent) {
+                    val parsed = audioFrame.parseCommandMessageOrNull()
+                    val svcName = parsed?.serviceName ?: "MEDIA_AUDIO"
+                    val audioIdx = audioPacketCounter.incrementAndGet()
+                    val shouldLog = isControlMsg || audioIdx <= 3L || (audioIdx % 100L == 0L)
+                    if (shouldLog) {
+                        val bodyLen = parsed?.body?.size ?: (audioFrame.payload.size - 12).coerceAtLeast(0)
+                        BridgeTelemetryBus.recordFrame(
+                            direction = "TX (S26U -> HU)",
+                            frame = audioFrame,
+                            rxBytesTotal = usbTransport.rxBytes,
+                            txBytesTotal = usbTransport.txBytes,
+                            rxFramesTotal = usbTransport.rxFrames,
+                            txFramesTotal = usbTransport.txFrames,
+                            protocolNote = when (parsed?.serviceType) {
+                                CarLifeMsgType.MSG_MEDIA_INIT ->
+                                    "Audio 0x0003 INIT: 48000 Hz, Stereo (2ch), 16-bit PCM (AOA 20B)"
+                                CarLifeMsgType.MSG_MEDIA_STOP ->
+                                    "Audio 0x0003 STOP: MSG_MEDIA_STOP (0x00030002)"
+                                else ->
+                                    "Audio 0x0003 PCM #$audioIdx (${bodyLen}B, ts=${audioFrame.header.timestamp}s)"
+                            },
+                            serviceNameOverride = svcName
+                        )
+                    } else {
+                        BridgeTelemetryBus.recordFrameCountersOnly(
+                            channel = CarLifeChannel.MEDIA_AUDIO,
+                            rxBytesTotal = usbTransport.rxBytes,
+                            txBytesTotal = usbTransport.txBytes,
+                            rxFramesTotal = usbTransport.rxFrames,
+                            txFramesTotal = usbTransport.txFrames
+                        )
+                    }
+                }
+                sent
+            },
+            externalScope = serviceScope
+        )
+
         BridgeTelemetryBus.updateState {
             it.copy(
                 isServiceRunning = true,
@@ -718,6 +794,15 @@ class BridgeForegroundService : Service() {
             projectionManager.stats.collect { projStats ->
                 BridgeTelemetryBus.updateState { current ->
                     current.copy(projectionStats = projStats)
+                }
+            }
+        }
+
+        // Observe Audio Capture stats (Channel 0x0003)
+        serviceScope.launch {
+            audioCaptureManager.stats.collect { audioStats ->
+                BridgeTelemetryBus.updateState { current ->
+                    current.copy(audioCaptureStats = audioStats)
                 }
             }
         }
@@ -775,6 +860,8 @@ class BridgeForegroundService : Service() {
                         hasSentAudioInitInSession = false
                         setVideoStreamingReady(false)
                         resetVideoLogFlags()
+                        audioPacketCounter.set(0L)
+                        audioCaptureManager.stopCapture(sendMediaStop = false)
                         if (newState is UsbTransportState.Disconnected || newState is UsbTransportState.Connecting) {
                             controlStateMachine.reset()
                             controlStateMachine.setPreferredResolution(activeWidth, activeHeight)
@@ -892,6 +979,7 @@ class BridgeForegroundService : Service() {
                         if (effectiveReady || isVideoChannelReadyForStreaming || hasSentMdInfoInSession) {
                             setVideoStreamingReady(true)
                             projectionManager.unlockVideoChannelAndRequestSyncFrame()
+                            startAudioCaptureIfReady(reason = "MediaProjection Granted")
                         }
                     }
                     BridgeTelemetryBus.updateState {
@@ -1009,7 +1097,27 @@ class BridgeForegroundService : Service() {
             ACTION_STOP_PROJECTION -> {
                 setVideoStreamingReady(false)
                 serviceScope.launch {
+                    audioCaptureManager.stopCapture(
+                        sendMediaStop = usbTransport.state.value is UsbTransportState.Connected
+                    )
                     projectionManager.stopProjection()
+                }
+            }
+
+            ACTION_START_AUDIO_CAPTURE -> {
+                serviceScope.launch {
+                    audioCaptureManager.refreshPermissionState()
+                    if (usbTransport.state.value is UsbTransportState.Connected) {
+                        startAudioCaptureIfReady(reason = "User / Permission Granted")
+                    }
+                }
+            }
+
+            ACTION_STOP_AUDIO_CAPTURE -> {
+                serviceScope.launch {
+                    audioCaptureManager.stopCapture(
+                        sendMediaStop = usbTransport.state.value is UsbTransportState.Connected
+                    )
                 }
             }
 
@@ -1144,6 +1252,9 @@ class BridgeForegroundService : Service() {
                 autoTestJob = null
                 setVideoStreamingReady(false)
                 serviceScope.launch {
+                    audioCaptureManager.stopCapture(
+                        sendMediaStop = usbTransport.state.value is UsbTransportState.Connected
+                    )
                     projectionManager.stopProjection()
                     usbTransport.closeSession("Stopped by user")
                     releaseWakeLock()
@@ -1160,9 +1271,19 @@ class BridgeForegroundService : Service() {
 
     override fun onDestroy() {
         releaseWakeLock()
-        serviceScope.launch {
-            projectionManager.stopProjection()
-            usbTransport.shutdown()
+        val wasConnected = ::usbTransport.isInitialized && usbTransport.state.value is UsbTransportState.Connected
+        runCatching {
+            kotlinx.coroutines.runBlocking(Dispatchers.IO) {
+                if (::audioCaptureManager.isInitialized) {
+                    audioCaptureManager.stopCapture(sendMediaStop = wasConnected)
+                }
+                if (::projectionManager.isInitialized) {
+                    projectionManager.stopProjection()
+                }
+                if (::usbTransport.isInitialized) {
+                    usbTransport.shutdown()
+                }
+            }
         }
         BridgeTelemetryBus.updateState {
             it.copy(
@@ -1324,6 +1445,7 @@ class BridgeForegroundService : Service() {
                         } else {
                             projectionManager.requestInstantIdrKeyFrame()
                         }
+                        startAudioCaptureIfReady(reason = "RX MSG_CMD_VIDEO_ENCODER_START")
                     }
 
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_PAUSE,
@@ -1603,6 +1725,8 @@ class BridgeForegroundService : Service() {
         const val ACTION_SET_HANDSHAKE_PROFILE = "com.example.core.usb.action.SET_HANDSHAKE_PROFILE"
         const val ACTION_START_AUTO_TEST = "com.example.core.usb.action.START_AUTO_TEST"
         const val ACTION_STOP_AUTO_TEST = "com.example.core.usb.action.STOP_AUTO_TEST"
+        const val ACTION_START_AUDIO_CAPTURE = "com.example.core.usb.action.START_AUDIO_CAPTURE"
+        const val ACTION_STOP_AUDIO_CAPTURE = "com.example.core.usb.action.STOP_AUDIO_CAPTURE"
         const val ACTION_DISCONNECT_STOP = "com.example.core.usb.action.DISCONNECT_STOP"
 
         const val EXTRA_RESULT_CODE = "extra_result_code"

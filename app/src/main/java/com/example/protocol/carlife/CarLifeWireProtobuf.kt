@@ -405,3 +405,48 @@ data class CarlifeModuleStatusProto(
     }
 }
 
+/**
+ * `CarlifeMusicInit` (`MSG_MEDIA_INIT = 0x00030001`, Channel `0x0003` Media Audio)
+ * - Field 1 (`sampleRate`, varint, tag `0x08`) = `48000` (48 kHz)
+ * - Field 2 (`channelConfig`, varint, tag `0x10`) = `2` (Stereo)
+ * - Field 3 (`sampleFormat`, varint, tag `0x18`) = `16` (16-bit PCM)
+ */
+data class CarlifeMusicInitProto(
+    val sampleRate: Int = DEFAULT_SAMPLE_RATE,
+    val channelConfig: Int = DEFAULT_CHANNEL_CONFIG,
+    val sampleFormat: Int = DEFAULT_SAMPLE_FORMAT
+) {
+    fun encode(): ByteArray = CarLifeWireProtobuf.Writer(16)
+        .writeVarintField(1, sampleRate)
+        .writeVarintField(2, channelConfig)
+        .writeVarintField(3, sampleFormat)
+        .toByteArray()
+
+    companion object {
+        const val DEFAULT_SAMPLE_RATE = 48_000
+        const val DEFAULT_CHANNEL_CONFIG = 2
+        const val DEFAULT_SAMPLE_FORMAT = 16
+
+        fun decode(bytes: ByteArray): CarlifeMusicInitProto {
+            var sampleRate = DEFAULT_SAMPLE_RATE
+            var channelConfig = DEFAULT_CHANNEL_CONFIG
+            var sampleFormat = DEFAULT_SAMPLE_FORMAT
+            val reader = CarLifeWireProtobuf.Reader(bytes)
+            while (reader.readTag()) {
+                when (reader.lastFieldNumber) {
+                    1 -> sampleRate = reader.readVarint32()
+                    2 -> channelConfig = reader.readVarint32()
+                    3 -> sampleFormat = reader.readVarint32()
+                    else -> reader.skipField()
+                }
+            }
+            return CarlifeMusicInitProto(
+                sampleRate = sampleRate,
+                channelConfig = channelConfig,
+                sampleFormat = sampleFormat
+            )
+        }
+    }
+}
+
+

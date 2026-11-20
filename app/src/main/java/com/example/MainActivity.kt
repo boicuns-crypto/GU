@@ -157,6 +157,7 @@ import com.example.ui.theme.TextSecondary
 import com.example.ui.theme.WarningBadgeBg
 import com.example.ui.theme.WarningBadgeFg
 import java.io.PipedInputStream
+import com.example.core.audio.CarLifeAudioCaptureManager
 import java.io.PipedOutputStream
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -167,10 +168,22 @@ import kotlinx.coroutines.withContext
 class MainActivity : ComponentActivity() {
 
     private lateinit var mediaProjectionLauncher: ActivityResultLauncher<Intent>
+    private lateinit var recordAudioPermissionLauncher: ActivityResultLauncher<String>
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+
+        recordAudioPermissionLauncher = registerForActivityResult(
+            ActivityResultContracts.RequestPermission()
+        ) { granted ->
+            if (granted) {
+                val audioIntent = Intent(this, BridgeForegroundService::class.java).apply {
+                    action = BridgeForegroundService.ACTION_START_AUDIO_CAPTURE
+                }
+                safeStartService(this, audioIntent)
+            }
+        }
 
         mediaProjectionLauncher = registerForActivityResult(
             ActivityResultContracts.StartActivityForResult()
@@ -182,6 +195,9 @@ class MainActivity : ComponentActivity() {
                     resultCode = result.resultCode,
                     resultData = data
                 )
+                if (!CarLifeAudioCaptureManager.hasRecordAudioPermission(this)) {
+                    requestRecordAudioPermission()
+                }
             }
         }
 
@@ -193,6 +209,9 @@ class MainActivity : ComponentActivity() {
                 CarLifeBridgeApp(
                     onRequestMediaProjection = {
                         requestScreenCapturePermission()
+                    },
+                    onRequestRecordAudioPermission = {
+                        requestRecordAudioPermission()
                     },
                     onStartOrScanBridge = {
                         BridgeForegroundService.startWithAccessory(this, null)
@@ -252,6 +271,19 @@ class MainActivity : ComponentActivity() {
         runCatching {
             val mpManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
             mediaProjectionLauncher.launch(mpManager.createScreenCaptureIntent())
+        }
+    }
+
+    private fun requestRecordAudioPermission() {
+        if (CarLifeAudioCaptureManager.hasRecordAudioPermission(this)) {
+            val audioIntent = Intent(this, BridgeForegroundService::class.java).apply {
+                action = BridgeForegroundService.ACTION_START_AUDIO_CAPTURE
+            }
+            safeStartService(this, audioIntent)
+        } else {
+            runCatching {
+                recordAudioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+            }
         }
     }
 
@@ -356,6 +388,7 @@ private fun evaluateSetupChecklist(
 @Composable
 fun CarLifeBridgeApp(
     onRequestMediaProjection: () -> Unit,
+    onRequestRecordAudioPermission: () -> Unit = {},
     onStartOrScanBridge: () -> Unit,
     onStopBridge: () -> Unit,
     onStartProjection: (Int, Int, Int) -> Unit,
@@ -736,7 +769,9 @@ fun CarLifeBridgeApp(
                         onStopBridge = onStopBridge,
                         onStartProjection = onStartProjection,
                         onStopProjection = onStopProjection,
-                        onInjectTouch = onInjectTouch
+                        onInjectTouch = onInjectTouch,
+                        onRequestMediaProjection = onRequestMediaProjection,
+                        onRequestRecordAudioPermission = onRequestRecordAudioPermission
                     )
                 }
             }
@@ -1264,7 +1299,9 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
     onStopBridge: () -> Unit,
     onStartProjection: (Int, Int, Int) -> Unit,
     onStopProjection: () -> Unit,
-    onInjectTouch: (Int, Int) -> Unit
+    onInjectTouch: (Int, Int) -> Unit,
+    onRequestMediaProjection: () -> Unit = {},
+    onRequestRecordAudioPermission: () -> Unit = {}
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -1483,6 +1520,155 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .padding(horizontal = 12.dp, vertical = 8.dp)
+                        )
+                    }
+                }
+            }
+        }
+
+        // 1.15 Карточка «Звук по USB AOA (канал 0x0003, AudioPlaybackCapture PCM)»
+        item {
+            val audioStats = state.audioCaptureStats
+            val hasRecordAudioPerm = remember(audioStats.hasRecordAudioPermission, checklistStatus) {
+                CarLifeAudioCaptureManager.hasRecordAudioPermission(context)
+            }
+            val audioBadgeText = when {
+                audioStats.isCapturing -> "PCM 48КГЦ ON"
+                !hasRecordAudioPerm -> "НЕТ RECORD_AUDIO"
+                !checklistStatus.step5MediaProjectionGranted -> "НЕТ ЭКРАНА"
+                else -> "ГОТОВ 0x0003"
+            }
+            val audioBadgeBg = when {
+                audioStats.isCapturing -> SuccessBadgeBg
+                !hasRecordAudioPerm -> WarningBadgeBg
+                else -> ObsidianSurfaceHigh
+            }
+            val audioBadgeFg = when {
+                audioStats.isCapturing -> SuccessBadgeFg
+                !hasRecordAudioPerm -> WarningBadgeFg
+                else -> TextSecondary
+            }
+
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("usb_audio_0x0003_card"),
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(containerColor = ObsidianSurface),
+                border = BorderStroke(
+                    1.dp,
+                    if (audioStats.isCapturing) TelemetryEmerald.copy(alpha = 0.7f) else ObsidianBorder
+                )
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Звук по USB AOA (канал 0x0003)",
+                                style = MaterialTheme.typography.titleMedium,
+                                color = TextPrimary
+                            )
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Text(
+                                text = "48 кГц Stereo 16-bit PCM (4096B) • Звонки HFP на Bluetooth авто",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = TextSecondary
+                            )
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Surface(
+                            color = audioBadgeBg,
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Text(
+                                text = audioBadgeText,
+                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+                                color = audioBadgeFg,
+                                softWrap = false,
+                                maxLines = 1,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                            )
+                        }
+                    }
+
+                    Text(
+                        text = "Системный звук (Я.Музыка, Навигатор, 2ГИС, YouTube) захватывается через AudioPlaybackCapture и передаётся в канал 0x0003 (AOA 20B). Паузы тишины пропускаются.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = TextSecondary
+                    )
+
+                    Surface(
+                        color = ObsidianBackground,
+                        shape = RoundedCornerShape(10.dp),
+                        border = BorderStroke(1.dp, ObsidianBorder)
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 12.dp, vertical = 8.dp),
+                            verticalArrangement = Arrangement.spacedBy(2.dp)
+                        ) {
+                            Text(
+                                text = audioStats.statusMessage,
+                                style = MaterialTheme.typography.labelMedium,
+                                color = if (audioStats.isCapturing) TelemetryEmerald else TextSecondary,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            Text(
+                                text = "INIT: ${audioStats.sentInitPackets} • PCM: ${audioStats.sentPcmPackets} пак. (${audioStats.sentPcmBytes / 1024} КБ) • Тишина пропущена: ${audioStats.skippedSilentPackets}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = TextMuted
+                            )
+                        }
+                    }
+
+                    Button(
+                        onClick = {
+                            when {
+                                !hasRecordAudioPerm -> onRequestRecordAudioPermission()
+                                !checklistStatus.step5MediaProjectionGranted -> onRequestMediaProjection()
+                                audioStats.isCapturing -> {
+                                    val stopAudioIntent = Intent(context, BridgeForegroundService::class.java).apply {
+                                        action = BridgeForegroundService.ACTION_STOP_AUDIO_CAPTURE
+                                    }
+                                    safeStartService(context, stopAudioIntent)
+                                }
+                                else -> {
+                                    val startAudioIntent = Intent(context, BridgeForegroundService::class.java).apply {
+                                        action = BridgeForegroundService.ACTION_START_AUDIO_CAPTURE
+                                    }
+                                    safeStartService(context, startAudioIntent)
+                                }
+                            }
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 48.dp)
+                            .testTag("audio_0x0003_action_btn"),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (audioStats.isCapturing) ObsidianSurfaceHigh else ElectricCyan,
+                            contentColor = if (audioStats.isCapturing) TextPrimary else Color(0xFF001D24)
+                        ),
+                        shape = RoundedCornerShape(10.dp)
+                    ) {
+                        Text(
+                            text = when {
+                                !hasRecordAudioPerm -> "Разрешить захват звука (RECORD_AUDIO)"
+                                !checklistStatus.step5MediaProjectionGranted -> "Выдать MediaProjection («Весь экран»)"
+                                audioStats.isCapturing -> "Остановить звук 0x0003 (MSG_MEDIA_STOP)"
+                                else -> "Запустить захват звука 0x0003"
+                            },
+                            fontWeight = FontWeight.SemiBold
                         )
                     }
                 }
