@@ -911,14 +911,67 @@ object CarLifeFrameCodec {
     }
 
     /**
-     * Runtime toggle for Baidu CarLife Video Channel (`0x0002`) payload framing (applied identically to SPS/PPS and IDR):
-     * - `false` (**Direct 12B — default**):
-     *   12B Header (`[00 00 00 02 (4B)][nalSize (4B)][timestamp (4B)]`) + `[00 00 00 01... h264Bytes]`.
-     * - `true` (**AOA 20B**):
-     *   Outer AOA 8B (`[00 00 00 02][12 + h264.size]`) + Inner 12B (`[h264.size (4B)][timestampMs (4B)][0x00020001 (4B)]`) + `[00 00 00 01 ... h264Bytes]`.
+     * Runtime toggle for Baidu CarLife Video Channel (`0x0002`) payload framing:
+     * - `true` (**Режим 1: AOA 20B — default per VideoOutputThread.smali**):
+     *   Outer AOA 8B (`[00 00 00 02][payloadLen + 12]`) + Inner 12B (`[payloadLen (4B)][timestampMs (4B)][00 02 00 01 (4B)]`) + H.264 payload.
+     * - `false` (**Режим 2: Direct 12B**):
+     *   12B Header (`[00 00 00 02 (4B)][payloadLen (4B)][timestampMs (4B)]`) + H.264 payload.
      */
     @Volatile
-    var useNestedVideoMsgHeader: Boolean = false
+    var useNestedVideoMsgHeader: Boolean = true
+
+    /**
+     * Returns `true` if [h264Buffer] already contains both H.264 SPS (NAL type 7) and PPS (NAL type 8).
+     */
+    fun containsSpsAndPps(h264Buffer: ByteArray): Boolean {
+        if (h264Buffer.size < 10) return false
+        val nals = splitAnnexBNalUnits(h264Buffer)
+        var hasSps = false
+        var hasPps = false
+        for (nal in nals) {
+            val nalType = if (nal.size > 4) (nal[4].toInt() and 0x1F) else 0
+            if (nalType == 7) hasSps = true
+            if (nalType == 8) hasPps = true
+            if (hasSps && hasPps) return true
+        }
+        return false
+    }
+
+    /**
+     * Normalizes a `BUFFER_FLAG_CODEC_CONFIG` (SPS+PPS) buffer so every NAL unit starts with
+     * a 4-byte Annex-B start code (`00 00 00 01`), returning a single contiguous `ByteArray`.
+     */
+    fun normalizeConfigBuffer(configBytes: ByteArray): ByteArray {
+        if (configBytes.isEmpty()) return ByteArray(0)
+        val nals = splitAnnexBNalUnits(configBytes)
+        if (nals.isEmpty()) return ensureAnnexBStartCode(configBytes)
+        val totalLen = nals.sumOf { it.size }
+        val merged = ByteArray(totalLen)
+        var pos = 0
+        for (nal in nals) {
+            System.arraycopy(nal, 0, merged, pos, nal.size)
+            pos += nal.size
+        }
+        return merged
+    }
+
+    /**
+     * Matches original `VideoOutputThread.smali` (`outputSpsPpsAndFirstFrame` / `firstSendEncodeFrame`):
+     * combines cached `SPS+PPS` with an `IDR` keyframe into ONE contiguous Annex-B byte array
+     * (`cachedSpsPps + idrBytes`) without duplicating `SPS+PPS` if the encoder already prepended them.
+     */
+    fun mergeSpsPpsWithIdr(cachedSpsPps: ByteArray?, idrBytes: ByteArray): ByteArray {
+        if (idrBytes.isEmpty()) return cachedSpsPps?.copyOf() ?: ByteArray(0)
+        val normalizedIdr = ensureAnnexBStartCode(idrBytes)
+        if (cachedSpsPps == null || cachedSpsPps.isEmpty() || containsSpsAndPps(normalizedIdr)) {
+            return normalizedIdr
+        }
+        val normalizedConfig = ensureAnnexBStartCode(cachedSpsPps)
+        val combined = ByteArray(normalizedConfig.size + normalizedIdr.size)
+        System.arraycopy(normalizedConfig, 0, combined, 0, normalizedConfig.size)
+        System.arraycopy(normalizedIdr, 0, combined, normalizedConfig.size, normalizedIdr.size)
+        return combined
+    }
 
     /**
      * Ensures an H.264 buffer starts with the 4-byte Annex-B start code `00 00 00 01`.

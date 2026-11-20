@@ -187,6 +187,7 @@ data class ProjectionPipelineStats(
 class CockpitProjectionManager(
     context: Context,
     private val onEncodedVideoNal: (nalBytes: ByteArray, timestampMs: Long, isKeyFrame: Boolean) -> Unit,
+    private val onVideoIdleHeartbeat: (timestampMs: Long) -> Unit = {},
     private val externalScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 ) {
     private val appContext = context.applicationContext
@@ -220,6 +221,9 @@ class CockpitProjectionManager(
         private set
 
     private val awaitingFirstIdrAfterGateOpen = AtomicBoolean(true)
+
+    @Volatile
+    private var cachedSpsPps: ByteArray? = null
 
     @Volatile
     private var cachedSpsAnnexB: ByteArray? = null
@@ -1026,13 +1030,12 @@ class CockpitProjectionManager(
     }
 
     /**
-     * Force-unlocked immediately after `MSG_CMD_HU_PROTOCOL_VERSION (0x00010001)` proactive handshake
-     * (and never reverted by late `VIDEO_ENCODER_INIT`).
+     * Force-unlocked immediately after `MSG_CMD_HU_PROTOCOL_VERSION (0x00018001)` / `VIDEO_ENCODER_START (0x00018009)`.
      *
      * 1. Sets `isVideoChannelReadyForStreaming = true`.
      * 2. Forces `MediaCodec` to generate a fresh sync keyframe (`PARAMETER_KEY_REQUEST_SYNC_FRAME = 0`).
-     * 3. If `cachedSpsAnnexB`, `cachedPpsAnnexB`, and `lastKeyFrameAnnexB` are already cached in memory,
-     *    immediately sends 3 separate `0x0002` packets: `[SPS]`, `[PPS]`, `[IDR]`.
+     * 3. If `cachedSpsPps` and `lastKeyFrameAnnexB` are already cached in memory, immediately sends
+     *    ONE combined `0x0002` packet (`cachedSpsPps + idrBytes`) per `VideoOutputThread.smali`.
      */
     fun unlockVideoChannelAndRequestSyncFrame() {
         awaitingFirstIdrAfterGateOpen.set(true)
@@ -1051,22 +1054,21 @@ class CockpitProjectionManager(
         }
 
         val idr = lastKeyFrameAnnexB
-        if (cachedSpsAnnexB != null &&
-            cachedPpsAnnexB != null &&
+        if (cachedSpsPps != null &&
             idr != null &&
             awaitingFirstIdrAfterGateOpen.compareAndSet(true, false)
         ) {
             val tsMs = SystemClock.uptimeMillis() and 0x7FFF_FFFFL
-            emitSeparateSpsPpsAndIdr(
-                idrNals = CarLifeFrameCodec.splitAnnexBNalUnits(idr),
+            emitCombinedSpsPpsAndIdr(
+                idrBytes = idr,
                 timestampMs = tsMs
             )
         }
     }
 
     /**
-     * Requests a fresh `IDR` sync frame from `MediaCodec` and sends separate `SPS`, `PPS`,
-     * and `IDR` packets on `0x0002` ONLY if `isVideoChannelReadyForStreaming` is `true`.
+     * Requests a fresh `IDR` sync frame from `MediaCodec` and sends ONE combined `SPS+PPS+IDR`
+     * packet on `0x0002` ONLY if `isVideoChannelReadyForStreaming` is `true`.
      */
     fun requestInstantIdrKeyFrame() {
         mainHandler.post {
@@ -1084,50 +1086,39 @@ class CockpitProjectionManager(
         val idr = lastKeyFrameAnnexB
         if (idr != null) {
             val tsMs = SystemClock.uptimeMillis() and 0x7FFF_FFFFL
-            emitSeparateSpsPpsAndIdr(
-                idrNals = CarLifeFrameCodec.splitAnnexBNalUnits(idr),
+            emitCombinedSpsPpsAndIdr(
+                idrBytes = idr,
                 timestampMs = tsMs
             )
         }
     }
 
-    private fun emitSeparateSpsPpsAndIdr(
-        idrNals: List<ByteArray>,
+    /**
+     * Matches original `VideoOutputThread.smali` (`outputSpsPpsAndFirstFrame` / `firstSendEncodeFrame`):
+     * merges `cachedSpsPps + idrBytes` (avoiding duplicate SPS/PPS if the codec already prepended them)
+     * and dispatches the entire keyframe in ONE `onEncodedVideoNal` call (ONE `sendVideoFrame` header).
+     */
+    private fun emitCombinedSpsPpsAndIdr(
+        idrBytes: ByteArray,
         timestampMs: Long
     ): Int {
-        if (idrNals.isEmpty()) return 0
-        var addedFrames = 0L
-        var addedBytes = 0L
-        var totalIdrPayloadBytes = 0
+        if (idrBytes.isEmpty()) return 0
+        val combinedPacket = CarLifeFrameCodec.mergeSpsPpsWithIdr(
+            cachedSpsPps = cachedSpsPps,
+            idrBytes = idrBytes
+        )
+        if (combinedPacket.isEmpty()) return 0
 
-        cachedSpsAnnexB?.let { sps ->
-            onEncodedVideoNal(sps, timestampMs, false)
-            addedFrames += 1L
-            addedBytes += sps.size
+        onEncodedVideoNal(combinedPacket, timestampMs, true)
+        _stats.update {
+            it.copy(
+                spsPpsConfigured = (cachedSpsPps != null || it.spsPpsConfigured),
+                encodedNalFrames = it.encodedNalFrames + 1L,
+                encodedBytes = it.encodedBytes + combinedPacket.size.toLong(),
+                lastIdrBytes = combinedPacket.size
+            )
         }
-        cachedPpsAnnexB?.let { pps ->
-            onEncodedVideoNal(pps, timestampMs, false)
-            addedFrames += 1L
-            addedBytes += pps.size
-        }
-        for (idrNal in idrNals) {
-            onEncodedVideoNal(idrNal, timestampMs, true)
-            addedFrames += 1L
-            addedBytes += idrNal.size
-            totalIdrPayloadBytes += idrNal.size
-        }
-
-        if (addedFrames > 0L) {
-            _stats.update {
-                it.copy(
-                    spsPpsConfigured = (cachedSpsAnnexB != null || cachedPpsAnnexB != null || it.spsPpsConfigured),
-                    encodedNalFrames = it.encodedNalFrames + addedFrames,
-                    encodedBytes = it.encodedBytes + addedBytes,
-                    lastIdrBytes = if (totalIdrPayloadBytes > 0) totalIdrPayloadBytes else it.lastIdrBytes
-                )
-            }
-        }
-        return totalIdrPayloadBytes
+        return combinedPacket.size
     }
 
     /**
@@ -1306,6 +1297,7 @@ class CockpitProjectionManager(
 
         runCatching { encoderInputSurface?.release() }
         encoderInputSurface = null
+        cachedSpsPps = null
         cachedSpsAnnexB = null
         cachedPpsAnnexB = null
         lastKeyFrameAnnexB = null
@@ -1398,8 +1390,8 @@ class CockpitProjectionManager(
                 )
             }
             // Note: Do NOT set KEY_PREPEND_HEADER_TO_SYNC_FRAMES — many CCodec encoders reject it with
-            // err 0xffffffea (BAD_VALUE). SPS/PPS are cached from csd-0/csd-1 and BUFFER_FLAG_CODEC_CONFIG
-            // and emitted explicitly before every IDR frame in emitSeparateSpsPpsAndIdr().
+            // err 0xffffffea (BAD_VALUE). SPS/PPS are cached into cachedSpsPps from csd-0/csd-1 and
+            // BUFFER_FLAG_CODEC_CONFIG and merged into ONE packet (cachedSpsPps + idrBytes) in emitCombinedSpsPpsAndIdr().
             if (includeOptionalTimingKeys) {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
@@ -1476,7 +1468,30 @@ class CockpitProjectionManager(
         throw lastError ?: IllegalStateException("Failed to configure H.264 MediaCodec encoder")
     }
 
-    private fun cacheConfigNalUnits(buffer: ByteArray) {
+    private fun rebuildCachedSpsPps(fallbackConfig: ByteArray? = null) {
+        val sps = cachedSpsAnnexB
+        val pps = cachedPpsAnnexB
+        cachedSpsPps = when {
+            sps != null && pps != null -> {
+                ByteArray(sps.size + pps.size).apply {
+                    System.arraycopy(sps, 0, this, 0, sps.size)
+                    System.arraycopy(pps, 0, this, sps.size, pps.size)
+                }
+            }
+            fallbackConfig != null && fallbackConfig.isNotEmpty() -> {
+                CarLifeFrameCodec.normalizeConfigBuffer(fallbackConfig)
+            }
+            sps != null -> sps
+            pps != null -> pps
+            else -> null
+        }
+        _stats.update {
+            it.copy(spsPpsConfigured = cachedSpsPps != null)
+        }
+    }
+
+    private fun cacheConfigNalUnits(buffer: ByteArray, saveWholeBufferAsFallback: Boolean = false) {
+        if (buffer.isEmpty()) return
         val nals = CarLifeFrameCodec.splitAnnexBNalUnits(buffer)
         var updated = false
         for (nal in nals) {
@@ -1492,10 +1507,8 @@ class CockpitProjectionManager(
                 }
             }
         }
-        if (updated) {
-            _stats.update {
-                it.copy(spsPpsConfigured = cachedSpsAnnexB != null || cachedPpsAnnexB != null)
-            }
+        if (updated || saveWholeBufferAsFallback) {
+            rebuildCachedSpsPps(fallbackConfig = if (saveWholeBufferAsFallback) buffer else null)
         }
     }
 
@@ -1512,24 +1525,22 @@ class CockpitProjectionManager(
                 when {
                     outIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> {
                         val nowElapsed = SystemClock.elapsedRealtime()
+                        // Per VideoOutputThread.smali: if no frame arrives from MediaCodec for >200 ms,
+                        // send an empty MSG_VIDEO_HEARTBEAT (0x00020002, payloadLen = 0) instead of standalone SPS/PPS.
                         if (isVideoChannelReadyForStreaming &&
                             lastCodecFrameElapsedMs > 0L &&
-                            (nowElapsed - lastCodecFrameElapsedMs) >= 200L &&
-                            (cachedSpsAnnexB != null || cachedPpsAnnexB != null)
+                            (nowElapsed - lastCodecFrameElapsedMs) >= 200L
                         ) {
                             lastCodecFrameElapsedMs = nowElapsed
                             val keepAliveTs = SystemClock.uptimeMillis() and 0x7FFF_FFFFL
-                            cachedSpsAnnexB?.let { sps ->
-                                onEncodedVideoNal(sps, keepAliveTs, false)
-                            }
-                            cachedPpsAnnexB?.let { pps ->
-                                onEncodedVideoNal(pps, keepAliveTs, false)
-                            }
-                            runCatching {
-                                val syncParams = Bundle().apply {
-                                    putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
+                            onVideoIdleHeartbeat(keepAliveTs)
+                            if (awaitingFirstIdrAfterGateOpen.get()) {
+                                runCatching {
+                                    val syncParams = Bundle().apply {
+                                        putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
+                                    }
+                                    codec.setParameters(syncParams)
                                 }
-                                codec.setParameters(syncParams)
                             }
                         }
                         delay(2L)
@@ -1566,65 +1577,62 @@ class CockpitProjectionManager(
 
                             val timestampMs = SystemClock.uptimeMillis() and 0x7FFF_FFFFL
 
-                            // ALWAYS manually scan MediaCodec output for Annex-B start codes (00 00 00 01 and 00 00 01),
-                            // expanding any 3-byte 00 00 01 start code into strict 4-byte 00 00 00 01 per NAL unit.
-                            val nals = CarLifeFrameCodec.splitAnnexBNalUnits(rawNal)
-                            val sliceNals = ArrayList<ByteArray>(nals.size)
-                            var containsIdrNal = isKeyFrameFlag
+                            // Per VideoOutputThread.smali: cache BUFFER_FLAG_CODEC_CONFIG (SPS+PPS) into cachedSpsPps
+                            // and NEVER transmit it as a standalone packet.
+                            if (isCodecConfig && !isKeyFrameFlag) {
+                                cacheConfigNalUnits(rawNal, saveWholeBufferAsFallback = true)
+                                codec.releaseOutputBuffer(outIndex, false)
+                                continue
+                            }
 
-                            for (nal in nals) {
+                            // Inspect NAL types without splitting outbound frames so we keep cachedSpsPps up to date
+                            // and detect IDR frames even on encoders that omit BUFFER_FLAG_KEY_FRAME.
+                            val scannedNals = CarLifeFrameCodec.splitAnnexBNalUnits(rawNal)
+                            var containsIdrNal = isKeyFrameFlag
+                            var sawConfigInFrame = false
+                            for (nal in scannedNals) {
                                 val nalType = if (nal.size > 4) (nal[4].toInt() and 0x1F) else 0
                                 when (nalType) {
                                     7 -> {
                                         cachedSpsAnnexB = nal
-                                        _stats.update { it.copy(spsPpsConfigured = true) }
+                                        sawConfigInFrame = true
                                     }
                                     8 -> {
                                         cachedPpsAnnexB = nal
-                                        _stats.update { it.copy(spsPpsConfigured = true) }
+                                        sawConfigInFrame = true
                                     }
                                     5 -> {
                                         containsIdrNal = true
-                                        sliceNals.add(nal)
                                     }
-                                    6 -> {
-                                        // Drop optional SEI metadata NALs to keep keyframes compact & clean for MQB HU
-                                    }
-                                    else -> sliceNals.add(nal)
                                 }
                             }
-
-                            if (containsIdrNal && sliceNals.isNotEmpty()) {
-                                val joinedIdr = if (sliceNals.size == 1) {
-                                    sliceNals[0]
-                                } else {
-                                    val baos = ByteArrayOutputStream(rawNal.size)
-                                    for (s in sliceNals) baos.write(s)
-                                    baos.toByteArray()
-                                }
-                                lastKeyFrameAnnexB = joinedIdr
+                            if (sawConfigInFrame) {
+                                rebuildCachedSpsPps()
                             }
 
-                            // Pure CODEC_CONFIG buffer (SPS/PPS only): already cached separately above.
-                            if (isCodecConfig && sliceNals.isEmpty()) {
+                            if (containsIdrNal) {
+                                lastKeyFrameAnnexB = CarLifeFrameCodec.ensureAnnexBStartCode(rawNal)
+                            }
+
+                            // Pure config-only buffer without any video slice: never send standalone.
+                            if (isCodecConfig && !containsIdrNal) {
                                 codec.releaseOutputBuffer(outIndex, false)
                                 continue
                             }
 
                             // STRICT GATE: Do NOT send any 0x0002 packets or increment counters
-                            // while isVideoChannelReadyForStreaming == false (only cache SPS, PPS, and last IDR).
+                            // while isVideoChannelReadyForStreaming == false (only cache SPS+PPS and last IDR).
                             if (!isVideoChannelReadyForStreaming) {
                                 codec.releaseOutputBuffer(outIndex, false)
                                 continue
                             }
 
-                            if (containsIdrNal && sliceNals.isNotEmpty()) {
+                            if (containsIdrNal) {
                                 lastCodecFrameElapsedMs = SystemClock.elapsedRealtime()
                                 awaitingFirstIdrAfterGateOpen.set(false)
-                                // Send separate 0x0002 packets in strict order:
-                                // [20B Header][00 00 00 01 SPS], [20B Header][00 00 00 01 PPS], [20B Header][00 00 00 01 IDR]
-                                val totalIdrSize = emitSeparateSpsPpsAndIdr(
-                                    idrNals = sliceNals,
+                                // Send ONE combined packet: cachedSpsPps + idrBytes (unless already prepended)
+                                val totalIdrSize = emitCombinedSpsPpsAndIdr(
+                                    idrBytes = rawNal,
                                     timestampMs = timestampMs
                                 )
 
@@ -1638,25 +1646,18 @@ class CockpitProjectionManager(
                                         codec.setParameters(b)
                                     }
                                 }
-                            } else if (!awaitingFirstIdrAfterGateOpen.get() && sliceNals.isNotEmpty()) {
+                            } else if (!awaitingFirstIdrAfterGateOpen.get()) {
                                 lastCodecFrameElapsedMs = SystemClock.elapsedRealtime()
-                                // Non-keyframe P-slice(s) emitted individually after the initial SPS -> PPS -> IDR sequence
-                                var sliceBytes = 0L
-                                var sliceCount = 0L
-                                for (sliceNal in sliceNals) {
-                                    onEncodedVideoNal(sliceNal, timestampMs, false)
-                                    sliceBytes += sliceNal.size.toLong()
-                                    sliceCount += 1L
+                                // Regular P-frame (Slice): send as-is in ONE packet without splitting
+                                val slicePacket = CarLifeFrameCodec.ensureAnnexBStartCode(rawNal)
+                                onEncodedVideoNal(slicePacket, timestampMs, false)
+                                _stats.update {
+                                    it.copy(
+                                        encodedNalFrames = it.encodedNalFrames + 1L,
+                                        encodedBytes = it.encodedBytes + slicePacket.size.toLong()
+                                    )
                                 }
-                                if (sliceCount > 0L) {
-                                    _stats.update {
-                                        it.copy(
-                                            encodedNalFrames = it.encodedNalFrames + sliceCount,
-                                            encodedBytes = it.encodedBytes + sliceBytes
-                                        )
-                                    }
-                                }
-                            } else if (awaitingFirstIdrAfterGateOpen.get()) {
+                            } else {
                                 // Waiting for initial IDR after gate open: request sync frame and skip stale P-slice
                                 runCatching {
                                     val b = Bundle().apply {

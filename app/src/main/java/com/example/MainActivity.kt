@@ -1852,7 +1852,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                     }
 
                     Text(
-                        text = "Формат шапки видеоканала 0x0002 (AOA 20B с 0x00020001 / Direct 12B по умолчанию)",
+                        text = "Формат шапки видеоканала 0x0002 (Режим 1: AOA 20B с 0x00020001 по умолчанию)",
                         style = MaterialTheme.typography.labelMedium,
                         color = TextSecondary
                     )
@@ -1925,13 +1925,13 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = "Профиль Jetta VS7 (Direct 12B + Audio Init)",
+                                text = "Профиль Jetta VS7 (AOA 20B 0x00020001 + Audio Init)",
                                 style = MaterialTheme.typography.titleMedium,
                                 color = TextPrimary
                             )
                             Spacer(modifier = Modifier.height(2.dp))
                             Text(
-                                text = "После 0x00018001 / 0x00018003 отправляются MATCH_STATUS (0x00010002), полный MD_INFO (0x00010004), Audio-Init (0x0003, 0x0004), INIT_DONE (0x00010008), SCREEN_ON (0x00010018), USERPRESENT (0x0001001A), FOREGROUND (0x0001001B), REQ_FG (0x00010038) и поток 0x0002 (в AOA 20B с HEARTBEAT 0x00020002 раз в 1 с).",
+                                text = "После 0x00018001 / 0x00018003 отправляются MATCH_STATUS (0x00010002), полный MD_INFO (0x00010004), Audio-Init (0x0003, 0x0004), INIT_DONE (0x00010008), SCREEN_ON (0x00010018), USERPRESENT (0x0001001A), FOREGROUND (0x0001001B), REQ_FG (0x00010038) и видеопоток 0x0002 (AOA 20B 0x00020001, единый пакет SPS+PPS+IDR, при простое >200 мс — HEARTBEAT 0x00020002).",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = TextSecondary
                             )

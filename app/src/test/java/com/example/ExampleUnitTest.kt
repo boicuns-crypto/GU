@@ -22,6 +22,8 @@ import com.example.protocol.carlife.CarlifeVideoEncoderInfoProto
 import com.example.protocol.carlife.HandshakeTestProfile
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -78,22 +80,22 @@ class ExampleUnitTest {
         val h264Nal = byteArrayOf(0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x2A)
         val timestamp = 0x12345678L
 
-        // Verify Direct 12B ([00 00 00 02][nalSize][timestamp] + Annex-B) is the default framing mode for 0x0002
+        // Verify AOA 20B ([00 00 00 02][payloadLen + 12] + [payloadLen][ts][00 02 00 01]) is the default framing mode for 0x0002
         val defaultFrame = CarLifeFrameCodec.createVideoFrame(
             nalData = h264Nal,
             timestampMs = timestamp
         )
-        assertEquals(12, CarLifeFrameCodec.encodeHeader(defaultFrame.header).size)
-        assertEquals(h264Nal.size, defaultFrame.payload.size)
-        assertArrayEquals(h264Nal, defaultFrame.payload)
+        val expectedAoA20Bytes = CarLifeFrameCodec.buildAoAVideoPacket(h264Nal, timestamp.toInt())
+        assertEquals(8, CarLifeFrameCodec.encodeHeader(defaultFrame.header).size)
+        assertEquals(12 + h264Nal.size, defaultFrame.payload.size)
+        assertArrayEquals(expectedAoA20Bytes, CarLifeFrameCodec.encodeFrame(defaultFrame))
 
-        // 1. Optional Mode: AOA 20B (8B AOA + 12B 0x00020001)
+        // 1. Default Mode: AOA 20B (8B AOA + 12B 0x00020001)
         val aoa20Frame = CarLifeFrameCodec.createVideoFrame(
             nalData = h264Nal,
             timestampMs = timestamp,
             nestedVideoMsgHeader = true
         )
-        val expectedAoA20Bytes = CarLifeFrameCodec.buildAoAVideoPacket(h264Nal, timestamp.toInt())
         assertArrayEquals(expectedAoA20Bytes, CarLifeFrameCodec.encodeFrame(aoa20Frame))
         assertTrue(CarLifeFrameCodec.formatHexPreview(aoa20Frame).contains("PAYLOAD[00 00 00 01"))
 
@@ -359,7 +361,7 @@ class ExampleUnitTest {
         assertEquals(800, profiles[0].width)
         assertEquals(480, profiles[0].height)
         assertEquals(1_200_000, profiles[0].bitrateBps)
-        assertEquals(false, profiles[0].useNestedVideoHeader)
+        assertEquals(true, profiles[0].useNestedVideoHeader)
         assertEquals(true, profiles[0].forceAudioMultiplexerInit)
 
         val audioInitFrames = CarLifeFrameCodec.createAudioMultiplexerInitFrames()
@@ -592,8 +594,9 @@ class ExampleUnitTest {
             CarLifeFrameCodec.encodeFrame(initStartWithFgScreen.outboundFrames[4])
         )
 
-        // Default video framing is Direct 12B, switchable to AOA 20B on the fly
-        assertFalse(CarLifeFrameCodec.useNestedVideoMsgHeader)
+        // Default video framing is Mode 1: AOA 20B (0x00020001), switchable to Direct 12B on the fly
+        assertTrue(CarLifeFrameCodec.useNestedVideoMsgHeader)
+        assertTrue(BridgeRuntimeState().useNestedVideoMsgHeader)
 
         // Full RX HEX without truncation even for >256B packets
         val largeRxPayload = ByteArray(320) { (it and 0xFF).toByte() }
@@ -784,6 +787,56 @@ class ExampleUnitTest {
         val direct12Bytes = CarLifeFrameCodec.encodeFrame(direct12Frame)
         assertEquals(12 + sampleNal.size, direct12Bytes.size)
         assertArrayEquals(sampleNal, direct12Bytes.copyOfRange(12, direct12Bytes.size))
+    }
+
+    @Test
+    fun videoOutputThreadSmali_bundlesSpsPpsAndIdrIntoSingleAoA20BPacketWithoutSplitting() {
+        // Default framing mode must be Mode 1: AOA 20B (0x00020001)
+        assertTrue(CarLifeFrameCodec.useNestedVideoMsgHeader)
+        assertTrue(BridgeRuntimeState().useNestedVideoMsgHeader)
+
+        // Simulated BUFFER_FLAG_CODEC_CONFIG (SPS + PPS with mixed 3B/4B start codes)
+        val rawCodecConfig = byteArrayOf(
+            0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1F, 0xE9.toByte(),
+            0x00, 0x00, 0x01, 0x68, 0xCE.toByte(), 0x3C, 0x80.toByte()
+        )
+        val cachedSpsPps = CarLifeFrameCodec.normalizeConfigBuffer(rawCodecConfig)
+        assertTrue(CarLifeFrameCodec.containsSpsAndPps(cachedSpsPps))
+
+        // 1. Standalone IDR frame -> merged into ONE buffer: cachedSpsPps + idrBytes
+        val idrOnly = byteArrayOf(0x00, 0x00, 0x00, 0x01, 0x65, 0x88.toByte(), 0x84.toByte(), 0x21, 0x10)
+        val combinedKeyFrame = CarLifeFrameCodec.mergeSpsPpsWithIdr(cachedSpsPps, idrOnly)
+        assertEquals(cachedSpsPps.size + idrOnly.size, combinedKeyFrame.size)
+        assertArrayEquals(cachedSpsPps + idrOnly, combinedKeyFrame)
+
+        // Wrap combined SPS+PPS+IDR in ONE default AOA 20B video packet (0x00020001)
+        val tsMs = 0x00001234L
+        val singleKeyFramePacket = CarLifeFrameCodec.createVideoFrame(
+            nalData = combinedKeyFrame,
+            timestampMs = tsMs
+        )
+        val wireKeyFrame = CarLifeFrameCodec.encodeFrame(singleKeyFramePacket)
+        assertEquals(20 + combinedKeyFrame.size, wireKeyFrame.size)
+        val hdrBuf = ByteBuffer.wrap(wireKeyFrame, 0, 20).order(ByteOrder.BIG_ENDIAN)
+        assertEquals(0x00000002, hdrBuf.int)                    // Channel 0x0002
+        assertEquals(combinedKeyFrame.size + 12, hdrBuf.int)    // Outer AOA len = payloadLen + 12
+        assertEquals(combinedKeyFrame.size, hdrBuf.int)         // Inner video payloadLen
+        assertEquals(tsMs.toInt(), hdrBuf.int)                  // Timestamp ms
+        assertEquals(0x00020001, hdrBuf.int)                    // MSG_VIDEO_DATA without 0x8000 bit
+        assertArrayEquals(combinedKeyFrame, wireKeyFrame.copyOfRange(20, wireKeyFrame.size))
+
+        // 2. If codec already prepended SPS+PPS before IDR, mergeSpsPpsWithIdr must NOT duplicate them
+        val alreadyPrepended = cachedSpsPps + idrOnly
+        val noDupKeyFrame = CarLifeFrameCodec.mergeSpsPpsWithIdr(cachedSpsPps, alreadyPrepended)
+        assertArrayEquals(alreadyPrepended, noDupKeyFrame)
+
+        // 3. Regular P-frame (Slice): sent as ONE packet without splitting
+        val pSlice = byteArrayOf(0x00, 0x00, 0x00, 0x01, 0x41, 0x9A.toByte(), 0x22, 0x33, 0x44)
+        val singlePFrame = CarLifeFrameCodec.createVideoFrame(nalData = pSlice, timestampMs = tsMs + 33L)
+        val wirePFrame = CarLifeFrameCodec.encodeFrame(singlePFrame)
+        assertEquals(20 + pSlice.size, wirePFrame.size)
+        assertArrayEquals(byteArrayOf(0x00, 0x02, 0x00, 0x01), wirePFrame.copyOfRange(16, 20))
+        assertArrayEquals(pSlice, wirePFrame.copyOfRange(20, wirePFrame.size))
     }
 }
 

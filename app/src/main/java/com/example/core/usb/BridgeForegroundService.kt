@@ -78,7 +78,7 @@ data class AutoTestProfile(
     val width: Int,
     val height: Int,
     val bitrateBps: Int,
-    val useNestedVideoHeader: Boolean = false,
+    val useNestedVideoHeader: Boolean = true,
     val forceAudioMultiplexerInit: Boolean = false
 )
 
@@ -89,9 +89,9 @@ data class AutoTestState(
     val isRunning: Boolean = false,
     val currentStep: Int = 0,
     val totalSteps: Int = 0,
-    val activeProfileLabel: String = "800×480 • 1.2 Мбит/с • CBR 30fps • Direct 12B + Audio Init",
-    val statusMessage: String = "Авто-тестер отключён: зафиксирован профиль Jetta VS7 (800×480 • 1.2 Мбит/с • CBR 30fps • Direct 12B + Audio Init)",
-    val matchedProfileLabel: String? = "800×480 • 1.2 Мбит/с • CBR 30fps • Direct 12B + Audio Init",
+    val activeProfileLabel: String = "800×480 • 1.2 Мбит/с • CBR 30fps • AOA 20B (0x00020001) + Audio Init",
+    val statusMessage: String = "Авто-тестер отключён: зафиксирован профиль Jetta VS7 (800×480 • 1.2 Мбит/с • CBR 30fps • AOA 20B + Audio Init)",
+    val matchedProfileLabel: String? = "800×480 • 1.2 Мбит/с • CBR 30fps • AOA 20B (0x00020001) + Audio Init",
     val audioInitForced: Boolean = true
 )
 
@@ -105,7 +105,7 @@ data class BridgeRuntimeState(
     val controlSession: CarLifeControlSessionState = CarLifeControlSessionState(),
     val projectionStats: ProjectionPipelineStats = ProjectionPipelineStats(),
     val isVideoChannelReadyForStreaming: Boolean = false,
-    val useNestedVideoMsgHeader: Boolean = false,
+    val useNestedVideoMsgHeader: Boolean = true,
     val videoSourceMode: VideoSourceMode = VideoSourceMode.CANVAS_TEST_CARD,
     val handshakeTestProfile: HandshakeTestProfile = HandshakeTestProfile.TEST_4_AUDIO_VIDEO_NO_SCREEN,
     val configuredWidth: Int = 800,
@@ -175,7 +175,7 @@ object BridgeTelemetryBus {
         val hexMaxBytes = when {
             direction.startsWith("RX") -> Int.MAX_VALUE
             !isVideo -> frame.payload.size.coerceAtLeast(16)
-            else -> 24
+            else -> 48
         }
 
         val entry = PacketLogEntry(
@@ -282,13 +282,19 @@ class BridgeForegroundService : Service() {
     lateinit var projectionManager: CockpitProjectionManager
         private set
 
-    private data class QueuedVideoNal(
-        val nalBytes: ByteArray,
-        val timestampMs: Long,
-        val isKeyFrame: Boolean
-    )
+    private sealed interface VideoTxItem {
+        data class VideoFrame(
+            val nalBytes: ByteArray,
+            val timestampMs: Long,
+            val isKeyFrame: Boolean
+        ) : VideoTxItem
 
-    private val videoTxQueue = Channel<QueuedVideoNal>(capacity = Channel.UNLIMITED)
+        data class VideoHeartbeat(
+            val timestampMs: Long
+        ) : VideoTxItem
+    }
+
+    private val videoTxQueue = Channel<VideoTxItem>(capacity = Channel.UNLIMITED)
     private val controlStateMachine = CarLifeControlStateMachine()
     private val videoPacketCounter = java.util.concurrent.atomic.AtomicLong(0L)
 
@@ -333,11 +339,14 @@ class BridgeForegroundService : Service() {
     @Volatile
     private var lastVideoTxElapsedMs: Long = 0L
 
+    @Volatile
+    private var lastRealVideoFrameElapsedMs: Long = 0L
+
     private var autoTestJob: kotlinx.coroutines.Job? = null
 
     private fun clearPendingVideoTxQueue() {
         while (videoTxQueue.tryReceive().isSuccess) {
-            // Drain stale video NALs from closed/reset sessions
+            // Drain stale video frames/heartbeats from closed/reset sessions
         }
     }
 
@@ -345,6 +354,12 @@ class BridgeForegroundService : Service() {
         isVideoChannelReadyForStreaming = ready
         if (!ready) {
             clearPendingVideoTxQueue()
+            lastVideoTxElapsedMs = 0L
+            lastRealVideoFrameElapsedMs = 0L
+        } else {
+            val now = SystemClock.elapsedRealtime()
+            lastVideoTxElapsedMs = now
+            lastRealVideoFrameElapsedMs = now
         }
         if (::projectionManager.isInitialized) {
             projectionManager.setVideoChannelReady(ready)
@@ -360,10 +375,9 @@ class BridgeForegroundService : Service() {
     }
 
     /**
-     * Wraps a SINGLE H.264 NAL unit (`SPS`, `PPS`, `IDR`, or `P-slice`) normalized to 4-byte
-     * Annex-B `00 00 00 01` into its own Direct 12B CarLife `0x0002` video frame
-     * (`[00 00 00 02][nalSize][ts][00 00 00 01 NAL]`) and transmits it over USB AOA.
-     * Never merges `SPS`, `PPS`, and `IDR` into a single packet.
+     * Wraps a complete H.264 frame (combined `SPS+PPS+IDR` keyframe OR single `P-slice` frame)
+     * into ONE CarLife `0x0002` video packet (default: Mode 1 AOA 20B with `0x00020001`) and
+     * transmits it over USB AOA without splitting NAL units.
      */
     private suspend fun sendVideoFrame(
         nalBytes: ByteArray,
@@ -373,28 +387,29 @@ class BridgeForegroundService : Service() {
         if (!isVideoChannelReadyForStreaming || usbTransport.state.value !is UsbTransportState.Connected) {
             return false
         }
-        val annexB4Nal = CarLifeFrameCodec.ensureAnnexBStartCode(nalBytes)
-        val nalType = if (annexB4Nal.size > 4) (annexB4Nal[4].toInt() and 0x1F) else 0
-        val isConfigNal = nalType == 7 || nalType == 8
-        val isIdr = !isConfigNal && (isKeyFrame || nalType == 5)
+        val annexB4Frame = CarLifeFrameCodec.ensureAnnexBStartCode(nalBytes)
+        val firstNalType = if (annexB4Frame.size > 4) (annexB4Frame[4].toInt() and 0x1F) else 0
+        val hasSpsPpsPrefix = CarLifeFrameCodec.containsSpsAndPps(annexB4Frame)
+        val isBundledKeyFrame = isKeyFrame || firstNalType == 5 || hasSpsPpsPrefix
         val pktIndex = videoPacketCounter.incrementAndGet()
 
         val videoFrame = CarLifeFrameCodec.createVideoFrame(
-            nalData = annexB4Nal,
+            nalData = annexB4Frame,
             timestampMs = timestampMs
         )
         val sentOk = usbTransport.sendFrameImmediate(videoFrame)
         if (!sentOk) return false
-        lastVideoTxElapsedMs = SystemClock.elapsedRealtime()
+        val now = SystemClock.elapsedRealtime()
+        lastVideoTxElapsedMs = now
+        lastRealVideoFrameElapsedMs = now
 
-        // Log all SPS/PPS, all IDR keyframes, and every 15th Slice to the dedicated Video Tab (0x0002)
-        val shouldLogToVideoTab = isConfigNal || isIdr || pktIndex <= 6L || (pktIndex % 15L == 0L)
+        // Log every SPS+PPS+IDR keyframe, the first 6 packets, and every 15th Slice to the Video Tab (0x0002)
+        val shouldLogToVideoTab = isBundledKeyFrame || pktIndex <= 6L || (pktIndex % 15L == 0L)
         if (shouldLogToVideoTab) {
-            val nalLabel = when (nalType) {
-                7 -> "SPS #$pktIndex (NAL=7)"
-                8 -> "PPS #$pktIndex (NAL=8)"
-                5 -> "IDR KeyFrame #$pktIndex (NAL=5)"
-                else -> if (isIdr) "IDR KeyFrame #$pktIndex" else "H.264 Slice #$pktIndex"
+            val nalLabel = when {
+                isBundledKeyFrame && hasSpsPpsPrefix -> "SPS+PPS+IDR KeyFrame #$pktIndex"
+                isBundledKeyFrame -> "IDR KeyFrame #$pktIndex (NAL=5)"
+                else -> "H.264 Slice #$pktIndex"
             }
             val hdrMode = if (CarLifeFrameCodec.useNestedVideoMsgHeader) "Режим 1: AOA 20B" else "Режим 2: Direct 12B"
             BridgeTelemetryBus.recordFrame(
@@ -404,7 +419,7 @@ class BridgeForegroundService : Service() {
                 txBytesTotal = usbTransport.txBytes,
                 rxFramesTotal = usbTransport.rxFrames,
                 txFramesTotal = usbTransport.txFrames,
-                protocolNote = "TX H.264 Video (0x0002 $hdrMode) $nalLabel (${annexB4Nal.size}B, ts=${timestampMs}ms)",
+                protocolNote = "TX H.264 Video (0x0002 $hdrMode) $nalLabel (${annexB4Frame.size}B, ts=${timestampMs}ms)",
                 serviceNameOverride = nalLabel
             )
         } else {
@@ -415,6 +430,41 @@ class BridgeForegroundService : Service() {
                 txFramesTotal = usbTransport.txFrames
             )
         }
+        return true
+    }
+
+    /**
+     * Sends an empty `MSG_VIDEO_HEARTBEAT (0x00020002, payloadLen = 0)` packet in AOA 20B mode
+     * when no H.264 frames have arrived from the codec for > 200 ms.
+     */
+    private suspend fun sendVideoHeartbeatIfStillIdle(timestampMs: Long): Boolean {
+        if (!isVideoChannelReadyForStreaming ||
+            usbTransport.state.value !is UsbTransportState.Connected ||
+            !CarLifeFrameCodec.useNestedVideoMsgHeader
+        ) {
+            return false
+        }
+        val now = SystemClock.elapsedRealtime()
+        if (lastRealVideoFrameElapsedMs > 0L && (now - lastRealVideoFrameElapsedMs) < 180L) {
+            return false
+        }
+        if (lastVideoTxElapsedMs > 0L && (now - lastVideoTxElapsedMs) < 180L) {
+            return false
+        }
+        val hb = CarLifeFrameCodec.createVideoHeartbeatFrame(timestampMs = timestampMs)
+        val sentOk = usbTransport.sendFrameImmediate(hb)
+        if (!sentOk) return false
+        lastVideoTxElapsedMs = SystemClock.elapsedRealtime()
+        BridgeTelemetryBus.recordFrame(
+            direction = "TX (S26U -> HU)",
+            frame = hb,
+            rxBytesTotal = usbTransport.rxBytes,
+            txBytesTotal = usbTransport.txBytes,
+            rxFramesTotal = usbTransport.rxFrames,
+            txFramesTotal = usbTransport.txFrames,
+            protocolNote = "TX MSG_VIDEO_HEARTBEAT (0x00020002, idle >200ms, payloadLen=0)",
+            serviceNameOverride = "MSG_VIDEO_HEARTBEAT (0x00020002)"
+        )
         return true
     }
 
@@ -514,7 +564,7 @@ class BridgeForegroundService : Service() {
         autoTestJob?.cancel()
         autoTestJob = null
 
-        CarLifeFrameCodec.useNestedVideoMsgHeader = false
+        CarLifeFrameCodec.useNestedVideoMsgHeader = true
         activeWidth = 800
         activeHeight = 480
         activeBitrateBps = 1_200_000
@@ -526,17 +576,17 @@ class BridgeForegroundService : Service() {
                 configuredWidth = 800,
                 configuredHeight = 480,
                 configuredBitrateBps = 1_200_000,
-                useNestedVideoMsgHeader = false,
+                useNestedVideoMsgHeader = true,
                 autoTestState = AutoTestState(
                     isRunning = false,
                     currentStep = 0,
                     totalSteps = 0,
-                    activeProfileLabel = "800×480 • 1.2 Мбит/с • CBR 30fps • Direct 12B + Audio Init",
-                    statusMessage = "Авто-тестер отключён: зафиксирован профиль Jetta VS7 (800×480 • 1.2 Мбит/с • CBR 30fps • Direct 12B + Audio Init)",
-                    matchedProfileLabel = "800×480 • 1.2 Мбит/с • CBR 30fps • Direct 12B + Audio Init",
+                    activeProfileLabel = "800×480 • 1.2 Мбит/с • CBR 30fps • AOA 20B (0x00020001) + Audio Init",
+                    statusMessage = "Авто-тестер отключён: зафиксирован профиль Jetta VS7 (800×480 • 1.2 Мбит/с • CBR 30fps • AOA 20B + Audio Init)",
+                    matchedProfileLabel = "800×480 • 1.2 Мбит/с • CBR 30fps • AOA 20B (0x00020001) + Audio Init",
                     audioInitForced = true
                 ),
-                lastProtocolEvent = "Locked Jetta VS7 Profile: 800×480 @ 1.2 Mbps CBR 30fps, Direct 12B + Audio Init"
+                lastProtocolEvent = "Locked Jetta VS7 Profile: 800×480 @ 1.2 Mbps CBR 30fps, AOA 20B (0x00020001) + Audio Init"
             )
         }
 
@@ -559,7 +609,7 @@ class BridgeForegroundService : Service() {
         createNotificationChannel()
         acquireWakeLock()
 
-        // Default Jetta VS7 Mode 2: Direct 12B ([00 00 00 02][nalSize][ts] + [00 00 00 01 Annex-B])
+        // Default Jetta VS7 Mode 1: AOA 20B (8B AOA [00 00 00 02][len+12] + 12B video header [len][ts][00 02 00 01])
         val currentNestedMode = BridgeTelemetryBus.runtimeState.value.useNestedVideoMsgHeader
         activeVideoSourceMode = BridgeTelemetryBus.runtimeState.value.videoSourceMode
         CarLifeFrameCodec.useNestedVideoMsgHeader = currentNestedMode
@@ -571,42 +621,51 @@ class BridgeForegroundService : Service() {
             externalScope = serviceScope
         )
 
-        // Single sequential FIFO consumer for 0x0002 packets so SPS -> PPS -> IDR never reorder
+        // Single sequential FIFO consumer for 0x0002 packets so bundled SPS+PPS+IDR, P-slices, and heartbeats never reorder
         serviceScope.launch(videoTxDispatcher) {
-            for (queued in videoTxQueue) {
+            for (item in videoTxQueue) {
                 if (!isVideoChannelReadyForStreaming || usbTransport.state.value !is UsbTransportState.Connected) {
                     continue
                 }
-                sendVideoFrame(
-                    nalBytes = queued.nalBytes,
-                    timestampMs = queued.timestampMs,
-                    isKeyFrame = queued.isKeyFrame
-                )
+                when (item) {
+                    is VideoTxItem.VideoFrame -> sendVideoFrame(
+                        nalBytes = item.nalBytes,
+                        timestampMs = item.timestampMs,
+                        isKeyFrame = item.isKeyFrame
+                    )
+                    is VideoTxItem.VideoHeartbeat -> sendVideoHeartbeatIfStillIdle(
+                        timestampMs = item.timestampMs
+                    )
+                }
             }
         }
 
         projectionManager = CockpitProjectionManager(
             context = applicationContext,
-            onEncodedVideoNal = { nalBytes, timestampMs, isKeyFrame ->
+            onEncodedVideoNal = { frameBytes, timestampMs, isKeyFrame ->
                 // STRICT GATE: While isVideoChannelReadyForStreaming == false, NEVER send 0x0002 packets
                 // to usbOutputStream and NEVER increment 0x0002 packet counters!
                 if (!isVideoChannelReadyForStreaming || usbTransport.state.value !is UsbTransportState.Connected) {
                     return@CockpitProjectionManager
                 }
 
-                // Manually parse Annex-B start codes (00 00 00 01 and 00 00 01 -> 00 00 00 01) and enqueue
-                // EACH individual NAL unit (SPS, PPS, IDR, Slice) for separate sendVideoFrame() wrapping.
-                val singleNalUnits = CarLifeFrameCodec.splitAnnexBNalUnits(nalBytes)
-                for (singleNal in singleNalUnits) {
-                    val nalType = if (singleNal.size > 4) (singleNal[4].toInt() and 0x1F) else 0
-                    val isIdr = nalType == 5 || (nalType != 7 && nalType != 8 && isKeyFrame)
-                    videoTxQueue.trySend(
-                        QueuedVideoNal(
-                            nalBytes = singleNal,
-                            timestampMs = timestampMs,
-                            isKeyFrame = isIdr
-                        )
+                // Per VideoOutputThread.smali: NEVER split SPS+PPS+IDR or P-frame buffers into separate packets.
+                // Enqueue the entire frame (combined cachedSpsPps + idrBytes for keyframes, raw slice for P-frames)
+                // for ONE sendVideoFrame(...) call with ONE header.
+                videoTxQueue.trySend(
+                    VideoTxItem.VideoFrame(
+                        nalBytes = frameBytes,
+                        timestampMs = timestampMs,
+                        isKeyFrame = isKeyFrame
                     )
+                )
+            },
+            onVideoIdleHeartbeat = { timestampMs ->
+                if (isVideoChannelReadyForStreaming &&
+                    usbTransport.state.value is UsbTransportState.Connected &&
+                    CarLifeFrameCodec.useNestedVideoMsgHeader
+                ) {
+                    videoTxQueue.trySend(VideoTxItem.VideoHeartbeat(timestampMs = timestampMs))
                 }
             },
             externalScope = serviceScope
@@ -740,27 +799,19 @@ class BridgeForegroundService : Service() {
             }
         }
 
-        // Periodic 1,000ms Video Heartbeat (MSG_VIDEO_HEARTBEAT = 0x00020002) in AOA 20B mode:
-        // sends 8B AOA header + 12B video header [len=0][timestampMs][0x00020002] once per second.
+        // Video Heartbeat watchdog per VideoOutputThread.smali:
+        // if no frames arrive from the codec for > 200 ms, send an empty MSG_VIDEO_HEARTBEAT (0x00020002, payloadLen = 0).
         serviceScope.launch {
             while (isActive) {
-                kotlinx.coroutines.delay(1_000L)
+                kotlinx.coroutines.delay(50L)
                 if (usbTransport.state.value is UsbTransportState.Connected &&
                     isVideoChannelReadyForStreaming &&
                     CarLifeFrameCodec.useNestedVideoMsgHeader
                 ) {
-                    val hb = controlStateMachine.createHeartbeatFrame()
-                    if (usbTransport.sendFrameImmediate(hb)) {
-                        BridgeTelemetryBus.recordFrame(
-                            direction = "TX (S26U -> HU)",
-                            frame = hb,
-                            rxBytesTotal = usbTransport.rxBytes,
-                            txBytesTotal = usbTransport.txBytes,
-                            rxFramesTotal = usbTransport.rxFrames,
-                            txFramesTotal = usbTransport.txFrames,
-                            protocolNote = "TX MSG_VIDEO_HEARTBEAT (0x00020002, AOA 20B 1s)",
-                            serviceNameOverride = "MSG_VIDEO_HEARTBEAT (0x00020002)"
-                        )
+                    val now = SystemClock.elapsedRealtime()
+                    if (lastVideoTxElapsedMs == 0L || (now - lastVideoTxElapsedMs) >= 200L) {
+                        val tsMs = SystemClock.uptimeMillis() and 0x7FFF_FFFFL
+                        videoTxQueue.trySend(VideoTxItem.VideoHeartbeat(timestampMs = tsMs))
                     }
                 }
             }
@@ -985,7 +1036,7 @@ class BridgeForegroundService : Service() {
 
             ACTION_TOGGLE_VIDEO_HEADER_MODE -> {
                 val newMode = if (intent.hasExtra(EXTRA_USE_NESTED_VIDEO_HEADER)) {
-                    intent.getBooleanExtra(EXTRA_USE_NESTED_VIDEO_HEADER, false)
+                    intent.getBooleanExtra(EXTRA_USE_NESTED_VIDEO_HEADER, true)
                 } else {
                     !CarLifeFrameCodec.useNestedVideoMsgHeader
                 }
@@ -1538,11 +1589,11 @@ class BridgeForegroundService : Service() {
         val AUTO_TEST_PROFILES: List<AutoTestProfile> = listOf(
             AutoTestProfile(
                 stepNumber = 1,
-                label = "800×480 • 1.2 Мбит/с • CBR 30fps • Direct 12B + Audio Init (0x0003/0x0004)",
+                label = "800×480 • 1.2 Мбит/с • CBR 30fps • AOA 20B (0x00020001) + Audio Init (0x0003/0x0004)",
                 width = 800,
                 height = 480,
                 bitrateBps = 1_200_000,
-                useNestedVideoHeader = false,
+                useNestedVideoHeader = true,
                 forceAudioMultiplexerInit = true
             )
         )
