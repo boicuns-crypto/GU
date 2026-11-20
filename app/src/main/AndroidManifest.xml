@@ -95,11 +95,11 @@
         </service>
 
         <!--
-            AccessibilityService для проброса касаний (Touch Injection) с тачскрина ГУ
-            внутрь сторонних приложений, запущенных на VirtualDisplay.
+            CarLifeAccessibilityService для проброса касаний и свайпов (канал 0x0006) с тачскрина ГУ
+            в любые приложения смартфона в режиме зеркалирования экрана (MediaProjection) и на VirtualDisplay.
         -->
         <service
-            android:name=".core.input.CarLifeTouchAccessibilityService"
+            android:name=".core.input.CarLifeAccessibilityService"
             android:enabled="true"
             android:exported="true"
             android:label="@string/app_name"
@@ -110,7 +110,7 @@
 
             <meta-data
                 android:name="android.accessibilityservice"
-                android:resource="@xml/accessibility_touch_config" />
+                android:resource="@xml/carlife_accessibility_config" />
         </service>
 
     </application>

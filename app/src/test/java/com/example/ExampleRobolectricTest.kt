@@ -50,7 +50,7 @@ class ExampleRobolectricTest {
     val service = serviceController.create().startCommand(0, 0).get()
 
     assertTrue(BridgeTelemetryBus.runtimeState.value.isServiceRunning)
-    assertEquals(VideoSourceMode.CANVAS_TEST_CARD, BridgeTelemetryBus.runtimeState.value.videoSourceMode)
+    assertEquals(VideoSourceMode.SCREEN_MIRRORING, BridgeTelemetryBus.runtimeState.value.videoSourceMode)
     val shadowService = Shadows.shadowOf(service)
     assertTrue(shadowService.isLastForegroundNotificationAttached)
 
@@ -58,7 +58,7 @@ class ExampleRobolectricTest {
   }
 
   @Test
-  fun `bridge foreground service switches video source mode between Canvas Test Card and VirtualDisplay`() {
+  fun `bridge foreground service switches video source mode across Screen Mirroring, VirtualDisplay and Canvas Test Card`() {
     val context = ApplicationProvider.getApplicationContext<Context>()
     val controller = Robolectric.buildService(BridgeForegroundService::class.java).create()
     val service = controller.get()
@@ -77,6 +77,13 @@ class ExampleRobolectricTest {
     service.onStartCommand(switchToCanvas, 0, 2)
     assertEquals(VideoSourceMode.CANVAS_TEST_CARD, BridgeTelemetryBus.runtimeState.value.videoSourceMode)
 
+    val switchToMirror = Intent(context, BridgeForegroundService::class.java).apply {
+      action = BridgeForegroundService.ACTION_SET_VIDEO_SOURCE_MODE
+      putExtra(BridgeForegroundService.EXTRA_VIDEO_SOURCE_MODE, VideoSourceMode.SCREEN_MIRRORING.id)
+    }
+    service.onStartCommand(switchToMirror, 0, 3)
+    assertEquals(VideoSourceMode.SCREEN_MIRRORING, BridgeTelemetryBus.runtimeState.value.videoSourceMode)
+
     controller.destroy()
   }
 
@@ -87,7 +94,7 @@ class ExampleRobolectricTest {
       context = context,
       onEncodedVideoNal = { _, _, _ -> }
     )
-    assertEquals(VideoSourceMode.CANVAS_TEST_CARD, manager.videoSourceMode)
+    assertEquals(VideoSourceMode.SCREEN_MIRRORING, manager.videoSourceMode)
 
     val drawnTexts = mutableListOf<String>()
     val drawnRectLefts = mutableListOf<Float>()

@@ -111,7 +111,7 @@ data class BridgeRuntimeState(
     val audioCaptureStats: AudioCaptureStats = AudioCaptureStats(),
     val isVideoChannelReadyForStreaming: Boolean = false,
     val useNestedVideoMsgHeader: Boolean = true,
-    val videoSourceMode: VideoSourceMode = VideoSourceMode.CANVAS_TEST_CARD,
+    val videoSourceMode: VideoSourceMode = VideoSourceMode.SCREEN_MIRRORING,
     val appLaunchMode: AppLaunchMode = AppLaunchMode.VIRTUAL_DISPLAY_IF_AVAILABLE,
     val handshakeTestProfile: HandshakeTestProfile = HandshakeTestProfile.TEST_4_AUDIO_VIDEO_NO_SCREEN,
     val configuredWidth: Int = 1280,
@@ -306,6 +306,7 @@ class BridgeForegroundService : Service() {
     }.asCoroutineDispatcher()
 
     private var wakeLock: PowerManager.WakeLock? = null
+    private var screenWakeLock: PowerManager.WakeLock? = null
 
     lateinit var usbTransport: UsbAccessoryTransport
         private set
@@ -364,7 +365,7 @@ class BridgeForegroundService : Service() {
     private var forceAudioInitForSession: Boolean = true
 
     @Volatile
-    private var activeVideoSourceMode: VideoSourceMode = VideoSourceMode.CANVAS_TEST_CARD
+    private var activeVideoSourceMode: VideoSourceMode = VideoSourceMode.SCREEN_MIRRORING
 
     private val huConfirmationSeq = java.util.concurrent.atomic.AtomicLong(0L)
 
@@ -1081,7 +1082,10 @@ class BridgeForegroundService : Service() {
                 val selectedMode = AppLaunchMode.fromId(modeId)
                 projectionManager.setAppLaunchMode(selectedMode)
                 BridgeTelemetryBus.setAppLaunchMode(selectedMode)
-                if (activeVideoSourceMode == VideoSourceMode.VIRTUAL_DISPLAY && projectionManager.stats.value.isRunning) {
+                if ((activeVideoSourceMode == VideoSourceMode.VIRTUAL_DISPLAY ||
+                        activeVideoSourceMode == VideoSourceMode.SCREEN_MIRRORING) &&
+                    projectionManager.stats.value.isRunning
+                ) {
                     serviceScope.launch {
                         projectionManager.startProjection(
                             width = activeWidth,
@@ -1566,23 +1570,40 @@ class BridgeForegroundService : Service() {
         }
     }
 
+    @Suppress("DEPRECATION")
     private fun acquireWakeLock() {
         runCatching {
-            if (wakeLock?.isHeld == true) return
             val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-            wakeLock = pm.newWakeLock(
-                PowerManager.PARTIAL_WAKE_LOCK,
-                "CarLifeBridge::UsbAoaStreamingWakeLock"
-            ).apply {
-                setReferenceCounted(false)
-                acquire(8 * 60 * 60 * 1000L)
+            if (wakeLock?.isHeld != true) {
+                wakeLock = pm.newWakeLock(
+                    PowerManager.PARTIAL_WAKE_LOCK,
+                    "CarLifeBridge::UsbAoaStreamingWakeLock"
+                ).apply {
+                    setReferenceCounted(false)
+                    acquire(8 * 60 * 60 * 1000L)
+                }
+            }
+            if (screenWakeLock?.isHeld != true) {
+                screenWakeLock = pm.newWakeLock(
+                    PowerManager.SCREEN_DIM_WAKE_LOCK or PowerManager.ON_AFTER_RELEASE,
+                    "CarLifeBridge::ScreenMirrorKeepAwake"
+                ).apply {
+                    setReferenceCounted(false)
+                    acquire(8 * 60 * 60 * 1000L)
+                }
             }
         }.onFailure { e ->
-            Log.w(TAG, "Partial WakeLock unavailable: ${e.message}")
+            Log.w(TAG, "WakeLock unavailable: ${e.message}")
         }
     }
 
     private fun releaseWakeLock() {
+        runCatching {
+            if (screenWakeLock?.isHeld == true) {
+                screenWakeLock?.release()
+            }
+        }
+        screenWakeLock = null
         runCatching {
             if (wakeLock?.isHeld == true) {
                 wakeLock?.release()

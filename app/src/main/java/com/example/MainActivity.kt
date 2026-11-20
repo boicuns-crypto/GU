@@ -114,7 +114,8 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.example.core.input.CarLifeTouchAccessibilityService
+import android.view.WindowManager
+import com.example.core.input.CarLifeAccessibilityService
 import com.example.core.projection.MediaProjectionTokenStore
 import com.example.core.projection.VideoSourceMode
 import com.example.core.usb.BridgeForegroundService
@@ -172,6 +173,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         enableEdgeToEdge()
 
         recordAudioPermissionLauncher = registerForActivityResult(
@@ -359,17 +361,8 @@ private fun evaluateSetupChecklist(
 
     val overlayGranted = Settings.canDrawOverlays(context)
 
-    val expectedComponent = ComponentName(pkg, CarLifeTouchAccessibilityService::class.java.name)
-    val enabledServicesRaw = runCatching {
-        Settings.Secure.getString(
-            context.contentResolver,
-            Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
-        )
-    }.getOrNull().orEmpty()
-    val a11yInSecureSettings = enabledServicesRaw.contains(expectedComponent.flattenToString(), ignoreCase = true) ||
-        enabledServicesRaw.contains(expectedComponent.flattenToShortString(), ignoreCase = true) ||
-        enabledServicesRaw.contains(CarLifeTouchAccessibilityService::class.java.simpleName, ignoreCase = true)
-    val accessibilityEnabled = a11yRealtimeFlag || a11yInSecureSettings
+    val accessibilityEnabled = a11yRealtimeFlag ||
+        CarLifeAccessibilityService.isEnabledInSettings(context)
 
     val notificationGranted = runCatching {
         NotificationManagerCompat.getEnabledListenerPackages(context).contains(pkg)
@@ -402,7 +395,7 @@ fun CarLifeBridgeApp(
 
     val runtimeState by BridgeTelemetryBus.runtimeState.collectAsStateWithLifecycle()
     val mediaState by MediaControllerRepository.mediaState.collectAsStateWithLifecycle()
-    val a11yEnabled by CarLifeTouchAccessibilityService.isServiceEnabled.collectAsStateWithLifecycle()
+    val a11yEnabled by CarLifeAccessibilityService.isServiceEnabled.collectAsStateWithLifecycle()
     val hasMediaProjectionToken by MediaProjectionTokenStore.hasValidToken.collectAsStateWithLifecycle()
     val lastLaunchStatus by CarLifeLauncherRepository.lastLaunchStatus.collectAsState()
 
@@ -664,9 +657,11 @@ fun CarLifeBridgeApp(
                         onRequestNotificationAccess = {
                             MediaControllerRepository.openNotificationListenerSettings(context)
                         },
-                        onHomePressed = {},
+                        onHomePressed = {
+                            CarLifeAccessibilityService.instance?.performHomeAction()
+                        },
                         onBackPressed = {
-                            CarLifeTouchAccessibilityService.instance?.performBackAction()
+                            CarLifeAccessibilityService.instance?.performBackAction()
                         },
                         modifier = Modifier.fillMaxSize()
                     )
@@ -681,7 +676,7 @@ fun CarLifeBridgeApp(
                             openOverlayPermissionSettings(context)
                         },
                         onOpenAccessibilitySettings = {
-                            CarLifeTouchAccessibilityService.openAccessibilitySettings(context)
+                            CarLifeAccessibilityService.openAccessibilitySettings(context)
                         },
                         onOpenAppDetailsSettings = {
                             openAppDetailsSettings(context)
@@ -760,7 +755,7 @@ fun CarLifeBridgeApp(
                             }
                         },
                         onOpenAccessibilitySettings = {
-                            CarLifeTouchAccessibilityService.openAccessibilitySettings(context)
+                            CarLifeAccessibilityService.openAccessibilitySettings(context)
                         },
                         onOpenOverlaySettings = {
                             openOverlayPermissionSettings(context)
@@ -1423,12 +1418,12 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        val isCanvasSource = state.videoSourceMode == VideoSourceMode.CANVAS_TEST_CARD
+                        val sourceMode = state.videoSourceMode
                         Text(
-                            text = if (isCanvasSource) {
-                                "Источник H.264: Тест-карта (Canvas)"
-                            } else {
-                                "Виртуальный экран ГУ (VirtualDisplay)"
+                            text = when (sourceMode) {
+                                VideoSourceMode.SCREEN_MIRRORING -> "Зеркалирование экрана (MediaProjection)"
+                                VideoSourceMode.VIRTUAL_DISPLAY -> "Виртуальный экран ГУ (VirtualDisplay)"
+                                VideoSourceMode.CANVAS_TEST_CARD -> "Источник H.264: Тест-карта (Canvas)"
                             },
                             style = MaterialTheme.typography.titleMedium,
                             color = TextPrimary,
@@ -1443,9 +1438,12 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                         ) {
                             Text(
                                 text = when {
-                                    state.projectionStats.isRunning && isCanvasSource -> "CANVAS 30FPS"
+                                    state.projectionStats.isRunning && sourceMode == VideoSourceMode.SCREEN_MIRRORING ->
+                                        if (state.projectionStats.usingMediaProjection) "MIRROR ON" else "ЖДЁТ MP"
+                                    state.projectionStats.isRunning && sourceMode == VideoSourceMode.CANVAS_TEST_CARD -> "CANVAS 30FPS"
                                     state.projectionStats.isRunning -> "VD #${state.projectionStats.virtualDisplayId} АКТИВЕН"
-                                    isCanvasSource -> "CANVAS ВЫКЛ"
+                                    sourceMode == VideoSourceMode.SCREEN_MIRRORING -> "MIRROR ВЫКЛ"
+                                    sourceMode == VideoSourceMode.CANVAS_TEST_CARD -> "CANVAS ВЫКЛ"
                                     else -> "VD ВЫКЛ"
                                 },
                                 style = MaterialTheme.typography.labelSmall.copy(
@@ -1463,11 +1461,13 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        val isCanvasSource = state.videoSourceMode == VideoSourceMode.CANVAS_TEST_CARD
+                        val sourceMode = state.videoSourceMode
                         StatusActionChip(
                             label = when {
-                                state.projectionStats.isRunning && isCanvasSource -> "Canvas ON"
-                                isCanvasSource -> "Start Canvas"
+                                state.projectionStats.isRunning && sourceMode == VideoSourceMode.SCREEN_MIRRORING -> "Mirror ON"
+                                sourceMode == VideoSourceMode.SCREEN_MIRRORING -> "Start Mirror"
+                                state.projectionStats.isRunning && sourceMode == VideoSourceMode.CANVAS_TEST_CARD -> "Canvas ON"
+                                sourceMode == VideoSourceMode.CANVAS_TEST_CARD -> "Start Canvas"
                                 state.projectionStats.isRunning -> "VD ON"
                                 else -> "Start VD"
                             },
@@ -1478,7 +1478,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                             modifier = Modifier.weight(1f)
                         )
                         StatusActionChip(
-                            label = if (checklistStatus.step3AccessibilityEnabled) "Touch ON" else "Touch A11y",
+                            label = if (checklistStatus.step3AccessibilityEnabled) "Тач: Вкл" else "Тач: Выкл",
                             active = checklistStatus.step3AccessibilityEnabled,
                             icon = CockpitIcons.TouchApp,
                             testTag = "quick_a11y_settings_btn",
@@ -1501,10 +1501,17 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                         border = BorderStroke(1.dp, ObsidianBorder)
                     ) {
                         val vdStatusLine = if (state.projectionStats.isRunning && !lastLaunchStatus.startsWith("Запущено:")) {
-                            if (state.videoSourceMode == VideoSourceMode.CANVAS_TEST_CARD) {
-                                "Тест-карта (Canvas) активна на Surface (${state.configuredWidth}×${state.configuredHeight} @ ${state.configuredBitrateBps / 1000} кбит/с, 30 fps)"
-                            } else {
-                                "Лаунчер ГУ активен на VD #${state.projectionStats.virtualDisplayId} (${state.configuredWidth}×${state.configuredHeight} @ ${state.configuredBitrateBps / 1000} кбит/с)"
+                            when (state.videoSourceMode) {
+                                VideoSourceMode.SCREEN_MIRRORING ->
+                                    if (state.projectionStats.usingMediaProjection) {
+                                        "Зеркалирование экрана активно (${state.configuredWidth}×${state.configuredHeight} @ ${state.configuredBitrateBps / 1000} кбит/с, 30 fps, без Presentation)"
+                                    } else {
+                                        "Ожидание разрешения MediaProjection («Весь экран») — нажмите кнопку «Начать трансляцию»"
+                                    }
+                                VideoSourceMode.CANVAS_TEST_CARD ->
+                                    "Тест-карта (Canvas) активна на Surface (${state.configuredWidth}×${state.configuredHeight} @ ${state.configuredBitrateBps / 1000} кбит/с, 30 fps)"
+                                VideoSourceMode.VIRTUAL_DISPLAY ->
+                                    "Лаунчер ГУ активен на VD #${state.projectionStats.virtualDisplayId} (${state.configuredWidth}×${state.configuredHeight} @ ${state.configuredBitrateBps / 1000} кбит/с)"
                             }
                         } else if (!state.projectionStats.isRunning) {
                             "Готов к трансляции: выбрано разрешение ${state.configuredWidth}×${state.configuredHeight} @ ${state.configuredBitrateBps / 1000} кбит/с"
@@ -1675,7 +1682,98 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
             }
         }
 
-        // 1.25 Переключатель «Источник видео» (Режим A: Тест-карта Canvas по умолчанию vs Режим B: VirtualDisplay)
+        // 1.20 Карточка «Служба тача (Спец. возможности)» — CarLifeAccessibilityService для канала 0x0006
+        item {
+            val isTouchServiceOn = checklistStatus.step3AccessibilityEnabled
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("accessibility_touch_service_card"),
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(containerColor = ObsidianSurface),
+                border = BorderStroke(
+                    1.dp,
+                    if (isTouchServiceOn) TelemetryEmerald.copy(alpha = 0.7f) else AmberSignal.copy(alpha = 0.7f)
+                )
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Служба тача (Спец. возможности)",
+                                style = MaterialTheme.typography.titleMedium,
+                                color = TextPrimary
+                            )
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Text(
+                                text = "CarLifeAccessibilityService • Тапы, свайпы карт и Назад/Домой (канал 0x0006)",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = TextSecondary
+                            )
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Surface(
+                            color = if (isTouchServiceOn) SuccessBadgeBg else WarningBadgeBg,
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Text(
+                                text = if (isTouchServiceOn) "Вкл" else "Выкл",
+                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+                                color = if (isTouchServiceOn) SuccessBadgeFg else WarningBadgeFg,
+                                softWrap = false,
+                                maxLines = 1,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                            )
+                        }
+                    }
+
+                    Text(
+                        text = "Переводит касания с экрана ГУ (1280×720) в реальные координаты смартфона с учётом ориентации и выполняет тапы (50 мс) и свайпы карт в любых приложениях (2ГИС, Яндекс.Навигатор, YouTube).",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = TextSecondary
+                    )
+
+                    Button(
+                        onClick = onOpenAccessibilitySettings,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 48.dp)
+                            .testTag("enable_accessibility_touch_btn"),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (isTouchServiceOn) ObsidianSurfaceHigh else ElectricCyan,
+                            contentColor = if (isTouchServiceOn) TextPrimary else Color(0xFF001D24)
+                        ),
+                        shape = RoundedCornerShape(10.dp)
+                    ) {
+                        Icon(
+                            imageVector = CockpitIcons.TouchApp,
+                            contentDescription = "Включить службу тача",
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = if (isTouchServiceOn) {
+                                "Служба тача включена (Открыть Спец. возможности)"
+                            } else {
+                                "Включить службу тача (Спец. возможности)"
+                            },
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                }
+            }
+        }
+
+        // 1.25 Переключатель «Источник видео» (Зеркалирование экрана MediaProjection по умолчанию vs VD vs Canvas)
         item {
             val activeSource = state.videoSourceMode
             fun selectVideoSource(mode: VideoSourceMode) {
@@ -1686,6 +1784,9 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                         putExtra(BridgeForegroundService.EXTRA_VIDEO_SOURCE_MODE, mode.id)
                     }
                     safeStartService(context, intent)
+                }
+                if (mode == VideoSourceMode.SCREEN_MIRRORING && !MediaProjectionTokenStore.hasValidToken.value) {
+                    onRequestMediaProjection()
                 }
             }
 
@@ -1716,7 +1817,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                             )
                             Spacer(modifier = Modifier.height(2.dp))
                             Text(
-                                text = "Выбор входа для H.264 MediaCodec (без перезапуска сервиса)",
+                                text = "Выбор входа для H.264 MediaCodec (1280×720@30fps, 2000 kbps, AOA 20B)",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = TextSecondary
                             )
@@ -1728,7 +1829,11 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                             border = BorderStroke(1.dp, TelemetryEmerald.copy(alpha = 0.65f))
                         ) {
                             Text(
-                                text = if (activeSource == VideoSourceMode.CANVAS_TEST_CARD) "CANVAS" else "VD",
+                                text = when (activeSource) {
+                                    VideoSourceMode.SCREEN_MIRRORING -> "MIRROR"
+                                    VideoSourceMode.VIRTUAL_DISPLAY -> "VD"
+                                    VideoSourceMode.CANVAS_TEST_CARD -> "CANVAS"
+                                },
                                 style = MaterialTheme.typography.labelSmall.copy(
                                     fontWeight = FontWeight.SemiBold
                                 ),
@@ -1752,10 +1857,10 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                         } else {
                             ObsidianBorder
                         }
-                        val tag = if (mode == VideoSourceMode.CANVAS_TEST_CARD) {
-                            "video_source_canvas_btn"
-                        } else {
-                            "video_source_vd_btn"
+                        val tag = when (mode) {
+                            VideoSourceMode.SCREEN_MIRRORING -> "video_source_mirror_btn"
+                            VideoSourceMode.VIRTUAL_DISPLAY -> "video_source_vd_btn"
+                            VideoSourceMode.CANVAS_TEST_CARD -> "video_source_canvas_btn"
                         }
                         Row(
                             modifier = Modifier
@@ -2723,10 +2828,10 @@ private fun ProjectionEngineCard(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = if (state.videoSourceMode == VideoSourceMode.CANVAS_TEST_CARD) {
-                        "Конвейер Тест-карта (Canvas) + H.264"
-                    } else {
-                        "Конвейер VirtualDisplay + H.264"
+                    text = when (state.videoSourceMode) {
+                        VideoSourceMode.SCREEN_MIRRORING -> "Конвейер Зеркалирование экрана (MediaProjection) + H.264"
+                        VideoSourceMode.VIRTUAL_DISPLAY -> "Конвейер VirtualDisplay + H.264"
+                        VideoSourceMode.CANVAS_TEST_CARD -> "Конвейер Тест-карта (Canvas) + H.264"
                     },
                     style = MaterialTheme.typography.titleSmall,
                     color = TextPrimary
@@ -2751,7 +2856,11 @@ private fun ProjectionEngineCard(
                 MetricPill(
                     label = "TOUCH INJECT",
                     value = "${proj.injectedTouches}",
-                    subValue = if (state.videoSourceMode == VideoSourceMode.CANVAS_TEST_CARD) "CANVAS" else "VD #${proj.virtualDisplayId}",
+                    subValue = when (state.videoSourceMode) {
+                        VideoSourceMode.SCREEN_MIRRORING -> "MIRROR A11Y"
+                        VideoSourceMode.CANVAS_TEST_CARD -> "CANVAS"
+                        VideoSourceMode.VIRTUAL_DISPLAY -> "VD #${proj.virtualDisplayId}"
+                    },
                     modifier = Modifier.weight(1f)
                 )
                 MetricPill(
@@ -2785,10 +2894,10 @@ private fun ProjectionEngineCard(
                         )
                         Spacer(modifier = Modifier.width(6.dp))
                         Text(
-                            text = if (state.videoSourceMode == VideoSourceMode.CANVAS_TEST_CARD) {
-                                "Запустить Тест-карту (Canvas) + H.264"
-                            } else {
-                                "Запустить VirtualDisplay + H.264"
+                            text = when (state.videoSourceMode) {
+                                VideoSourceMode.SCREEN_MIRRORING -> "Запустить Зеркалирование (MediaProjection)"
+                                VideoSourceMode.VIRTUAL_DISPLAY -> "Запустить VirtualDisplay + H.264"
+                                VideoSourceMode.CANVAS_TEST_CARD -> "Запустить Тест-карту (Canvas) + H.264"
                             },
                             fontWeight = FontWeight.SemiBold
                         )

@@ -76,7 +76,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.example.core.input.CarLifeTouchAccessibilityService
+import com.example.core.input.CarLifeAccessibilityService
 import com.example.ui.theme.CockpitIcons
 import com.example.ui.theme.ElectricCyan
 import com.example.ui.theme.ObsidianBackground
@@ -448,7 +448,7 @@ fun CarLifeAppLauncherScreen(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val apps by CarLifeLauncherRepository.installedApps.collectAsState()
-    val a11yEnabled by CarLifeTouchAccessibilityService.isServiceEnabled.collectAsState()
+    val a11yEnabled by CarLifeAccessibilityService.isServiceEnabled.collectAsState()
 
     var selectedFilter by remember { mutableIntStateOf(0) } // 0 = All, 1 = Priority/Nav & Media
 

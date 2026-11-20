@@ -5,6 +5,7 @@ import com.example.core.audio.CarLifeAudioCaptureManager
 import com.example.core.carlife.CarLifePacketBuilder
 import com.example.core.carlife.CarLifeProtocolConstants
 import com.example.core.carlife.CarLifeTouchPacket
+import com.example.core.input.CarLifeAccessibilityService
 import com.example.core.projection.CockpitProjectionManager
 import com.example.core.projection.ProjectionPipelineStats
 import com.example.core.projection.VideoSourceMode
@@ -743,12 +744,13 @@ class ExampleUnitTest {
         assertEquals(CarLifeProtocolConstants.MSG_VIDEO_DATA, CarLifeMsgType.MSG_VIDEO_DATA)
         assertEquals(CarLifeProtocolConstants.MSG_VIDEO_HEARTBEAT, CarLifeMsgType.MSG_VIDEO_HEARTBEAT)
 
-        // Default video source mode must be Режим A: Тест-карта (Canvas)
-        assertEquals(VideoSourceMode.CANVAS_TEST_CARD, ProjectionPipelineStats().videoSourceMode)
-        assertEquals(VideoSourceMode.CANVAS_TEST_CARD, BridgeRuntimeState().videoSourceMode)
+        // Default video source mode must be Режим 1: Зеркалирование экрана (MediaProjection)
+        assertEquals(VideoSourceMode.SCREEN_MIRRORING, ProjectionPipelineStats().videoSourceMode)
+        assertEquals(VideoSourceMode.SCREEN_MIRRORING, BridgeRuntimeState().videoSourceMode)
+        assertEquals(VideoSourceMode.SCREEN_MIRRORING, VideoSourceMode.fromId("screen_mirroring"))
         assertEquals(VideoSourceMode.CANVAS_TEST_CARD, VideoSourceMode.fromId("canvas_test_card"))
         assertEquals(VideoSourceMode.VIRTUAL_DISPLAY, VideoSourceMode.fromId("virtual_display"))
-        assertEquals(VideoSourceMode.CANVAS_TEST_CARD, VideoSourceMode.fromId(null))
+        assertEquals(VideoSourceMode.SCREEN_MIRRORING, VideoSourceMode.fromId(null))
 
         // Direct 12B vs AOA 20B with 0x00020001
         val sampleNal = byteArrayOf(0x00, 0x00, 0x00, 0x01, 0x65, 0x88.toByte(), 0x84.toByte())
@@ -1030,6 +1032,96 @@ class ExampleUnitTest {
         assertFalse(CarLifeAudioCaptureManager.isBufferSilent(silentBuf, 4096))
         assertTrue(CarLifeAudioCaptureManager.isBufferSilent(silentBuf, 4095))
     }
+
+    @Test
+    fun carLifeAccessibilityService_scalesPhysicalScreenCoordinatesAndClassifiesTapVsSwipe() {
+        // 1. Exact 16:9 landscape phone (1920x1080) mirrored into 1280x720 -> linear scaling
+        val (l16x, l16y) = CarLifeAccessibilityService.mapHuTouchToPhysicalScreen(
+            rawX = 640,
+            rawY = 360,
+            huWidth = 1280f,
+            huHeight = 720f,
+            screenWidth = 1920,
+            screenHeight = 1080
+        )
+        assertEquals(960f, l16x, 0.5f)
+        assertEquals(540f, l16y, 0.5f)
+
+        val (l16CornerX, l16CornerY) = CarLifeAccessibilityService.mapHuTouchToPhysicalScreen(
+            rawX = 1280,
+            rawY = 720,
+            huWidth = 1280f,
+            huHeight = 720f,
+            screenWidth = 1920,
+            screenHeight = 1080
+        )
+        assertEquals(1919f, l16CornerX, 0.5f)
+        assertEquals(1079f, l16CornerY, 0.5f)
+
+        // 2. Ultrawide landscape phone (e.g. S26 Ultra 3120x1440) -> vertical letterbox inside 1280x720
+        // scale = min(1280/3120, 720/1440) = 1280/3120 ≈ 0.410256, drawnH ≈ 590.77, offsetY ≈ 64.615
+        val (uwCenterX, uwCenterY) = CarLifeAccessibilityService.mapHuTouchToPhysicalScreen(
+            rawX = 640,
+            rawY = 360,
+            huWidth = 1280f,
+            huHeight = 720f,
+            screenWidth = 3120,
+            screenHeight = 1440
+        )
+        assertEquals(1560f, uwCenterX, 1.0f)
+        assertEquals(720f, uwCenterY, 1.0f)
+
+        // Tap in top letterbox bar clamps cleanly to y=0
+        val (uwTopX, uwTopY) = CarLifeAccessibilityService.mapHuTouchToPhysicalScreen(
+            rawX = 0,
+            rawY = 10,
+            huWidth = 1280f,
+            huHeight = 720f,
+            screenWidth = 3120,
+            screenHeight = 1440
+        )
+        assertEquals(0f, uwTopX, 0.5f)
+        assertEquals(0f, uwTopY, 0.5f)
+
+        // 3. Portrait phone (1440x3120) -> horizontal pillarbox inside 1280x720
+        val (ptCenterX, ptCenterY) = CarLifeAccessibilityService.mapHuTouchToPhysicalScreen(
+            rawX = 640,
+            rawY = 360,
+            huWidth = 1280f,
+            huHeight = 720f,
+            screenWidth = 1440,
+            screenHeight = 3120
+        )
+        assertEquals(720f, ptCenterX, 1.0f)
+        assertEquals(1560f, ptCenterY, 1.0f)
+
+        // 4. Short tap vs map swipe classification
+        assertTrue(
+            CarLifeAccessibilityService.isShortTapGesture(
+                startX = 500f,
+                startY = 500f,
+                endX = 508f,
+                endY = 505f,
+                points = listOf(500f to 500f, 504f to 502f, 508f to 505f)
+            )
+        )
+        assertFalse(
+            CarLifeAccessibilityService.isShortTapGesture(
+                startX = 500f,
+                startY = 500f,
+                endX = 720f,
+                endY = 510f,
+                points = listOf(500f to 500f, 610f to 505f, 720f to 510f)
+            )
+        )
+
+        // 5. Tap duration (40..60ms) & Swipe duration clamping (50..1500ms)
+        assertTrue(CarLifeAccessibilityService.DEFAULT_TAP_DURATION_MS in 40L..60L)
+        assertEquals(50L, CarLifeAccessibilityService.computeSwipeDurationMs(1000L, 1010L))
+        assertEquals(320L, CarLifeAccessibilityService.computeSwipeDurationMs(1000L, 1320L))
+        assertEquals(1500L, CarLifeAccessibilityService.computeSwipeDurationMs(1000L, 4500L))
+    }
 }
+
 
 
