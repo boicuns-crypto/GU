@@ -1,14 +1,18 @@
 package com.example
 
 import android.content.Context
+import android.content.ContextWrapper
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Canvas
+import android.os.Bundle
 import androidx.test.core.app.ApplicationProvider
 import com.example.core.projection.CockpitProjectionManager
 import com.example.core.projection.VideoSourceMode
 import com.example.core.usb.BridgeForegroundService
 import com.example.core.usb.BridgeTelemetryBus
+import com.example.feature.cockpit.CarLifeLauncherRepository
+import com.example.feature.cockpit.InstalledAppInfo
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
@@ -143,5 +147,47 @@ class ExampleRobolectricTest {
     assertTrue(!activity.isFinishing)
 
     activityController.pause().resume().destroy()
+  }
+
+  @Test
+  fun `cockpit launcher uses NEW_TASK and RESET_TASK_IF_NEEDED and falls back when VirtualDisplay rejects launch`() {
+    val baseContext = ApplicationProvider.getApplicationContext<Context>()
+    var vdAttempted = false
+    var fallbackIntent: Intent? = null
+
+    val wrappedContext = object : ContextWrapper(baseContext) {
+      override fun startActivity(intent: Intent?, options: Bundle?) {
+        if (options != null) {
+          vdAttempted = true
+          throw SecurityException("Android 16 VirtualDisplay launch blocked")
+        }
+        fallbackIntent = intent
+      }
+
+      override fun startActivity(intent: Intent?) {
+        fallbackIntent = intent
+      }
+    }
+
+    val testApp = InstalledAppInfo(
+      packageName = baseContext.packageName,
+      activityName = MainActivity::class.java.name,
+      label = "CarLife Bridge",
+      iconBitmap = null
+    )
+
+    val launched = CarLifeLauncherRepository.launchAppOnVirtualDisplay(
+      context = wrappedContext,
+      app = testApp,
+      targetDisplayId = 2
+    )
+
+    assertTrue(launched)
+    assertTrue("Expected VirtualDisplay ActivityOptions attempt first", vdAttempted)
+    val launchedIntent = fallbackIntent
+    assertTrue("Expected fallback startActivity(intent) call", launchedIntent != null)
+    val expectedFlags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED
+    assertEquals(expectedFlags, launchedIntent!!.flags and expectedFlags)
+    assertTrue(CarLifeLauncherRepository.lastLaunchStatus.value.contains("VD #2"))
   }
 }

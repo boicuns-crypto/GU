@@ -378,9 +378,9 @@ fun CarLifeBridgeApp(
     // 2 = «Настройки» (Settings — VD Controls, H.264 Stream Config & Expandable AOA/Protocol Lab)
     var selectedTab by rememberSaveable { mutableIntStateOf(0) }
 
-    var configuredWidth by rememberSaveable { mutableIntStateOf(800) }
-    var configuredHeight by rememberSaveable { mutableIntStateOf(480) }
-    var configuredBitrateKbps by rememberSaveable { mutableIntStateOf(800) }
+    var configuredWidth by rememberSaveable { mutableIntStateOf(1280) }
+    var configuredHeight by rememberSaveable { mutableIntStateOf(720) }
+    var configuredBitrateKbps by rememberSaveable { mutableIntStateOf(1800) }
 
     var checklistStatus by remember {
         mutableStateOf(
@@ -1786,7 +1786,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                     }
 
                     Text(
-                        text = "Разрешение виртуального дисплея и кодека (800×480 по умолчанию для Jetta VS7)",
+                        text = "Разрешение виртуального дисплея и кодека (1280×720 по умолчанию для Jetta VS7)",
                         style = MaterialTheme.typography.labelMedium,
                         color = TextSecondary
                     )
@@ -1819,7 +1819,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                     }
 
                     Text(
-                        text = "Битрейт кодека (AVCProfileBaseline CBR, 30fps, I=1s, 1.2 Мбит/с по умолчанию)",
+                        text = "Битрейт кодека (AVCProfileBaseline CBR, 30fps, I=1s, 1.8 Мбит/с по умолчанию)",
                         style = MaterialTheme.typography.labelMedium,
                         color = TextSecondary
                     )
@@ -1991,7 +1991,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                         )
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
-                            text = "Стартовать VD (800×480 • CBR • 30fps)",
+                            text = "Стартовать VD (1280×720 • 1.8 Мбит/с • 30fps)",
                             fontWeight = FontWeight.SemiBold,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis

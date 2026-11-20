@@ -82,13 +82,39 @@ sealed interface CarLifeInputEvent {
  */
 object CarLifeTouchDecoder {
 
+    const val DEFAULT_HU_TOUCH_MAX_X: Float = 1280f
+    const val DEFAULT_HU_TOUCH_MAX_Y: Float = 720f
+
+    /**
+     * Dynamically scales Head Unit touch coordinates (`rawX`, `rawY`) into any target surface resolution:
+     * `scaledX = rawX * (currentSurfaceWidth.toFloat() / huTouchMaxX)`
+     * `scaledY = rawY * (currentSurfaceHeight.toFloat() / huTouchMaxY)`
+     */
+    fun scaleTouchCoordinates(
+        rawX: Int,
+        rawY: Int,
+        currentSurfaceWidth: Int,
+        currentSurfaceHeight: Int,
+        huTouchMaxX: Float = DEFAULT_HU_TOUCH_MAX_X,
+        huTouchMaxY: Float = DEFAULT_HU_TOUCH_MAX_Y
+    ): Pair<Float, Float> {
+        val safeSurfaceW = currentSurfaceWidth.coerceAtLeast(1).toFloat()
+        val safeSurfaceH = currentSurfaceHeight.coerceAtLeast(1).toFloat()
+        val safeHuMaxX = if (huTouchMaxX > 0f) huTouchMaxX else DEFAULT_HU_TOUCH_MAX_X
+        val safeHuMaxY = if (huTouchMaxY > 0f) huTouchMaxY else DEFAULT_HU_TOUCH_MAX_Y
+
+        val scaledX = (rawX.toFloat() * (safeSurfaceW / safeHuMaxX)).coerceIn(0f, safeSurfaceW)
+        val scaledY = (rawY.toFloat() * (safeSurfaceH / safeHuMaxY)).coerceIn(0f, safeSurfaceH)
+        return scaledX to scaledY
+    }
+
     /**
      * Decodes a `CarLifeChannel.TOUCH (0x0006)` frame and maps coordinates to `[targetWidth] x [targetHeight]`.
      */
     fun decodeTouchChannelFrame(
         frame: CarLifeFrame,
-        targetWidth: Int = 1920,
-        targetHeight: Int = 1080,
+        targetWidth: Int = 1280,
+        targetHeight: Int = 720,
         defaultHuWidth: Int = 1280,
         defaultHuHeight: Int = 720
     ): CarLifeInputEvent? {
@@ -327,13 +353,16 @@ object CarLifeTouchDecoder {
         targetWidth: Int,
         targetHeight: Int
     ): CarLifeInputEvent.Touch {
-        val safeHuW = huWidth.coerceAtLeast(1)
-        val safeHuH = huHeight.coerceAtLeast(1)
-        val clampedX = rawX.coerceIn(0, safeHuW)
-        val clampedY = rawY.coerceIn(0, safeHuH)
-
-        val scaledX = (clampedX.toFloat() / safeHuW.toFloat()) * targetWidth.toFloat()
-        val scaledY = (clampedY.toFloat() / safeHuH.toFloat()) * targetHeight.toFloat()
+        val safeHuW = huWidth.takeIf { it > 0 } ?: DEFAULT_HU_TOUCH_MAX_X.toInt()
+        val safeHuH = huHeight.takeIf { it > 0 } ?: DEFAULT_HU_TOUCH_MAX_Y.toInt()
+        val (scaledX, scaledY) = scaleTouchCoordinates(
+            rawX = rawX,
+            rawY = rawY,
+            currentSurfaceWidth = targetWidth,
+            currentSurfaceHeight = targetHeight,
+            huTouchMaxX = safeHuW.toFloat(),
+            huTouchMaxY = safeHuH.toFloat()
+        )
 
         return CarLifeInputEvent.Touch(
             type = type,

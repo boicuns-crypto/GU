@@ -67,6 +67,7 @@ import com.example.feature.cockpit.CarLifeAppLauncherScreen
 import com.example.feature.cockpit.CarLifeLauncherRepository
 import com.example.feature.cockpit.MediaControllerRepository
 import com.example.protocol.carlife.CarLifeFrameCodec
+import com.example.protocol.carlife.CarLifeTouchDecoder
 import com.example.ui.theme.AmberSignal
 import com.example.ui.theme.ElectricCyan
 import com.example.ui.theme.MyApplicationTheme
@@ -161,11 +162,11 @@ data class ProjectionPipelineStats(
     val videoSourceMode: VideoSourceMode = VideoSourceMode.CANVAS_TEST_CARD,
     val usingMediaProjection: Boolean = false,
     val virtualDisplayId: Int = Display.DEFAULT_DISPLAY,
-    val width: Int = 800,
-    val height: Int = 480,
+    val width: Int = 1280,
+    val height: Int = 720,
     val fps: Int = 30,
-    val bitRateMbps: Int = 1,
-    val bitRateKbps: Int = 1200,
+    val bitRateMbps: Int = 2,
+    val bitRateKbps: Int = 1800,
     val encodedNalFrames: Long = 0L,
     val encodedBytes: Long = 0L,
     val lastIdrBytes: Int = 0,
@@ -173,7 +174,7 @@ data class ProjectionPipelineStats(
     val injectedTouches: Long = 0L,
     val lastTouchPoint: Pair<Float, Float>? = null,
     val activeCockpitWidget: String = "Тест-карта (Canvas) готова",
-    val statusMessage: String = "Тест-карта (Canvas) готова (800×480 @ 1.2 Мбит/с, CBR 30fps)"
+    val statusMessage: String = "Тест-карта (Canvas) готова (1280×720 @ 1.8 Мбит/с, CBR 30fps)"
 )
 
 /**
@@ -237,7 +238,7 @@ class CockpitProjectionManager(
     @Volatile
     private var lastCodecFrameElapsedMs: Long = 0L
 
-    private val activeDownTimeUptimeMs = AtomicLong(0L)
+    private val lastDownTime = AtomicLong(0L)
 
     private val _stats = MutableStateFlow(ProjectionPipelineStats())
     val stats: StateFlow<ProjectionPipelineStats> = _stats.asStateFlow()
@@ -255,15 +256,15 @@ class CockpitProjectionManager(
     private var presentationRefreshJob: Job? = null
 
     suspend fun ensureProjectionStarted(
-        width: Int = 800,
-        height: Int = 480,
+        width: Int = 1280,
+        height: Int = 720,
         frameRate: Int = 30,
-        bitRate: Int = 1_200_000,
+        bitRate: Int = 1_800_000,
         densityDpi: Int = DisplayMetrics.DENSITY_MEDIUM,
         sourceMode: VideoSourceMode = this.videoSourceMode
     ): Boolean {
-        val safeWidth = if (width in 480..3840) width else 800
-        val safeHeight = if (height in 272..2160) height else 480
+        val safeWidth = if (width in 480..3840) width else 1280
+        val safeHeight = if (height in 272..2160) height else 720
         val safeFps = if (frameRate in 15..60) frameRate else 30
         val safeBitRate = bitRate.coerceIn(400_000, 12_000_000)
 
@@ -282,10 +283,10 @@ class CockpitProjectionManager(
     }
 
     suspend fun startProjection(
-        width: Int = 800,
-        height: Int = 480,
+        width: Int = 1280,
+        height: Int = 720,
         frameRate: Int = 30,
-        bitRate: Int = 1_200_000,
+        bitRate: Int = 1_800_000,
         densityDpi: Int = DisplayMetrics.DENSITY_MEDIUM,
         sourceMode: VideoSourceMode = this.videoSourceMode
     ): Boolean = projectionMutex.withLock {
@@ -294,8 +295,8 @@ class CockpitProjectionManager(
         // or releasing VirtualDisplay when switching to pure Canvas Test Card mode).
         stopEncoderOnlyLocked()
 
-        val safeWidth = if (width in 480..3840) width else 800
-        val safeHeight = if (height in 272..2160) height else 480
+        val safeWidth = if (width in 480..3840) width else 1280
+        val safeHeight = if (height in 272..2160) height else 720
         val safeFps = if (frameRate in 15..60) frameRate else 30
         val safeBitRate = bitRate.coerceIn(400_000, 12_000_000)
         val effectiveDpi = if (safeWidth <= 1024) DisplayMetrics.DENSITY_MEDIUM else densityDpi
@@ -1130,16 +1131,27 @@ class CockpitProjectionManager(
      */
     suspend fun injectTouchPacket(packet: CarLifeTouchPacket): Boolean {
         val currentStats = _stats.value
-        val targetW = currentStats.width.coerceAtLeast(1)
-        val targetH = currentStats.height.coerceAtLeast(1)
-        val huW = packet.huWidth.coerceAtLeast(1)
-        val huH = packet.huHeight.coerceAtLeast(1)
-
-        val scaledX = ((packet.rawX.coerceIn(0, huW).toFloat() / huW.toFloat()) * targetW.toFloat())
-        val scaledY = ((packet.rawY.coerceIn(0, huH).toFloat() / huH.toFloat()) * targetH.toFloat())
+        val huTouchMaxX = packet.huWidth.takeIf { it > 0 }?.toFloat()
+            ?: CarLifeTouchDecoder.DEFAULT_HU_TOUCH_MAX_X
+        val huTouchMaxY = packet.huHeight.takeIf { it > 0 }?.toFloat()
+            ?: CarLifeTouchDecoder.DEFAULT_HU_TOUCH_MAX_Y
 
         return withContext(Dispatchers.Main.immediate) {
             val vDisplayId = virtualDisplay?.display?.displayId ?: Display.DEFAULT_DISPLAY
+            val decorView = cockpitPresentation?.window?.decorView
+            val currentSurfaceWidth = decorView?.width?.takeIf { it > 0 }
+                ?: currentStats.width.coerceAtLeast(1)
+            val currentSurfaceHeight = decorView?.height?.takeIf { it > 0 }
+                ?: currentStats.height.coerceAtLeast(1)
+
+            val (scaledX, scaledY) = CarLifeTouchDecoder.scaleTouchCoordinates(
+                rawX = packet.rawX,
+                rawY = packet.rawY,
+                currentSurfaceWidth = currentSurfaceWidth,
+                currentSurfaceHeight = currentSurfaceHeight,
+                huTouchMaxX = huTouchMaxX,
+                huTouchMaxY = huTouchMaxY
+            )
 
             val a11yDispatched = CarLifeTouchAccessibilityService.instance?.handleMotionStream(
                 displayId = vDisplayId,
@@ -1149,32 +1161,38 @@ class CockpitProjectionManager(
                 synthesizeClickUp = packet.synthesizeClickUp
             ) ?: false
 
-            val decorView = cockpitPresentation?.window?.decorView
             var viewDispatched = false
             if (decorView != null) {
                 val nowUptime = SystemClock.uptimeMillis()
                 val downTime = when (packet.androidAction) {
                     MotionEvent.ACTION_DOWN -> {
-                        activeDownTimeUptimeMs.set(nowUptime)
+                        lastDownTime.set(nowUptime)
                         nowUptime
                     }
+                    MotionEvent.ACTION_MOVE,
+                    MotionEvent.ACTION_UP,
+                    MotionEvent.ACTION_CANCEL -> {
+                        val saved = lastDownTime.get()
+                        if (saved > 0L) saved else nowUptime
+                    }
                     else -> {
-                        val existing = activeDownTimeUptimeMs.get()
-                        if (existing > 0L) existing else nowUptime
+                        val saved = lastDownTime.get()
+                        if (saved > 0L) saved else nowUptime
                     }
                 }
+                val eventTime = maxOf(downTime, nowUptime)
 
                 viewDispatched = dispatchSynthesizedMotionEvent(
                     decorView = decorView,
                     downTime = downTime,
-                    eventTime = nowUptime,
+                    eventTime = eventTime,
                     action = packet.androidAction,
                     x = scaledX,
                     y = scaledY
                 )
 
                 if (packet.synthesizeClickUp) {
-                    val upTime = SystemClock.uptimeMillis() + 16L
+                    val upTime = maxOf(downTime + 16L, SystemClock.uptimeMillis())
                     dispatchSynthesizedMotionEvent(
                         decorView = decorView,
                         downTime = downTime,
@@ -1186,10 +1204,16 @@ class CockpitProjectionManager(
                 }
             } else if (packet.androidAction == MotionEvent.ACTION_UP || packet.synthesizeClickUp) {
                 // Canvas mode hit-test for app launch and media controls
-                handleCanvasLauncherTap(scaledX, scaledY, targetW.toFloat(), targetH.toFloat(), vDisplayId)
+                handleCanvasLauncherTap(
+                    scaledX,
+                    scaledY,
+                    currentSurfaceWidth.toFloat(),
+                    currentSurfaceHeight.toFloat(),
+                    vDisplayId
+                )
             }
 
-            val zoneHit = if (scaledX < targetW * 0.25f) {
+            val zoneHit = if (scaledX < currentSurfaceWidth * 0.25f) {
                 "Dock Bar (${scaledX.toInt()}, ${scaledY.toInt()}) on VD #$vDisplayId"
             } else {
                 "App Grid (${scaledX.toInt()}, ${scaledY.toInt()}) on VD #$vDisplayId"
@@ -1686,36 +1710,16 @@ class CockpitProjectionManager(
         x: Float,
         y: Float
     ): Boolean {
-        val props = arrayOf(
-            MotionEvent.PointerProperties().apply {
-                id = 0
-                toolType = MotionEvent.TOOL_TYPE_FINGER
-            }
-        )
-        val coords = arrayOf(
-            MotionEvent.PointerCoords().apply {
-                this.x = x
-                this.y = y
-                pressure = if (action == MotionEvent.ACTION_UP) 0f else 1.0f
-                size = 1.0f
-            }
-        )
         val event = MotionEvent.obtain(
             downTime,
             eventTime,
             action,
-            1,
-            props,
-            coords,
-            0,
-            0,
-            1.0f,
-            1.0f,
-            0,
-            0,
-            InputDevice.SOURCE_TOUCHSCREEN,
+            x,
+            y,
             0
-        )
+        ).apply {
+            source = InputDevice.SOURCE_TOUCHSCREEN
+        }
         return try {
             decorView.dispatchTouchEvent(event)
         } finally {

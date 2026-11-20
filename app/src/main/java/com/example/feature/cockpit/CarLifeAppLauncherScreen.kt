@@ -11,8 +11,11 @@ import android.graphics.Canvas
 import android.graphics.drawable.BitmapDrawable
 import android.graphics.drawable.Drawable
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import android.view.Display
+import android.widget.Toast
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -203,42 +206,96 @@ object CarLifeLauncherRepository {
         }
     }
 
+    private fun showLaunchToast(context: Context, message: String) {
+        runCatching {
+            val appCtx = context.applicationContext ?: context
+            if (Looper.myLooper() == Looper.getMainLooper()) {
+                Toast.makeText(appCtx, message, Toast.LENGTH_SHORT).show()
+            } else {
+                Handler(Looper.getMainLooper()).post {
+                    runCatching {
+                        Toast.makeText(appCtx, message, Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
+        }
+    }
+
     /**
-     * Launches [app] on the target CarLife `VirtualDisplay` ([targetDisplayId]) using
-     * `ActivityOptions.makeBasic().setLaunchDisplayId(targetDisplayId).toBundle()`.
+     * Launches [app] using `packageManager.getLaunchIntentForPackage(pkg)` with
+     * `FLAG_ACTIVITY_NEW_TASK or FLAG_ACTIVITY_RESET_TASK_IF_NEEDED`.
+     * When a CarLife `VirtualDisplay` is active ([targetDisplayId] != [Display.DEFAULT_DISPLAY]),
+     * attempts `ActivityOptions.makeBasic().setLaunchDisplayId(targetDisplayId).toBundle()` first
+     * and automatically falls back to a standard default-display launch with a short Toast + log
+     * if Android 16 rejects VirtualDisplay launch.
      */
     fun launchAppOnVirtualDisplay(
         context: Context,
         app: InstalledAppInfo,
         targetDisplayId: Int
     ): Boolean {
-        return try {
-            val launchIntent = Intent(Intent.ACTION_MAIN).apply {
-                addCategory(Intent.CATEGORY_LAUNCHER)
-                component = ComponentName(app.packageName, app.activityName)
-                addFlags(
-                    Intent.FLAG_ACTIVITY_NEW_TASK or
-                        Intent.FLAG_ACTIVITY_MULTIPLE_TASK or
-                        Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED
-                )
-            }
-
-            val options = ActivityOptions.makeBasic()
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && targetDisplayId != Display.DEFAULT_DISPLAY) {
-                options.setLaunchDisplayId(targetDisplayId)
-            }
-
-            context.startActivity(launchIntent, options.toBundle())
-            val displayTag = if (targetDisplayId == Display.DEFAULT_DISPLAY) {
-                "Default Display (0)"
+        val launchIntent = context.packageManager.getLaunchIntentForPackage(app.packageName)
+            ?: if (app.activityName.isNotBlank()) {
+                Intent(Intent.ACTION_MAIN).apply {
+                    addCategory(Intent.CATEGORY_LAUNCHER)
+                    component = ComponentName(app.packageName, app.activityName)
+                }
             } else {
-                "VirtualDisplay #$targetDisplayId"
+                null
             }
-            _lastLaunchStatus.value = "Запущено: ${app.label} (${app.packageName}) -> $displayTag"
+
+        if (launchIntent == null) {
+            val reason = "Не найден LaunchIntent для ${app.label} (${app.packageName})"
+            Log.w(TAG, reason)
+            _lastLaunchStatus.value = reason
+            showLaunchToast(context, reason)
+            return false
+        }
+
+        launchIntent.addFlags(
+            Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED
+        )
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && targetDisplayId != Display.DEFAULT_DISPLAY) {
+            try {
+                val options = ActivityOptions.makeBasic()
+                    .setLaunchDisplayId(targetDisplayId)
+                    .toBundle()
+                context.startActivity(launchIntent, options)
+                _lastLaunchStatus.value = "Запущено: ${app.label} (${app.packageName}) -> VirtualDisplay #$targetDisplayId"
+                return true
+            } catch (vdError: Throwable) {
+                val vdReason = vdError.message ?: vdError.javaClass.simpleName
+                Log.w(
+                    TAG,
+                    "VirtualDisplay #$targetDisplayId launch rejected for ${app.packageName} ($vdReason) — falling back to default display",
+                    vdError
+                )
+                return try {
+                    context.startActivity(launchIntent)
+                    val fallbackMsg = "VD #$targetDisplayId отклонён ($vdReason): ${app.label} открыто на телефоне"
+                    _lastLaunchStatus.value = fallbackMsg
+                    showLaunchToast(context, fallbackMsg)
+                    true
+                } catch (fallbackError: Throwable) {
+                    val errMsg = "Ошибка запуска ${app.label}: ${fallbackError.message ?: fallbackError.javaClass.simpleName}"
+                    Log.e(TAG, "Fallback launch failed for ${app.packageName}", fallbackError)
+                    _lastLaunchStatus.value = errMsg
+                    showLaunchToast(context, errMsg)
+                    false
+                }
+            }
+        }
+
+        return try {
+            context.startActivity(launchIntent)
+            _lastLaunchStatus.value = "Запущено: ${app.label} (${app.packageName}) -> Default Display (0)"
             true
         } catch (t: Throwable) {
-            Log.e(TAG, "Error launching ${app.packageName} on displayId=$targetDisplayId", t)
-            _lastLaunchStatus.value = "Ошибка запуска ${app.label}: ${t.message}"
+            val errMsg = "Ошибка запуска ${app.label}: ${t.message ?: t.javaClass.simpleName}"
+            Log.e(TAG, "Error launching ${app.packageName} on Default Display", t)
+            _lastLaunchStatus.value = errMsg
+            showLaunchToast(context, errMsg)
             false
         }
     }

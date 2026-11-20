@@ -146,12 +146,12 @@ class ExampleUnitTest {
         val videoInitFrame = CarLifeFrameCodec.createCommandFrame(
             channel = CarLifeChannel.CONTROL,
             serviceType = CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT,
-            commandBody = CarlifeVideoEncoderInfoProto(width = 800, height = 480, frameRate = 30).encode()
+            commandBody = CarlifeVideoEncoderInfoProto(width = 1280, height = 720, frameRate = 30).encode()
         )
         val step2 = sm.onControlFrame(videoInitFrame)
         assertEquals(CarLifeSessionPhase.VIDEO_INITIALIZED, step2.updatedState.phase)
-        assertEquals(800, step2.updatedState.negotiatedVideoWidth)
-        assertEquals(480, step2.updatedState.negotiatedVideoHeight)
+        assertEquals(1280, step2.updatedState.negotiatedVideoWidth)
+        assertEquals(720, step2.updatedState.negotiatedVideoHeight)
         assertEquals(30, step2.updatedState.negotiatedFps)
         assertEquals(1, step2.outboundFrames.size)
         assertEquals(
@@ -358,9 +358,9 @@ class ExampleUnitTest {
     fun jettaVs7LockedProfile_audioInitBytesAndAoA20BVideo_verifySpec() {
         val profiles = com.example.core.usb.BridgeForegroundService.AUTO_TEST_PROFILES
         assertEquals(1, profiles.size)
-        assertEquals(800, profiles[0].width)
-        assertEquals(480, profiles[0].height)
-        assertEquals(1_200_000, profiles[0].bitrateBps)
+        assertEquals(1280, profiles[0].width)
+        assertEquals(720, profiles[0].height)
+        assertEquals(1_800_000, profiles[0].bitrateBps)
         assertEquals(true, profiles[0].useNestedVideoHeader)
         assertEquals(true, profiles[0].forceAudioMultiplexerInit)
 
@@ -837,6 +837,90 @@ class ExampleUnitTest {
         assertEquals(20 + pSlice.size, wirePFrame.size)
         assertArrayEquals(byteArrayOf(0x00, 0x02, 0x00, 0x01), wirePFrame.copyOfRange(16, 20))
         assertArrayEquals(pSlice, wirePFrame.copyOfRange(20, wirePFrame.size))
+    }
+
+    @Test
+    fun dynamicTouchScaling_andDefault1280x720Resolution_andHfpTelephonyBlocked() {
+        // 1. Default resolution 1280x720@30fps (1800 kbps) and huTouchMax 1280x720
+        val defaultRuntime = BridgeRuntimeState()
+        assertEquals(1280, defaultRuntime.configuredWidth)
+        assertEquals(720, defaultRuntime.configuredHeight)
+        assertEquals(1_800_000, defaultRuntime.configuredBitrateBps)
+
+        val defaultStats = ProjectionPipelineStats()
+        assertEquals(1280, defaultStats.width)
+        assertEquals(720, defaultStats.height)
+        assertEquals(30, defaultStats.fps)
+        assertEquals(1800, defaultStats.bitRateKbps)
+
+        assertEquals(1280f, CarLifeTouchDecoder.DEFAULT_HU_TOUCH_MAX_X, 0.01f)
+        assertEquals(720f, CarLifeTouchDecoder.DEFAULT_HU_TOUCH_MAX_Y, 0.01f)
+
+        // 2. Dynamic scaling formula: rawX * (currentSurfaceWidth / huTouchMaxX)
+        val (sx720, sy720) = CarLifeTouchDecoder.scaleTouchCoordinates(
+            rawX = 640,
+            rawY = 360,
+            currentSurfaceWidth = 1280,
+            currentSurfaceHeight = 720
+        )
+        assertEquals(640f, sx720, 0.01f)
+        assertEquals(360f, sy720, 0.01f)
+
+        val (sx480, sy480) = CarLifeTouchDecoder.scaleTouchCoordinates(
+            rawX = 640,
+            rawY = 360,
+            currentSurfaceWidth = 800,
+            currentSurfaceHeight = 480
+        )
+        assertEquals(400f, sx480, 0.01f)
+        assertEquals(240f, sy480, 0.01f)
+
+        val (sx600, sy600) = CarLifeTouchDecoder.scaleTouchCoordinates(
+            rawX = 320,
+            rawY = 180,
+            currentSurfaceWidth = 1024,
+            currentSurfaceHeight = 600
+        )
+        assertEquals(256f, sx600, 0.01f)
+        assertEquals(150f, sy600, 0.01f)
+
+        val (sx1080, sy1080) = CarLifeTouchDecoder.scaleTouchCoordinates(
+            rawX = 1280,
+            rawY = 720,
+            currentSurfaceWidth = 1920,
+            currentSurfaceHeight = 1080
+        )
+        assertEquals(1920f, sx1080, 0.01f)
+        assertEquals(1080f, sy1080, 0.01f)
+
+        // 3. Bluetooth HFP & Telephony commands (0x00010040, 0x0001004F) must NEVER be emitted
+        val sm = CarLifeControlStateMachine()
+        assertEquals(1280, sm.sessionState.value.negotiatedVideoWidth)
+        assertEquals(720, sm.sessionState.value.negotiatedVideoHeight)
+
+        val rxHfp40 = CarLifeFrameCodec.createCommandFrame(
+            channel = CarLifeChannel.CONTROL,
+            serviceType = 0x00018040,
+            commandBody = byteArrayOf(0x08, 0x01)
+        )
+        val res40 = sm.onControlFrame(rxHfp40)
+        assertTrue("0x00010040 must NEVER be sent", res40.outboundFrames.isEmpty())
+
+        val rxTele4F = CarLifeFrameCodec.createCommandFrame(
+            channel = CarLifeChannel.CONTROL,
+            serviceType = 0x0001804F,
+            commandBody = byteArrayOf(0x08, 0x01)
+        )
+        val res4F = sm.onControlFrame(rxTele4F)
+        assertTrue("0x0001004F must NEVER be sent", res4F.outboundFrames.isEmpty())
+
+        val rxHfpMid = CarLifeFrameCodec.createCommandFrame(
+            channel = CarLifeChannel.CONTROL,
+            serviceType = 0x00018045,
+            commandBody = byteArrayOf(0x08, 0x01)
+        )
+        val resMid = sm.onControlFrame(rxHfpMid)
+        assertTrue("HFP/telephony range 0x00010040..0x0001004F must NEVER be sent", resMid.outboundFrames.isEmpty())
     }
 }
 

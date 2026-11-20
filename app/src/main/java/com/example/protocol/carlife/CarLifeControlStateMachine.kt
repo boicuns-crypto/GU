@@ -62,8 +62,8 @@ data class CarLifeControlSessionState(
     val huProtocolMajor: Int = 0,
     val huProtocolMinor: Int = 0,
     val huDeviceInfo: CarlifeDeviceInfoProto? = null,
-    val negotiatedVideoWidth: Int = 800,
-    val negotiatedVideoHeight: Int = 480,
+    val negotiatedVideoWidth: Int = 1280,
+    val negotiatedVideoHeight: Int = 720,
     val negotiatedFps: Int = 30,
     val isHuScreenOn: Boolean = true,
     val isHuForeground: Boolean = true,
@@ -86,8 +86,8 @@ data class ControlTransitionResult(
 class CarLifeControlStateMachine(
     private val force60FpsOnMqb: Boolean = false,
     private val mobileDeviceInfo: CarlifeDeviceInfoProto = CarlifeDeviceInfoProto(),
-    @Volatile var preferredVideoWidth: Int = 800,
-    @Volatile var preferredVideoHeight: Int = 480,
+    @Volatile var preferredVideoWidth: Int = 1280,
+    @Volatile var preferredVideoHeight: Int = 720,
     @Volatile var handshakeTestProfile: HandshakeTestProfile = HandshakeTestProfile.TEST_4_AUDIO_VIDEO_NO_SCREEN
 ) {
     private val _sessionState = MutableStateFlow(
@@ -317,8 +317,22 @@ class CarLifeControlStateMachine(
                     summary = note
                 )
             }
-            CarLifeMsgType.MSG_CMD_HU_RSA_PUBLIC_KEY_REQUEST ->
-                handleMockAuthBypass(frame, cmd.serviceType, CarLifeMsgType.MSG_CMD_HU_RSA_PUBLIC_KEY_RESPONSE)
+            CarLifeMsgType.MSG_CMD_HU_RSA_PUBLIC_KEY_REQUEST,
+            0x00010040,
+            0x0001804F,
+            0x0001004F -> {
+                // Bluetooth HFP / Telephony commands (0x00010040, 0x0001004F) are NEVER transmitted so the
+                // Jetta VS7 stock Bluetooth audio & native dialer stay uninterrupted.
+                val hex = CarLifeFrameCodec.formatHexPreview(frame, maxPayloadBytes = 256)
+                val idHex = "0x${cmd.serviceType.toUInt().toString(16).uppercase().padStart(8, '0')}"
+                val note = "RX HFP/Telephony ($idHex) $hex -> ignored (native HU Bluetooth & dialer preserved)"
+                _sessionState.update { it.copy(lastControlAction = note) }
+                ControlTransitionResult(
+                    updatedState = _sessionState.value,
+                    outboundFrames = emptyList(),
+                    summary = note
+                )
+            }
             CarLifeMsgType.MSG_CMD_VEHICLE_CERTIFICATE_REQUEST ->
                 handleMockAuthBypass(frame, cmd.serviceType, CarLifeMsgType.MSG_CMD_VEHICLE_CERTIFICATE_RESPONSE)
             CarLifeMsgType.MSG_CMD_HU_AUTHEN_REQUEST,
@@ -597,18 +611,20 @@ class CarLifeControlStateMachine(
     private fun handleUnknownOrAuthCommand(frame: CarLifeFrame, serviceId: Int): ControlTransitionResult {
         val hex = CarLifeFrameCodec.formatHexPreview(frame, maxPayloadBytes = 256)
         val serviceHex = "0x${serviceId.toUInt().toString(16).uppercase().padStart(8, '0')}"
+        val normalizedReplyId = serviceId and 0x00008000.inv()
+        val isBlockedHfpOrTelephony = normalizedReplyId in 0x00010040..0x0001004F
         val isPassiveTelemetry = serviceId in CarLifeMsgType.MSG_CMD_CAR_VELOCITY..CarLifeMsgType.MSG_CMD_CAR_OIL ||
             serviceId == CarLifeMsgType.MSG_CMD_STATISTIC_INFO ||
             serviceId == CarLifeMsgType.MSG_CMD_STATISTIC_INFO_ALT ||
-            serviceId == CarLifeMsgType.MSG_CMD_PAUSE_MEDIA
+            serviceId == CarLifeMsgType.MSG_CMD_PAUSE_MEDIA ||
+            isBlockedHfpOrTelephony
         val isHuRequest = ((serviceId ushr 16) == 0x0001) && ((serviceId and 0x8000) != 0) && !isPassiveTelemetry
 
         val outbound = if (isHuRequest) {
-            val mockReplyId = serviceId and 0x00008000.inv()
             listOf(
                 CarLifeFrameCodec.createCommandFrame(
                     channel = CarLifeChannel.CONTROL,
-                    serviceType = mockReplyId,
+                    serviceType = normalizedReplyId,
                     commandBody = byteArrayOf(0x08, 0x01)
                 )
             )
