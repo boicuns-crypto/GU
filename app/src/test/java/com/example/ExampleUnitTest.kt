@@ -1,15 +1,18 @@
 package com.example
 
 import android.view.MotionEvent
+import com.example.core.audio.AudioCaptureStats
 import com.example.core.audio.CarLifeAudioCaptureManager
 import com.example.core.carlife.CarLifePacketBuilder
 import com.example.core.carlife.CarLifeProtocolConstants
 import com.example.core.carlife.CarLifeTouchPacket
 import com.example.core.input.CarLifeAccessibilityService
+import com.example.core.projection.AppMode
 import com.example.core.projection.CockpitProjectionManager
 import com.example.core.projection.ProjectionPipelineStats
 import com.example.core.projection.VideoSourceMode
 import com.example.core.usb.BridgeRuntimeState
+import com.example.core.usb.BridgeTelemetryBus
 import com.example.feature.cockpit.AppLaunchMode
 import com.example.protocol.carlife.CarLifeChannel
 import com.example.protocol.carlife.CarLifeControlStateMachine
@@ -1120,6 +1123,46 @@ class ExampleUnitTest {
         assertEquals(50L, CarLifeAccessibilityService.computeSwipeDurationMs(1000L, 1010L))
         assertEquals(320L, CarLifeAccessibilityService.computeSwipeDurationMs(1000L, 1320L))
         assertEquals(1500L, CarLifeAccessibilityService.computeSwipeDurationMs(1000L, 4500L))
+    }
+
+    @Test
+    fun appModeDefaults_uiLogGating_andSpeakerMuteDefaults_verifySpec() {
+        val defaultRuntime = BridgeRuntimeState()
+        assertEquals(AppMode.MIRRORING, defaultRuntime.appMode)
+        assertEquals(VideoSourceMode.SCREEN_MIRRORING, defaultRuntime.videoSourceMode)
+        assertFalse(defaultRuntime.logPacketsInUi)
+        assertTrue(defaultRuntime.mutePhoneSpeakerDuringUsbAudio)
+        assertTrue(AudioCaptureStats().mutePhoneSpeakerDuringUsbAudio)
+        assertTrue(CockpitProjectionManager.MIRROR_VIRTUAL_DISPLAY_DPI in 160..240)
+        assertEquals(AppMode.COCKPIT, AppMode.fromId("cockpit"))
+        assertEquals(AppMode.MIRRORING, AppMode.fromId("mirroring"))
+        assertEquals(AppMode.MIRRORING, AppMode.fromId(null))
+
+        BridgeTelemetryBus.clearLogs()
+        BridgeTelemetryBus.setAppMode(AppMode.MIRRORING)
+        assertFalse(BridgeTelemetryBus.runtimeState.value.logPacketsInUi)
+
+        val videoTestFrame = CarLifeFrameCodec.createVideoFrame(
+            nalData = byteArrayOf(0x00, 0x00, 0x00, 0x01, 0x65, 0x88.toByte()),
+            timestampMs = 123L
+        )
+        // With logPacketsInUi == false, recordFrame must NOT allocate packet log entries
+        BridgeTelemetryBus.recordFrame(direction = "TX (S26U -> HU)", frame = videoTestFrame)
+        assertEquals(0, BridgeTelemetryBus.runtimeState.value.videoPacketLogs.size)
+        assertEquals(1L, BridgeTelemetryBus.runtimeState.value.channelFrameCounts[CarLifeChannel.VIDEO])
+
+        // Manual Protocol Lab vectors with forceLog = true must still log
+        BridgeTelemetryBus.recordFrame(direction = "TX (S26U -> HU)", frame = videoTestFrame, forceLog = true)
+        assertEquals(1, BridgeTelemetryBus.runtimeState.value.videoPacketLogs.size)
+
+        // Switching to COCKPIT enables VirtualDisplay + UI logging, switching back restores Mirroring defaults
+        BridgeTelemetryBus.setAppMode(AppMode.COCKPIT)
+        assertEquals(AppMode.COCKPIT, BridgeTelemetryBus.runtimeState.value.appMode)
+        assertEquals(VideoSourceMode.VIRTUAL_DISPLAY, BridgeTelemetryBus.runtimeState.value.videoSourceMode)
+        assertTrue(BridgeTelemetryBus.runtimeState.value.logPacketsInUi)
+
+        BridgeTelemetryBus.setAppMode(AppMode.MIRRORING)
+        BridgeTelemetryBus.clearLogs()
     }
 }
 

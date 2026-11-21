@@ -5,8 +5,13 @@ import android.content.ContextWrapper
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Canvas
+import android.media.AudioManager
 import android.os.Bundle
+import android.view.MotionEvent
 import androidx.test.core.app.ApplicationProvider
+import com.example.core.audio.CarLifeAudioCaptureManager
+import com.example.core.carlife.CarLifeTouchPacket
+import com.example.core.projection.AppMode
 import com.example.core.projection.CockpitProjectionManager
 import com.example.core.projection.VideoSourceMode
 import com.example.core.usb.BridgeForegroundService
@@ -15,6 +20,7 @@ import com.example.feature.cockpit.AppLaunchMode
 import com.example.feature.cockpit.CarLifeLauncherRepository
 import com.example.feature.cockpit.InstalledAppInfo
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -213,4 +219,121 @@ class ExampleRobolectricTest {
     assertTrue("SCREEN_MIRRORING must launch directly on default display", fallbackIntent != null)
     CarLifeLauncherRepository.setAppLaunchMode(AppLaunchMode.VIRTUAL_DISPLAY_IF_AVAILABLE)
   }
+
+  @Test
+  fun `bridge service toggles AppMode COCKPIT vs MIRRORING, UI packet log, and speaker mute`() {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val controller = Robolectric.buildService(BridgeForegroundService::class.java).create()
+    val service = controller.get()
+
+    val switchToCockpit = Intent(context, BridgeForegroundService::class.java).apply {
+      action = BridgeForegroundService.ACTION_SET_APP_MODE
+      putExtra(BridgeForegroundService.EXTRA_APP_MODE, AppMode.COCKPIT.id)
+    }
+    service.onStartCommand(switchToCockpit, 0, 1)
+    assertEquals(AppMode.COCKPIT, BridgeTelemetryBus.runtimeState.value.appMode)
+    assertEquals(VideoSourceMode.VIRTUAL_DISPLAY, BridgeTelemetryBus.runtimeState.value.videoSourceMode)
+    assertTrue(BridgeTelemetryBus.runtimeState.value.logPacketsInUi)
+
+    val disableLog = Intent(context, BridgeForegroundService::class.java).apply {
+      action = BridgeForegroundService.ACTION_SET_LOG_PACKETS_IN_UI
+      putExtra(BridgeForegroundService.EXTRA_LOG_PACKETS_IN_UI, false)
+    }
+    service.onStartCommand(disableLog, 0, 2)
+    assertFalse(BridgeTelemetryBus.runtimeState.value.logPacketsInUi)
+
+    val disableMute = Intent(context, BridgeForegroundService::class.java).apply {
+      action = BridgeForegroundService.ACTION_SET_MUTE_PHONE_SPEAKER
+      putExtra(BridgeForegroundService.EXTRA_MUTE_PHONE_SPEAKER, false)
+    }
+    service.onStartCommand(disableMute, 0, 3)
+    assertFalse(BridgeTelemetryBus.runtimeState.value.mutePhoneSpeakerDuringUsbAudio)
+
+    val switchToMirror = Intent(context, BridgeForegroundService::class.java).apply {
+      action = BridgeForegroundService.ACTION_SET_APP_MODE
+      putExtra(BridgeForegroundService.EXTRA_APP_MODE, AppMode.MIRRORING.id)
+    }
+    service.onStartCommand(switchToMirror, 0, 4)
+    assertEquals(AppMode.MIRRORING, BridgeTelemetryBus.runtimeState.value.appMode)
+    assertEquals(VideoSourceMode.SCREEN_MIRRORING, BridgeTelemetryBus.runtimeState.value.videoSourceMode)
+    assertFalse(BridgeTelemetryBus.runtimeState.value.logPacketsInUi)
+
+    val enableMute = Intent(context, BridgeForegroundService::class.java).apply {
+      action = BridgeForegroundService.ACTION_SET_MUTE_PHONE_SPEAKER
+      putExtra(BridgeForegroundService.EXTRA_MUTE_PHONE_SPEAKER, true)
+    }
+    service.onStartCommand(enableMute, 0, 5)
+    assertTrue(BridgeTelemetryBus.runtimeState.value.mutePhoneSpeakerDuringUsbAudio)
+
+    controller.destroy()
+  }
+
+  @Test
+  fun `audio capture manager saves and mutes STREAM_MUSIC then restores original volume`() {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+    audioManager.setStreamVolume(AudioManager.STREAM_MUSIC, 9, 0)
+
+    val captureManager = CarLifeAudioCaptureManager(
+      context = context,
+      onSendAudioFrame = { _, _ -> true }
+    )
+    assertTrue(captureManager.stats.value.mutePhoneSpeakerDuringUsbAudio)
+
+    captureManager.mutePhoneSpeakerIfEnabled()
+    assertEquals(0, audioManager.getStreamVolume(AudioManager.STREAM_MUSIC))
+    assertTrue(captureManager.stats.value.isPhoneSpeakerMutedByBridge)
+    assertEquals(9, captureManager.stats.value.savedPhoneMusicVolume)
+
+    // Repeated mute call while muted must NOT overwrite saved volume 9 with 0
+    captureManager.mutePhoneSpeakerIfEnabled()
+    assertEquals(9, captureManager.stats.value.savedPhoneMusicVolume)
+
+    // Restoring or toggling mute off restores original volume 9
+    captureManager.setMutePhoneSpeakerEnabled(false)
+    assertEquals(9, audioManager.getStreamVolume(AudioManager.STREAM_MUSIC))
+    assertFalse(captureManager.stats.value.isPhoneSpeakerMutedByBridge)
+  }
+
+  @Test
+  fun `cockpit projection manager isolates 0x0006 touch routing between COCKPIT and MIRRORING`() {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val manager = CockpitProjectionManager(
+      context = context,
+      onEncodedVideoNal = { _, _, _ -> }
+    )
+
+    val sampleTouch = CarLifeTouchPacket(
+      androidAction = MotionEvent.ACTION_DOWN,
+      rawX = 640,
+      rawY = 360,
+      huWidth = 1280,
+      huHeight = 720,
+      synthesizeClickUp = true
+    )
+
+    // Mode COCKPIT: never routes through CarLifeAccessibilityService
+    manager.appMode = AppMode.COCKPIT
+    kotlinx.coroutines.runBlocking {
+      manager.injectTouchPacket(sampleTouch)
+    }
+    assertTrue(
+      "Expected Cockpit Touch status without A11y routing, got: ${manager.stats.value.statusMessage}",
+      manager.stats.value.statusMessage.startsWith("Cockpit Touch ->")
+    )
+
+    // Mode MIRRORING: routes strictly through CarLifeAccessibilityService path
+    manager.appMode = AppMode.MIRRORING
+    kotlinx.coroutines.runBlocking {
+      manager.injectTouchPacket(sampleTouch)
+    }
+    assertTrue(
+      "Expected Mirror/Accessibility touch status, got: ${manager.stats.value.statusMessage}",
+      manager.stats.value.statusMessage.contains("CarLifeAccessibilityService") ||
+        manager.stats.value.statusMessage.startsWith("Mirror Touch")
+    )
+
+    kotlinx.coroutines.runBlocking { manager.stopProjection() }
+  }
 }
+

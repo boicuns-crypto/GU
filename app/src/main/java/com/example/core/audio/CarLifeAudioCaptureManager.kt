@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.media.AudioAttributes
 import android.media.AudioFormat
+import android.media.AudioManager
 import android.media.AudioPlaybackCaptureConfiguration
 import android.media.AudioRecord
 import android.media.projection.MediaProjection
@@ -39,6 +40,9 @@ import kotlinx.coroutines.withContext
 data class AudioCaptureStats(
     val isCapturing: Boolean = false,
     val hasRecordAudioPermission: Boolean = false,
+    val mutePhoneSpeakerDuringUsbAudio: Boolean = true,
+    val isPhoneSpeakerMutedByBridge: Boolean = false,
+    val savedPhoneMusicVolume: Int? = null,
     val mediaInitSent: Boolean = false,
     val sentInitPackets: Long = 0L,
     val sentPcmPackets: Long = 0L,
@@ -64,19 +68,97 @@ class CarLifeAudioCaptureManager(
     private val externalScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 ) {
     private val appContext = context.applicationContext
+    private val audioManager: AudioManager? =
+        appContext.getSystemService(Context.AUDIO_SERVICE) as? AudioManager
     private val captureMutex = Mutex()
+    private val volumeLock = Any()
     private val isCapturingFlag = AtomicBoolean(false)
+    private val mutePhoneSpeakerFlag = AtomicBoolean(true)
+
+    @Volatile
+    private var savedMusicVolumeIndex: Int? = null
 
     private var audioRecord: AudioRecord? = null
     private var captureJob: Job? = null
 
     private val _stats = MutableStateFlow(
-        AudioCaptureStats(hasRecordAudioPermission = hasRecordAudioPermission(appContext))
+        AudioCaptureStats(
+            hasRecordAudioPermission = hasRecordAudioPermission(appContext),
+            mutePhoneSpeakerDuringUsbAudio = true
+        )
     )
     val stats: StateFlow<AudioCaptureStats> = _stats.asStateFlow()
 
     val isCapturing: Boolean
         get() = isCapturingFlag.get()
+
+    fun setMutePhoneSpeakerEnabled(enabled: Boolean) {
+        mutePhoneSpeakerFlag.set(enabled)
+        if (!enabled) {
+            restorePhoneSpeakerVolume()
+        } else if (isCapturingFlag.get()) {
+            mutePhoneSpeakerIfEnabled()
+        } else {
+            _stats.update { it.copy(mutePhoneSpeakerDuringUsbAudio = true) }
+        }
+    }
+
+    internal fun mutePhoneSpeakerIfEnabled() {
+        if (!mutePhoneSpeakerFlag.get()) {
+            _stats.update { it.copy(mutePhoneSpeakerDuringUsbAudio = false) }
+            return
+        }
+        val am = audioManager ?: return
+        var capturedSavedVol: Int? = null
+        var muted = false
+        synchronized(volumeLock) {
+            if (savedMusicVolumeIndex == null) {
+                val currentVol = runCatching { am.getStreamVolume(AudioManager.STREAM_MUSIC) }.getOrNull()
+                if (currentVol != null) {
+                    savedMusicVolumeIndex = currentVol
+                    if (currentVol > 0) {
+                        runCatching { am.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0) }
+                    }
+                    muted = true
+                }
+            } else {
+                val currentVol = runCatching { am.getStreamVolume(AudioManager.STREAM_MUSIC) }.getOrDefault(0)
+                if (currentVol > 0) {
+                    runCatching { am.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0) }
+                }
+                muted = true
+            }
+            capturedSavedVol = savedMusicVolumeIndex
+        }
+        Log.i(TAG, "Phone STREAM_MUSIC muted=0 (saved volume=$capturedSavedVol)")
+        _stats.update {
+            it.copy(
+                mutePhoneSpeakerDuringUsbAudio = true,
+                isPhoneSpeakerMutedByBridge = muted,
+                savedPhoneMusicVolume = capturedSavedVol
+            )
+        }
+    }
+
+    fun restorePhoneSpeakerVolume() {
+        val am = audioManager
+        val prevVol: Int?
+        synchronized(volumeLock) {
+            prevVol = savedMusicVolumeIndex
+            savedMusicVolumeIndex = null
+        }
+        if (prevVol != null && am != null) {
+            runCatching { am.setStreamVolume(AudioManager.STREAM_MUSIC, prevVol, 0) }
+            Log.i(TAG, "Restored phone STREAM_MUSIC volume to $prevVol")
+        }
+        _stats.update {
+            it.copy(
+                mutePhoneSpeakerDuringUsbAudio = mutePhoneSpeakerFlag.get(),
+                isPhoneSpeakerMutedByBridge = false,
+                savedPhoneMusicVolume = null
+            )
+        }
+    }
 
     fun refreshPermissionState(): Boolean {
         val granted = hasRecordAudioPermission(appContext)
@@ -234,12 +316,17 @@ class CarLifeAudioCaptureManager(
 
         audioRecord = recorder
         isCapturingFlag.set(true)
+        mutePhoneSpeakerIfEnabled()
         _stats.update { current ->
             current.copy(
                 isCapturing = true,
                 hasRecordAudioPermission = true,
                 mediaInitSent = current.mediaInitSent || initSent,
-                statusMessage = "Аудио 0x0003 активно: 48 кГц Stereo 16-bit PCM (4096B чанки, звонки HFP на BT)"
+                statusMessage = if (mutePhoneSpeakerFlag.get()) {
+                    "Аудио 0x0003 активно: 48 кГц PCM • Динамик телефона заглушён (0)"
+                } else {
+                    "Аудио 0x0003 активно: 48 кГц Stereo 16-bit PCM (4096B чанки, звонки HFP на BT)"
+                }
             )
         }
 
@@ -346,6 +433,7 @@ class CarLifeAudioCaptureManager(
                 if (audioRecord === recorder) {
                     audioRecord = null
                 }
+                restorePhoneSpeakerVolume()
                 _stats.update { current ->
                     current.copy(
                         isCapturing = false,
@@ -393,6 +481,7 @@ class CarLifeAudioCaptureManager(
             val stopFrame = CarLifeFrameCodec.createMediaStopFrame(timestampSec = currentTimestampSec())
             stopSent = runCatching { onSendAudioFrame(stopFrame, true) }.getOrDefault(false)
         }
+        restorePhoneSpeakerVolume()
 
         _stats.update { current ->
             current.copy(

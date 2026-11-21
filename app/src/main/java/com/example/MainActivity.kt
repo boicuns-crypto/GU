@@ -79,6 +79,8 @@ import androidx.compose.material3.RadioButton
 import androidx.compose.material3.RadioButtonDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -116,6 +118,7 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import android.view.WindowManager
 import com.example.core.input.CarLifeAccessibilityService
+import com.example.core.projection.AppMode
 import com.example.core.projection.MediaProjectionTokenStore
 import com.example.core.projection.VideoSourceMode
 import com.example.core.usb.BridgeForegroundService
@@ -1333,7 +1336,8 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                         BridgeTelemetryBus.recordFrame(
                             direction = "TX (S26U -> HU)",
                             frame = reply,
-                            protocolNote = transition.summary
+                            protocolNote = transition.summary,
+                            forceLog = true
                         )
                     }
                 } else if (decoded.channel == CarLifeChannel.TOUCH) {
@@ -1360,7 +1364,8 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                 BridgeTelemetryBus.recordFrame(
                     direction = "RX (HU -> S26U)",
                     frame = decoded,
-                    protocolNote = "Verified ${decoded.header.headerSizeBytes}B header on ${decoded.channel.label}: $description"
+                    protocolNote = "Verified ${decoded.header.headerSizeBytes}B header on ${decoded.channel.label}: $description",
+                    forceLog = true
                 )
 
                 val rawHeader = CarLifeFrameCodec.encodeHeader(decoded.header)
@@ -1399,6 +1404,180 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
         contentPadding = PaddingValues(16.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
+        // 0. Главный переключатель режима работы: «Кокпит (Виртуальный экран)» vs «Зеркалирование (Экран телефона)»
+        item {
+            val activeAppMode = state.appMode
+            fun selectAppMode(mode: AppMode) {
+                BridgeTelemetryBus.setAppMode(mode)
+                if (state.isServiceRunning) {
+                    val intent = Intent(context, BridgeForegroundService::class.java).apply {
+                        action = BridgeForegroundService.ACTION_SET_APP_MODE
+                        putExtra(BridgeForegroundService.EXTRA_APP_MODE, mode.id)
+                    }
+                    safeStartService(context, intent)
+                }
+                if (mode == AppMode.MIRRORING && !MediaProjectionTokenStore.hasValidToken.value) {
+                    onRequestMediaProjection()
+                }
+            }
+
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("app_mode_switcher_card"),
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(containerColor = ObsidianSurface),
+                border = BorderStroke(1.dp, ElectricCyan.copy(alpha = 0.75f))
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Режим работы приложения",
+                                style = MaterialTheme.typography.titleMedium,
+                                color = TextPrimary
+                            )
+                            Spacer(modifier = Modifier.height(2.dp))
+                            Text(
+                                text = "Независимые видеопоток и маршрутизация тача (0x0006)",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = TextSecondary
+                            )
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Surface(
+                            color = ElectricCyan.copy(alpha = 0.16f),
+                            shape = RoundedCornerShape(8.dp),
+                            border = BorderStroke(1.dp, ElectricCyan.copy(alpha = 0.65f))
+                        ) {
+                            Text(
+                                text = if (activeAppMode == AppMode.COCKPIT) "КОКПИТ VD" else "ЗЕРКАЛО",
+                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+                                color = ElectricCyan,
+                                softWrap = false,
+                                maxLines = 1,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                            )
+                        }
+                    }
+
+                    AppMode.entries.forEach { mode ->
+                        val isSelected = activeAppMode == mode
+                        val rowBg = if (isSelected) ElectricCyan.copy(alpha = 0.12f) else ObsidianBackground
+                        val rowBorder = if (isSelected) ElectricCyan else ObsidianBorder
+                        val tag = if (mode == AppMode.COCKPIT) "app_mode_cockpit_btn" else "app_mode_mirroring_btn"
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(min = 48.dp)
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(rowBg)
+                                .border(1.dp, rowBorder, RoundedCornerShape(12.dp))
+                                .selectable(
+                                    selected = isSelected,
+                                    onClick = { selectAppMode(mode) },
+                                    role = Role.RadioButton
+                                )
+                                .padding(horizontal = 12.dp, vertical = 10.dp)
+                                .testTag(tag),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            RadioButton(
+                                selected = isSelected,
+                                onClick = null,
+                                colors = RadioButtonDefaults.colors(
+                                    selectedColor = ElectricCyan,
+                                    unselectedColor = TextMuted
+                                )
+                            )
+                            Spacer(modifier = Modifier.width(10.dp))
+                            Column(
+                                modifier = Modifier.weight(1f),
+                                verticalArrangement = Arrangement.spacedBy(2.dp)
+                            ) {
+                                Text(
+                                    text = mode.title,
+                                    style = MaterialTheme.typography.labelLarge.copy(
+                                        fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Medium
+                                    ),
+                                    color = if (isSelected) ElectricCyan else TextPrimary
+                                )
+                                Text(
+                                    text = mode.subtitle,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = TextSecondary
+                                )
+                            }
+                        }
+                    }
+
+                    // Тумблер «Логировать пакеты в UI» (выкл. по умолчанию в режиме Зеркалирования для плавных 30 fps)
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 48.dp)
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(ObsidianBackground)
+                            .border(1.dp, ObsidianBorder, RoundedCornerShape(12.dp))
+                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .weight(1f)
+                                .padding(end = 12.dp),
+                            verticalArrangement = Arrangement.spacedBy(2.dp)
+                        ) {
+                            Text(
+                                text = "Логировать пакеты в UI",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = TextPrimary
+                            )
+                            Text(
+                                text = if (state.logPacketsInUi) {
+                                    "Вкл — пакеты 0x0001/0x0002 пишутся в журнал (может нагружать UI)"
+                                } else {
+                                    "Выкл — ноль лишних перерисовок Compose при 30 fps и аудио PCM"
+                                },
+                                style = MaterialTheme.typography.labelSmall,
+                                color = TextSecondary
+                            )
+                        }
+                        Switch(
+                            checked = state.logPacketsInUi,
+                            onCheckedChange = { enabled ->
+                                BridgeTelemetryBus.setLogPacketsInUi(enabled)
+                                if (state.isServiceRunning) {
+                                    val intent = Intent(context, BridgeForegroundService::class.java).apply {
+                                        action = BridgeForegroundService.ACTION_SET_LOG_PACKETS_IN_UI
+                                        putExtra(BridgeForegroundService.EXTRA_LOG_PACKETS_IN_UI, enabled)
+                                    }
+                                    safeStartService(context, intent)
+                                }
+                            },
+                            modifier = Modifier.testTag("log_packets_ui_switch"),
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = ObsidianBackground,
+                                checkedTrackColor = ElectricCyan,
+                                uncheckedThumbColor = TextSecondary,
+                                uncheckedTrackColor = ObsidianSurfaceHigh
+                            )
+                        )
+                    }
+                }
+            }
+        }
+
         // 1. Блок управления виртуальным экраном и статусами (Start VD, Touch ON, Overlay OK + лог запуска)
         item {
             Card(
@@ -1637,6 +1816,61 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                 color = TextMuted
                             )
                         }
+                    }
+
+                    // Тумблер «Глушить динамик телефона при USB-звуке» (по умолчанию ВКЛ)
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 48.dp)
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(ObsidianBackground)
+                            .border(1.dp, ObsidianBorder, RoundedCornerShape(12.dp))
+                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .weight(1f)
+                                .padding(end = 12.dp),
+                            verticalArrangement = Arrangement.spacedBy(2.dp)
+                        ) {
+                            Text(
+                                text = "Глушить динамик телефона при USB-звуке",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = TextPrimary
+                            )
+                            Text(
+                                text = if (audioStats.isPhoneSpeakerMutedByBridge) {
+                                    "Динамик телефона заглушен (сохранена громкость: ${audioStats.savedPhoneMusicVolume ?: 0}); восстановится при отключении USB"
+                                } else {
+                                    "При старте захвата 0x0003 сохраняет STREAM_MUSIC, ставит 0 и возвращает при остановке/отключении USB"
+                                },
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (audioStats.isPhoneSpeakerMutedByBridge) TelemetryEmerald else TextSecondary
+                            )
+                        }
+                        Switch(
+                            checked = state.mutePhoneSpeakerDuringUsbAudio,
+                            onCheckedChange = { enabled ->
+                                BridgeTelemetryBus.setMutePhoneSpeakerDuringUsbAudio(enabled)
+                                if (state.isServiceRunning) {
+                                    val muteIntent = Intent(context, BridgeForegroundService::class.java).apply {
+                                        action = BridgeForegroundService.ACTION_SET_MUTE_PHONE_SPEAKER
+                                        putExtra(BridgeForegroundService.EXTRA_MUTE_PHONE_SPEAKER, enabled)
+                                    }
+                                    safeStartService(context, muteIntent)
+                                }
+                            },
+                            modifier = Modifier.testTag("mute_speaker_usb_audio_switch"),
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = ObsidianBackground,
+                                checkedTrackColor = TelemetryEmerald,
+                                uncheckedThumbColor = TextSecondary,
+                                uncheckedTrackColor = ObsidianSurfaceHigh
+                            )
+                        )
                     }
 
                     Button(

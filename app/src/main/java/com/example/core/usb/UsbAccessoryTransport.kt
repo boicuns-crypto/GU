@@ -9,8 +9,10 @@ import android.hardware.usb.UsbAccessory
 import android.hardware.usb.UsbManager
 import android.os.Build
 import android.os.ParcelFileDescriptor
+import android.os.Process
 import android.util.Log
 import androidx.core.content.ContextCompat
+import com.example.protocol.carlife.CarLifeChannel
 import com.example.protocol.carlife.CarLifeFrame
 import com.example.protocol.carlife.CarLifeFrameCodec
 import com.example.protocol.carlife.CarLifeStreamAssembler
@@ -21,6 +23,7 @@ import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.channels.FileChannel
+import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
@@ -30,7 +33,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.BufferOverflow
-import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -99,9 +101,8 @@ class UsbAccessoryTransport(
         appContext.getSystemService(Context.USB_SERVICE) as UsbManager
 
     private val lifecycleMutex = Mutex()
-    private val writeMutex = Mutex()
-    private val usbWriteLock = Any()
     private val isReceiverRegistered = AtomicBoolean(false)
+    private val writerRunning = AtomicBoolean(false)
 
     private var parcelFd: ParcelFileDescriptor? = null
     private var fileInputStream: FileInputStream? = null
@@ -111,12 +112,10 @@ class UsbAccessoryTransport(
     private var activeAccessory: UsbAccessory? = null
 
     private var readJob: Job? = null
-    private var writeJob: Job? = null
+    private var writerThread: Thread? = null
 
-    private var outgoingQueue = Channel<CarLifeFrame>(
-        capacity = 256,
-        onBufferOverflow = BufferOverflow.SUSPEND
-    )
+    @Volatile
+    private var outgoingQueue: LinkedBlockingQueue<CarLifeFrame> = LinkedBlockingQueue(WRITER_QUEUE_CAPACITY)
 
     private val _state = MutableStateFlow<UsbTransportState>(UsbTransportState.Disconnected)
     val state: StateFlow<UsbTransportState> = _state.asStateFlow()
@@ -232,10 +231,9 @@ class UsbAccessoryTransport(
         outChannel = fos.channel
         activeAccessory = accessory
 
-        outgoingQueue = Channel(
-            capacity = 256,
-            onBufferOverflow = BufferOverflow.SUSPEND
-        )
+        val writeQueue = LinkedBlockingQueue<CarLifeFrame>(WRITER_QUEUE_CAPACITY)
+        outgoingQueue = writeQueue
+        writerRunning.set(true)
 
         val fdNum = runCatching { pfd.fd }.getOrDefault(-1)
         _state.value = UsbTransportState.Connected(
@@ -248,52 +246,49 @@ class UsbAccessoryTransport(
         readJob = externalScope.launch(ioDispatcher) {
             runDirectReadLoop(fis)
         }
-        writeJob = externalScope.launch(ioDispatcher) {
-            runDirectWriteLoop(fos)
+        writerThread = Thread({
+            runCatching {
+                Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
+            }
+            runDedicatedUsbWriterLoop(fos, writeQueue)
+        }, "CarLifeUsbWriterThread").apply {
+            isDaemon = true
+            priority = Thread.MAX_PRIORITY
+            start()
         }
         return true
     }
 
-    suspend fun sendFrame(frame: CarLifeFrame): Boolean {
-        if (_state.value !is UsbTransportState.Connected) return false
-        return runCatching {
-            outgoingQueue.send(frame)
-            true
-        }.getOrDefault(false)
+    /**
+     * Enqueues a [CarLifeFrame] into the lock-free [LinkedBlockingQueue] without blocking
+     * `MediaCodec` (`0x0002`) or `AudioRecord` (`0x0003`) threads on USB I/O.
+     */
+    fun enqueueFrameNonBlocking(frame: CarLifeFrame): Boolean {
+        if (_state.value !is UsbTransportState.Connected || !writerRunning.get()) return false
+        val queue = outgoingQueue
+        if (queue.offer(frame)) return true
+        // Queue congested: evict one stale queued item so codecs/audio never stall
+        queue.poll()
+        return queue.offer(frame)
     }
 
-    suspend fun sendFrameImmediate(frame: CarLifeFrame): Boolean = withContext(ioDispatcher) {
-        val fos = fileOutputStream ?: return@withContext false
-        writeMutex.withLock {
-            try {
-                writeFrameChunked16K(fos, frame)
-                _txFrames.incrementAndGet()
-                _txBytes.addAndGet(frame.totalFrameBytes.toLong())
-                true
-            } catch (e: IOException) {
-                Log.e(TAG, "USB AOA chunked write failed on channel=${frame.channel}", e)
-                externalScope.launch { closeSession("USB write failure: ${e.message}") }
-                false
-            }
-        }
-    }
+    suspend fun sendFrame(frame: CarLifeFrame): Boolean = enqueueFrameNonBlocking(frame)
+
+    suspend fun sendFrameImmediate(frame: CarLifeFrame): Boolean = enqueueFrameNonBlocking(frame)
 
     /**
      * Writes any CarLife frame to `/dev/usb_accessory` (`FileOutputStream`) in strict
-     * **16,384-byte (16 KB)** chunks inside `synchronized(usbWriteLock)` so the Linux kernel
+     * **16,384-byte (16 KB)** chunks on the dedicated high-priority [writerThread] so the Linux kernel
      * `f_accessory` driver never drops or truncates >16KB H.264 IDR keyframes.
      */
     @Throws(IOException::class)
     private fun writeFrameChunked16K(usbOutputStream: FileOutputStream, frame: CarLifeFrame) {
         val fullPacket = CarLifeFrameCodec.encodeFrame(frame)
-        synchronized(usbWriteLock) {
-            var offset = 0
-            while (offset < fullPacket.size) {
-                val chunk = minOf(MAX_AOA_WRITE_SIZE, fullPacket.size - offset)
-                usbOutputStream.write(fullPacket, offset, chunk)
-                offset += chunk
-            }
-            usbOutputStream.flush()
+        var offset = 0
+        while (offset < fullPacket.size) {
+            val chunk = minOf(MAX_AOA_WRITE_SIZE, fullPacket.size - offset)
+            usbOutputStream.write(fullPacket, offset, chunk)
+            offset += chunk
         }
     }
 
@@ -461,25 +456,35 @@ class UsbAccessoryTransport(
     }
 
     /**
-     * Chunk-safe write loop over [FileOutputStream] (`16,384`-byte chunks).
+     * Dedicated high-priority writer loop draining [LinkedBlockingQueue] sequentially into [FileOutputStream]
+     * in 16,384-byte chunks without blocking `MediaCodec` or `AudioRecord`.
      */
-    private suspend fun CoroutineScope.runDirectWriteLoop(fos: FileOutputStream) {
+    private fun runDedicatedUsbWriterLoop(
+        fos: FileOutputStream,
+        queue: LinkedBlockingQueue<CarLifeFrame>
+    ) {
         try {
-            for (frame in outgoingQueue) {
-                if (!isActive) break
-                writeMutex.withLock {
-                    writeFrameChunked16K(fos, frame)
-                }
+            while (writerRunning.get() && !Thread.currentThread().isInterrupted) {
+                val frame = queue.take()
+                if (!writerRunning.get()) break
+                writeFrameChunked16K(fos, frame)
                 _txFrames.incrementAndGet()
                 _txBytes.addAndGet(frame.totalFrameBytes.toLong())
             }
-        } catch (ce: CancellationException) {
-            throw ce
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
         } catch (ioe: IOException) {
             Log.w(TAG, "USB AOA bulk OUT stream terminated: ${ioe.message}")
-            if (isActive) {
+            if (writerRunning.get()) {
                 externalScope.launch {
                     closeSession("USB bulk OUT write error: ${ioe.message}")
+                }
+            }
+        } catch (t: Throwable) {
+            Log.e(TAG, "Unexpected error in USB writer thread: ${t.message}", t)
+            if (writerRunning.get()) {
+                externalScope.launch {
+                    closeSession("USB writer error: ${t.message}")
                 }
             }
         }
@@ -501,12 +506,13 @@ class UsbAccessoryTransport(
     }
 
     private fun closeResourcesLocked() {
+        writerRunning.set(false)
         readJob?.cancel()
-        writeJob?.cancel()
         readJob = null
-        writeJob = null
 
-        outgoingQueue.close()
+        writerThread?.interrupt()
+        writerThread = null
+        outgoingQueue.clear()
 
         runCatching { inChannel?.close() }
         runCatching { outChannel?.close() }
@@ -569,6 +575,7 @@ class UsbAccessoryTransport(
         const val ACTION_USB_PERMISSION = "com.example.core.usb.ACTION_USB_PERMISSION"
         const val MAX_AOA_CHUNK = 16_384
         const val MAX_AOA_WRITE_SIZE = MAX_AOA_CHUNK
+        const val WRITER_QUEUE_CAPACITY = 512
 
         val KNOWN_MANUFACTURERS = setOf(
             "Baidu",

@@ -25,6 +25,7 @@ import com.example.core.audio.AudioCaptureStats
 import com.example.core.audio.CarLifeAudioCaptureManager
 import com.example.core.carlife.CarLifeHardKeyPacket
 import com.example.core.carlife.CarLifeTouchPacket
+import com.example.core.projection.AppMode
 import com.example.core.projection.CockpitProjectionManager
 import com.example.core.projection.MediaProjectionTokenStore
 import com.example.core.projection.ProjectionPipelineStats
@@ -111,6 +112,9 @@ data class BridgeRuntimeState(
     val audioCaptureStats: AudioCaptureStats = AudioCaptureStats(),
     val isVideoChannelReadyForStreaming: Boolean = false,
     val useNestedVideoMsgHeader: Boolean = true,
+    val appMode: AppMode = AppMode.MIRRORING,
+    val logPacketsInUi: Boolean = false,
+    val mutePhoneSpeakerDuringUsbAudio: Boolean = true,
     val videoSourceMode: VideoSourceMode = VideoSourceMode.SCREEN_MIRRORING,
     val appLaunchMode: AppLaunchMode = AppLaunchMode.VIRTUAL_DISPLAY_IF_AVAILABLE,
     val handshakeTestProfile: HandshakeTestProfile = HandshakeTestProfile.TEST_4_AUDIO_VIDEO_NO_SCREEN,
@@ -149,9 +153,65 @@ object BridgeTelemetryBus {
         }
     }
 
-    fun setVideoSourceMode(mode: VideoSourceMode) {
+    fun setAppMode(mode: AppMode) {
+        val mappedSource = if (mode == AppMode.MIRRORING) {
+            VideoSourceMode.SCREEN_MIRRORING
+        } else {
+            VideoSourceMode.VIRTUAL_DISPLAY
+        }
+        val mappedLaunch = if (mode == AppMode.MIRRORING) {
+            AppLaunchMode.SCREEN_MIRRORING
+        } else {
+            AppLaunchMode.VIRTUAL_DISPLAY_IF_AVAILABLE
+        }
+        CarLifeLauncherRepository.setAppLaunchMode(mappedLaunch)
         _runtimeState.update {
             it.copy(
+                appMode = mode,
+                videoSourceMode = mappedSource,
+                appLaunchMode = mappedLaunch,
+                logPacketsInUi = (mode == AppMode.COCKPIT),
+                lastProtocolEvent = "Режим работы: ${mode.title}"
+            )
+        }
+    }
+
+    fun setLogPacketsInUi(enabled: Boolean) {
+        _runtimeState.update {
+            it.copy(
+                logPacketsInUi = enabled,
+                lastProtocolEvent = if (enabled) {
+                    "Логирование пакетов в UI: ВКЛ"
+                } else {
+                    "Логирование пакетов в UI: ВЫКЛ (макс. производительность)"
+                }
+            )
+        }
+    }
+
+    fun setMutePhoneSpeakerDuringUsbAudio(enabled: Boolean) {
+        _runtimeState.update {
+            it.copy(
+                mutePhoneSpeakerDuringUsbAudio = enabled,
+                audioCaptureStats = it.audioCaptureStats.copy(mutePhoneSpeakerDuringUsbAudio = enabled),
+                lastProtocolEvent = if (enabled) {
+                    "Глушить динамик телефона при USB-звуке: ВКЛ"
+                } else {
+                    "Глушить динамик телефона при USB-звуке: ВЫКЛ"
+                }
+            )
+        }
+    }
+
+    fun setVideoSourceMode(mode: VideoSourceMode) {
+        val mappedAppMode = if (mode == VideoSourceMode.SCREEN_MIRRORING) {
+            AppMode.MIRRORING
+        } else {
+            AppMode.COCKPIT
+        }
+        _runtimeState.update {
+            it.copy(
+                appMode = mappedAppMode,
                 videoSourceMode = mode,
                 lastProtocolEvent = "Источник видео: ${mode.title}"
             )
@@ -180,8 +240,19 @@ object BridgeTelemetryBus {
         rxFramesTotal: Long? = null,
         txFramesTotal: Long? = null,
         protocolNote: String? = null,
-        serviceNameOverride: String? = null
+        serviceNameOverride: String? = null,
+        forceLog: Boolean = false
     ) {
+        if (!_runtimeState.value.logPacketsInUi && !forceLog) {
+            recordFrameCountersOnly(
+                channel = frame.channel,
+                rxBytesTotal = rxBytesTotal,
+                txBytesTotal = txBytesTotal,
+                rxFramesTotal = rxFramesTotal,
+                txFramesTotal = txFramesTotal
+            )
+            return
+        }
         val timeFmt = SimpleDateFormat("HH:mm:ss.SSS", Locale.US).format(Date())
         val cmdMsg = frame.parseCommandMessageOrNull()
         val isVideo = frame.channel == CarLifeChannel.VIDEO
@@ -365,6 +436,9 @@ class BridgeForegroundService : Service() {
     private var forceAudioInitForSession: Boolean = true
 
     @Volatile
+    private var activeAppMode: AppMode = AppMode.MIRRORING
+
+    @Volatile
     private var activeVideoSourceMode: VideoSourceMode = VideoSourceMode.SCREEN_MIRRORING
 
     private val huConfirmationSeq = java.util.concurrent.atomic.AtomicLong(0L)
@@ -439,26 +513,36 @@ class BridgeForegroundService : Service() {
         lastVideoTxElapsedMs = now
         lastRealVideoFrameElapsedMs = now
 
-        // Log every SPS+PPS+IDR keyframe, the first 6 packets, and every 15th Slice to the Video Tab (0x0002)
-        val shouldLogToVideoTab = isBundledKeyFrame || pktIndex <= 6L || (pktIndex % 15L == 0L)
-        if (shouldLogToVideoTab) {
-            val nalLabel = when {
-                isBundledKeyFrame && hasSpsPpsPrefix -> "SPS+PPS+IDR KeyFrame #$pktIndex"
-                isBundledKeyFrame -> "IDR KeyFrame #$pktIndex (NAL=5)"
-                else -> "H.264 Slice #$pktIndex"
+        val logPacketsInUi = BridgeTelemetryBus.runtimeState.value.logPacketsInUi
+        if (logPacketsInUi) {
+            // Log every SPS+PPS+IDR keyframe, the first 6 packets, and every 15th Slice to the Video Tab (0x0002)
+            val shouldLogToVideoTab = isBundledKeyFrame || pktIndex <= 6L || (pktIndex % 15L == 0L)
+            if (shouldLogToVideoTab) {
+                val nalLabel = when {
+                    isBundledKeyFrame && hasSpsPpsPrefix -> "SPS+PPS+IDR KeyFrame #$pktIndex"
+                    isBundledKeyFrame -> "IDR KeyFrame #$pktIndex (NAL=5)"
+                    else -> "H.264 Slice #$pktIndex"
+                }
+                val hdrMode = if (CarLifeFrameCodec.useNestedVideoMsgHeader) "Режим 1: AOA 20B" else "Режим 2: Direct 12B"
+                BridgeTelemetryBus.recordFrame(
+                    direction = "TX (S26U -> HU)",
+                    frame = videoFrame,
+                    rxBytesTotal = usbTransport.rxBytes,
+                    txBytesTotal = usbTransport.txBytes,
+                    rxFramesTotal = usbTransport.rxFrames,
+                    txFramesTotal = usbTransport.txFrames,
+                    protocolNote = "TX H.264 Video (0x0002 $hdrMode) $nalLabel (${annexB4Frame.size}B, ts=${timestampMs}ms)",
+                    serviceNameOverride = nalLabel
+                )
+            } else {
+                BridgeTelemetryBus.recordVideoFrameCountersOnly(
+                    rxBytesTotal = usbTransport.rxBytes,
+                    txBytesTotal = usbTransport.txBytes,
+                    rxFramesTotal = usbTransport.rxFrames,
+                    txFramesTotal = usbTransport.txFrames
+                )
             }
-            val hdrMode = if (CarLifeFrameCodec.useNestedVideoMsgHeader) "Режим 1: AOA 20B" else "Режим 2: Direct 12B"
-            BridgeTelemetryBus.recordFrame(
-                direction = "TX (S26U -> HU)",
-                frame = videoFrame,
-                rxBytesTotal = usbTransport.rxBytes,
-                txBytesTotal = usbTransport.txBytes,
-                rxFramesTotal = usbTransport.rxFrames,
-                txFramesTotal = usbTransport.txFrames,
-                protocolNote = "TX H.264 Video (0x0002 $hdrMode) $nalLabel (${annexB4Frame.size}B, ts=${timestampMs}ms)",
-                serviceNameOverride = nalLabel
-            )
-        } else {
+        } else if (isBundledKeyFrame || pktIndex % 15L == 0L) {
             BridgeTelemetryBus.recordVideoFrameCountersOnly(
                 rxBytesTotal = usbTransport.rxBytes,
                 txBytesTotal = usbTransport.txBytes,
@@ -561,7 +645,8 @@ class BridgeForegroundService : Service() {
             height = targetH,
             frameRate = targetFps,
             bitRate = activeBitrateBps,
-            sourceMode = activeVideoSourceMode
+            sourceMode = activeVideoSourceMode,
+            targetAppMode = activeAppMode
         )
 
         if (sendAudioInitIfNeeded && (!hasSentAudioInitInSession || forceAudioInitForSession)) {
@@ -639,7 +724,8 @@ class BridgeForegroundService : Service() {
                 height = 720,
                 frameRate = 30,
                 bitRate = 2_000_000,
-                sourceMode = activeVideoSourceMode
+                sourceMode = activeVideoSourceMode,
+                targetAppMode = activeAppMode
             )
             if (usbTransport.state.value is UsbTransportState.Connected) {
                 sendAudioMultiplexerInitPackets()
@@ -653,8 +739,10 @@ class BridgeForegroundService : Service() {
         acquireWakeLock()
 
         // Default Jetta VS7 Mode 1: AOA 20B (8B AOA [00 00 00 02][len+12] + 12B video header [len][ts][00 02 00 01])
-        val currentNestedMode = BridgeTelemetryBus.runtimeState.value.useNestedVideoMsgHeader
-        activeVideoSourceMode = BridgeTelemetryBus.runtimeState.value.videoSourceMode
+        val initialRuntime = BridgeTelemetryBus.runtimeState.value
+        val currentNestedMode = initialRuntime.useNestedVideoMsgHeader
+        activeAppMode = initialRuntime.appMode
+        activeVideoSourceMode = initialRuntime.videoSourceMode
         CarLifeFrameCodec.useNestedVideoMsgHeader = currentNestedMode
         isVideoChannelReadyForStreaming = false
 
@@ -713,6 +801,7 @@ class BridgeForegroundService : Service() {
             },
             externalScope = serviceScope
         )
+        projectionManager.appMode = activeAppMode
         projectionManager.videoSourceMode = activeVideoSourceMode
         projectionManager.setVideoChannelReady(false)
 
@@ -722,34 +811,43 @@ class BridgeForegroundService : Service() {
                 if (usbTransport.state.value !is UsbTransportState.Connected) {
                     return@CarLifeAudioCaptureManager false
                 }
-                // Uses usbTransport.sendFrameImmediate which acquires the shared USB writeMutex + usbWriteLock,
-                // guaranteeing atomic, non-interleaved writes with video channel 0x0002.
                 val sent = usbTransport.sendFrameImmediate(audioFrame)
                 if (sent) {
-                    val parsed = audioFrame.parseCommandMessageOrNull()
-                    val svcName = parsed?.serviceName ?: "MEDIA_AUDIO"
                     val audioIdx = audioPacketCounter.incrementAndGet()
-                    val shouldLog = isControlMsg || audioIdx <= 3L || (audioIdx % 100L == 0L)
-                    if (shouldLog) {
-                        val bodyLen = parsed?.body?.size ?: (audioFrame.payload.size - 12).coerceAtLeast(0)
-                        BridgeTelemetryBus.recordFrame(
-                            direction = "TX (S26U -> HU)",
-                            frame = audioFrame,
-                            rxBytesTotal = usbTransport.rxBytes,
-                            txBytesTotal = usbTransport.txBytes,
-                            rxFramesTotal = usbTransport.rxFrames,
-                            txFramesTotal = usbTransport.txFrames,
-                            protocolNote = when (parsed?.serviceType) {
-                                CarLifeMsgType.MSG_MEDIA_INIT ->
-                                    "Audio 0x0003 INIT: 48000 Hz, Stereo (2ch), 16-bit PCM (AOA 20B)"
-                                CarLifeMsgType.MSG_MEDIA_STOP ->
-                                    "Audio 0x0003 STOP: MSG_MEDIA_STOP (0x00030002)"
-                                else ->
-                                    "Audio 0x0003 PCM #$audioIdx (${bodyLen}B, ts=${audioFrame.header.timestamp}s)"
-                            },
-                            serviceNameOverride = svcName
-                        )
-                    } else {
+                    val logPacketsInUi = BridgeTelemetryBus.runtimeState.value.logPacketsInUi
+                    if (logPacketsInUi) {
+                        val parsed = audioFrame.parseCommandMessageOrNull()
+                        val svcName = parsed?.serviceName ?: "MEDIA_AUDIO"
+                        val shouldLog = isControlMsg || audioIdx <= 3L || (audioIdx % 100L == 0L)
+                        if (shouldLog) {
+                            val bodyLen = parsed?.body?.size ?: (audioFrame.payload.size - 12).coerceAtLeast(0)
+                            BridgeTelemetryBus.recordFrame(
+                                direction = "TX (S26U -> HU)",
+                                frame = audioFrame,
+                                rxBytesTotal = usbTransport.rxBytes,
+                                txBytesTotal = usbTransport.txBytes,
+                                rxFramesTotal = usbTransport.rxFrames,
+                                txFramesTotal = usbTransport.txFrames,
+                                protocolNote = when (parsed?.serviceType) {
+                                    CarLifeMsgType.MSG_MEDIA_INIT ->
+                                        "Audio 0x0003 INIT: 48000 Hz, Stereo (2ch), 16-bit PCM (AOA 20B)"
+                                    CarLifeMsgType.MSG_MEDIA_STOP ->
+                                        "Audio 0x0003 STOP: MSG_MEDIA_STOP (0x00030002)"
+                                    else ->
+                                        "Audio 0x0003 PCM #$audioIdx (${bodyLen}B, ts=${audioFrame.header.timestamp}s)"
+                                },
+                                serviceNameOverride = svcName
+                            )
+                        } else {
+                            BridgeTelemetryBus.recordFrameCountersOnly(
+                                channel = CarLifeChannel.MEDIA_AUDIO,
+                                rxBytesTotal = usbTransport.rxBytes,
+                                txBytesTotal = usbTransport.txBytes,
+                                rxFramesTotal = usbTransport.rxFrames,
+                                txFramesTotal = usbTransport.txFrames
+                            )
+                        }
+                    } else if (isControlMsg || audioIdx % 25L == 0L) {
                         BridgeTelemetryBus.recordFrameCountersOnly(
                             channel = CarLifeChannel.MEDIA_AUDIO,
                             rxBytesTotal = usbTransport.rxBytes,
@@ -763,6 +861,7 @@ class BridgeForegroundService : Service() {
             },
             externalScope = serviceScope
         )
+        audioCaptureManager.setMutePhoneSpeakerEnabled(initialRuntime.mutePhoneSpeakerDuringUsbAudio)
 
         BridgeTelemetryBus.updateState {
             it.copy(
@@ -770,15 +869,16 @@ class BridgeForegroundService : Service() {
                 wakeLockHeld = wakeLock?.isHeld == true,
                 isVideoChannelReadyForStreaming = false,
                 useNestedVideoMsgHeader = currentNestedMode,
+                appMode = activeAppMode,
                 videoSourceMode = activeVideoSourceMode,
                 configuredWidth = activeWidth,
                 configuredHeight = activeHeight,
                 configuredBitrateBps = activeBitrateBps,
-                lastProtocolEvent = "BridgeForegroundService active (${activeWidth}×${activeHeight} @ ${activeBitrateBps / 1000}kbps CBR 30fps, ${activeVideoSourceMode.title}; Awaiting 0x00018001)"
+                lastProtocolEvent = "BridgeForegroundService active (${activeWidth}×${activeHeight} @ ${activeBitrateBps / 1000}kbps CBR 30fps, ${activeAppMode.title}; Awaiting 0x00018001)"
             )
         }
 
-        // Immediately start selected Video Source (Canvas Test Card by default or VirtualDisplay) + H.264 MediaCodec
+        // Immediately start selected Video Source + H.264 MediaCodec
         // while keeping 0x0002 streaming locked until USB AOA handshake completes.
         serviceScope.launch {
             projectionManager.startProjection(
@@ -786,7 +886,8 @@ class BridgeForegroundService : Service() {
                 height = activeHeight,
                 frameRate = 30,
                 bitRate = activeBitrateBps,
-                sourceMode = activeVideoSourceMode
+                sourceMode = activeVideoSourceMode,
+                targetAppMode = activeAppMode
             )
         }
 
@@ -863,6 +964,7 @@ class BridgeForegroundService : Service() {
                         resetVideoLogFlags()
                         audioPacketCounter.set(0L)
                         audioCaptureManager.stopCapture(sendMediaStop = false)
+                        audioCaptureManager.restorePhoneSpeakerVolume()
                         if (newState is UsbTransportState.Disconnected || newState is UsbTransportState.Connecting) {
                             controlStateMachine.reset()
                             controlStateMachine.setPreferredResolution(activeWidth, activeHeight)
@@ -975,7 +1077,8 @@ class BridgeForegroundService : Service() {
                             height = targetH,
                             frameRate = targetFps,
                             bitRate = activeBitrateBps,
-                            sourceMode = activeVideoSourceMode
+                            sourceMode = activeVideoSourceMode,
+                            targetAppMode = activeAppMode
                         )
                         if (effectiveReady || isVideoChannelReadyForStreaming || hasSentMdInfoInSession) {
                             setVideoStreamingReady(true)
@@ -1022,7 +1125,8 @@ class BridgeForegroundService : Service() {
                             height = height,
                             frameRate = 30,
                             bitRate = bitrate,
-                            sourceMode = activeVideoSourceMode
+                            sourceMode = activeVideoSourceMode,
+                            targetAppMode = activeAppMode
                         )
                         if (wasReady && usbTransport.state.value is UsbTransportState.Connected) {
                             triggerAutoVideoEncoderStart(
@@ -1068,12 +1172,64 @@ class BridgeForegroundService : Service() {
                         height = height,
                         frameRate = fps,
                         bitRate = bitrate,
-                        sourceMode = activeVideoSourceMode
+                        sourceMode = activeVideoSourceMode,
+                        targetAppMode = activeAppMode
                     )
                     if (effectiveReadyBeforeStart || isVideoChannelReadyForStreaming || hasSentMdInfoInSession) {
                         setVideoStreamingReady(true)
                         projectionManager.unlockVideoChannelAndRequestSyncFrame()
                     }
+                }
+            }
+
+            ACTION_SET_APP_MODE -> {
+                val mode = AppMode.fromId(intent.getStringExtra(EXTRA_APP_MODE))
+                activeAppMode = mode
+                val targetSource = if (mode == AppMode.MIRRORING) {
+                    VideoSourceMode.SCREEN_MIRRORING
+                } else {
+                    VideoSourceMode.VIRTUAL_DISPLAY
+                }
+                val targetLaunch = if (mode == AppMode.MIRRORING) {
+                    AppLaunchMode.SCREEN_MIRRORING
+                } else {
+                    AppLaunchMode.VIRTUAL_DISPLAY_IF_AVAILABLE
+                }
+                activeVideoSourceMode = targetSource
+                projectionManager.appMode = mode
+                projectionManager.videoSourceMode = targetSource
+                projectionManager.setAppLaunchMode(targetLaunch)
+                BridgeTelemetryBus.setAppMode(mode)
+                serviceScope.launch {
+                    val wasReady = isVideoChannelReadyForStreaming
+                    resetVideoLogFlags()
+                    projectionManager.stopVideoSourceForModeSwitch()
+                    projectionManager.setVideoChannelReady(wasReady)
+                    projectionManager.startProjection(
+                        width = activeWidth,
+                        height = activeHeight,
+                        frameRate = 30,
+                        bitRate = activeBitrateBps,
+                        sourceMode = targetSource,
+                        targetAppMode = mode
+                    )
+                    if (wasReady && usbTransport.state.value is UsbTransportState.Connected) {
+                        setVideoStreamingReady(true)
+                        projectionManager.unlockVideoChannelAndRequestSyncFrame()
+                    }
+                }
+            }
+
+            ACTION_SET_LOG_PACKETS_IN_UI -> {
+                val enabled = intent.getBooleanExtra(EXTRA_LOG_PACKETS_IN_UI, false)
+                BridgeTelemetryBus.setLogPacketsInUi(enabled)
+            }
+
+            ACTION_SET_MUTE_PHONE_SPEAKER -> {
+                val enabled = intent.getBooleanExtra(EXTRA_MUTE_PHONE_SPEAKER, true)
+                BridgeTelemetryBus.setMutePhoneSpeakerDuringUsbAudio(enabled)
+                if (::audioCaptureManager.isInitialized) {
+                    audioCaptureManager.setMutePhoneSpeakerEnabled(enabled)
                 }
             }
 
@@ -1092,7 +1248,8 @@ class BridgeForegroundService : Service() {
                             height = activeHeight,
                             frameRate = 30,
                             bitRate = activeBitrateBps,
-                            sourceMode = activeVideoSourceMode
+                            sourceMode = activeVideoSourceMode,
+                            targetAppMode = activeAppMode
                         )
                     }
                 }
@@ -1203,7 +1360,14 @@ class BridgeForegroundService : Service() {
 
             ACTION_SET_VIDEO_SOURCE_MODE -> {
                 val mode = VideoSourceMode.fromId(intent.getStringExtra(EXTRA_VIDEO_SOURCE_MODE))
+                val mappedAppMode = if (mode == VideoSourceMode.SCREEN_MIRRORING) {
+                    AppMode.MIRRORING
+                } else {
+                    AppMode.COCKPIT
+                }
+                activeAppMode = mappedAppMode
                 activeVideoSourceMode = mode
+                projectionManager.appMode = mappedAppMode
                 projectionManager.videoSourceMode = mode
                 BridgeTelemetryBus.setVideoSourceMode(mode)
                 serviceScope.launch {
@@ -1215,7 +1379,8 @@ class BridgeForegroundService : Service() {
                         height = activeHeight,
                         frameRate = 30,
                         bitRate = activeBitrateBps,
-                        sourceMode = mode
+                        sourceMode = mode,
+                        targetAppMode = mappedAppMode
                     )
                     if (wasReady && usbTransport.state.value is UsbTransportState.Connected) {
                         setVideoStreamingReady(true)
@@ -1259,6 +1424,7 @@ class BridgeForegroundService : Service() {
                     audioCaptureManager.stopCapture(
                         sendMediaStop = usbTransport.state.value is UsbTransportState.Connected
                     )
+                    audioCaptureManager.restorePhoneSpeakerVolume()
                     projectionManager.stopProjection()
                     usbTransport.closeSession("Stopped by user")
                     releaseWakeLock()
@@ -1278,14 +1444,17 @@ class BridgeForegroundService : Service() {
         val wasConnected = ::usbTransport.isInitialized && usbTransport.state.value is UsbTransportState.Connected
         runCatching {
             kotlinx.coroutines.runBlocking(Dispatchers.IO) {
-                if (::audioCaptureManager.isInitialized) {
-                    audioCaptureManager.stopCapture(sendMediaStop = wasConnected)
-                }
-                if (::projectionManager.isInitialized) {
-                    projectionManager.stopProjection()
-                }
-                if (::usbTransport.isInitialized) {
-                    usbTransport.shutdown()
+                kotlinx.coroutines.withTimeoutOrNull(1_500L) {
+                    if (::audioCaptureManager.isInitialized) {
+                        audioCaptureManager.stopCapture(sendMediaStop = wasConnected)
+                        audioCaptureManager.restorePhoneSpeakerVolume()
+                    }
+                    if (::projectionManager.isInitialized) {
+                        projectionManager.stopProjection()
+                    }
+                    if (::usbTransport.isInitialized) {
+                        usbTransport.shutdown()
+                    }
                 }
             }
         }
@@ -1417,7 +1586,8 @@ class BridgeForegroundService : Service() {
                             height = targetH,
                             frameRate = 30,
                             bitRate = activeBitrateBps,
-                            sourceMode = activeVideoSourceMode
+                            sourceMode = activeVideoSourceMode,
+                            targetAppMode = activeAppMode
                         )
                         if (!isVideoChannelReadyForStreaming) {
                             resetVideoLogFlags()
@@ -1440,7 +1610,8 @@ class BridgeForegroundService : Service() {
                             height = targetH,
                             frameRate = 30,
                             bitRate = activeBitrateBps,
-                            sourceMode = activeVideoSourceMode
+                            sourceMode = activeVideoSourceMode,
+                            targetAppMode = activeAppMode
                         )
                         if (!isVideoChannelReadyForStreaming) {
                             resetVideoLogFlags()
@@ -1534,7 +1705,11 @@ class BridgeForegroundService : Service() {
 
                 val eventSummary = when (decodedEvent) {
                     is CarLifeInputEvent.Touch ->
-                        "Touch ${decodedEvent.type.label}: HU(${decodedEvent.rawX},${decodedEvent.rawY}) -> VirtualDisplay(${decodedEvent.scaledX.toInt()},${decodedEvent.scaledY.toInt()})"
+                        if (activeAppMode == AppMode.MIRRORING) {
+                            "Touch ${decodedEvent.type.label}: HU(${decodedEvent.rawX},${decodedEvent.rawY}) -> Mirroring (AccessibilityService)"
+                        } else {
+                            "Touch ${decodedEvent.type.label}: HU(${decodedEvent.rawX},${decodedEvent.rawY}) -> Cockpit VD(${decodedEvent.scaledX.toInt()},${decodedEvent.scaledY.toInt()})"
+                        }
                     is CarLifeInputEvent.HardKey ->
                         "HardKey: ${decodedEvent.mappedKey?.label ?: "0x${decodedEvent.rawKeyCode.toString(16)}"} (Android KeyCode=${decodedEvent.androidKeyCode})"
                     null -> "Raw Touch Frame (${frame.payload.size}B)"
@@ -1741,6 +1916,9 @@ class BridgeForegroundService : Service() {
         const val ACTION_SEND_VERSION_MATCH = "com.example.core.usb.action.SEND_VERSION_MATCH"
         const val ACTION_SEND_VIDEO_HEARTBEAT = "com.example.core.usb.action.SEND_VIDEO_HEARTBEAT"
         const val ACTION_TOGGLE_VIDEO_HEADER_MODE = "com.example.core.usb.action.TOGGLE_VIDEO_HEADER_MODE"
+        const val ACTION_SET_APP_MODE = "com.example.core.usb.action.SET_APP_MODE"
+        const val ACTION_SET_LOG_PACKETS_IN_UI = "com.example.core.usb.action.SET_LOG_PACKETS_IN_UI"
+        const val ACTION_SET_MUTE_PHONE_SPEAKER = "com.example.core.usb.action.SET_MUTE_PHONE_SPEAKER"
         const val ACTION_SET_VIDEO_SOURCE_MODE = "com.example.core.usb.action.SET_VIDEO_SOURCE_MODE"
         const val ACTION_SET_APP_LAUNCH_MODE = "com.example.core.usb.action.SET_APP_LAUNCH_MODE"
         const val ACTION_SET_HANDSHAKE_PROFILE = "com.example.core.usb.action.SET_HANDSHAKE_PROFILE"
@@ -1759,6 +1937,9 @@ class BridgeForegroundService : Service() {
         const val EXTRA_TOUCH_X = "extra_touch_x"
         const val EXTRA_TOUCH_Y = "extra_touch_y"
         const val EXTRA_USE_NESTED_VIDEO_HEADER = "extra_use_nested_video_header"
+        const val EXTRA_APP_MODE = "extra_app_mode"
+        const val EXTRA_LOG_PACKETS_IN_UI = "extra_log_packets_in_ui"
+        const val EXTRA_MUTE_PHONE_SPEAKER = "extra_mute_phone_speaker"
         const val EXTRA_VIDEO_SOURCE_MODE = "extra_video_source_mode"
         const val EXTRA_APP_LAUNCH_MODE = "extra_app_launch_mode"
         const val EXTRA_HANDSHAKE_PROFILE_ID = "extra_handshake_profile_id"
