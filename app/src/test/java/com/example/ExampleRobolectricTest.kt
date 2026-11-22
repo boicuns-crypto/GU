@@ -293,6 +293,8 @@ class ExampleRobolectricTest {
     assertEquals(1280, fmt.getInteger(MediaFormat.KEY_WIDTH))
     assertEquals(720, fmt.getInteger(MediaFormat.KEY_HEIGHT))
     assertEquals(30, fmt.getInteger(MediaFormat.KEY_FRAME_RATE))
+    assertEquals(30f, fmt.getFloat(MediaFormat.KEY_MAX_FPS_TO_ENCODER), 0.001f)
+    assertEquals(30, fmt.getInteger(MediaFormat.KEY_CAPTURE_RATE))
     assertEquals(2_000_000, fmt.getInteger(MediaFormat.KEY_BIT_RATE))
     assertEquals(1, fmt.getInteger(MediaFormat.KEY_I_FRAME_INTERVAL))
     assertEquals(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR, fmt.getInteger(MediaFormat.KEY_BITRATE_MODE))

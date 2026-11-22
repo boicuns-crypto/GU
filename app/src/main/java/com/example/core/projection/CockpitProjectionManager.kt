@@ -1894,7 +1894,8 @@ class CockpitProjectionManager(
                     targetLevel = null,
                     includeVbr = false,
                     includeVendorTimingKeys = false,
-                    includeSamsungQpMax = false
+                    includeSamsungQpMax = false,
+                    includeFpsLimitKeys = false
                 )
             )
         }
@@ -2180,8 +2181,10 @@ class CockpitProjectionManager(
         const val SAMSUNG_QP_P_MAX_VALUE = 36
 
         /**
-         * Builds the preferred H.264 [MediaFormat] matching `MediaFormatUtils.smali`:
+         * Builds the preferred H.264 [MediaFormat] matching `MediaFormatUtils.smali` with strict
+         * 30 FPS input capping for 120 Hz Samsung displays:
          * `1280×720`, VBR (`BITRATE_MODE_VBR = 1`), `AVCProfileBaseline (1)`, `AVCLevel3 (0x100)`,
+         * `KEY_FRAME_RATE = 30`, `KEY_MAX_FPS_TO_ENCODER = 30f`, `KEY_CAPTURE_RATE = 30`,
          * `KEY_I_FRAME_INTERVAL = 1`, `KEY_REPEAT_PREVIOUS_FRAME_AFTER = 100_000L`,
          * `KEY_PRIORITY = 0` (realtime), and Samsung `video-qp-p-max = 36`.
          */
@@ -2194,7 +2197,8 @@ class CockpitProjectionManager(
             targetLevel: Int? = MediaCodecInfo.CodecProfileLevel.AVCLevel3,
             includeVbr: Boolean = true,
             includeVendorTimingKeys: Boolean = true,
-            includeSamsungQpMax: Boolean = true
+            includeSamsungQpMax: Boolean = true,
+            includeFpsLimitKeys: Boolean = true
         ): MediaFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
             setInteger(
                 MediaFormat.KEY_COLOR_FORMAT,
@@ -2202,6 +2206,12 @@ class CockpitProjectionManager(
             )
             setInteger(MediaFormat.KEY_BIT_RATE, bitRate)
             setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
+            if (includeFpsLimitKeys) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    setFloat(MediaFormat.KEY_MAX_FPS_TO_ENCODER, frameRate.toFloat())
+                }
+                setInteger(MediaFormat.KEY_CAPTURE_RATE, frameRate)
+            }
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
             if (includeBaselineProfile) {
                 setInteger(

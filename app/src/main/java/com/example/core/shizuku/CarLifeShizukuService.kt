@@ -152,7 +152,7 @@ class CarLifeShizukuService : ICarLifeShizukuService.Stub {
         }
     }
 
-    @SuppressLint("PrivateApi", "DiscouragedPrivateApi")
+    @SuppressLint("PrivateApi", "DiscouragedPrivateApi", "BlockedPrivateApi")
     companion object {
         private const val TAG = "CarLifeShizukuSvc"
         private const val INJECT_INPUT_EVENT_MODE_ASYNC = 0
