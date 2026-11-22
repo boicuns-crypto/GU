@@ -9,13 +9,17 @@ import android.media.AudioManager
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.os.Bundle
+import android.view.KeyEvent
 import android.view.MotionEvent
 import androidx.test.core.app.ApplicationProvider
 import com.example.core.audio.CarLifeAudioCaptureManager
+import com.example.core.carlife.CarLifeHardKeyPacket
 import com.example.core.carlife.CarLifeTouchPacket
 import com.example.core.projection.AppMode
 import com.example.core.projection.CockpitProjectionManager
 import com.example.core.projection.VideoSourceMode
+import com.example.core.shizuku.CarLifeShizukuManager
+import com.example.core.shizuku.ICarLifeShizukuService
 import com.example.core.usb.BridgeForegroundService
 import com.example.core.usb.BridgeTelemetryBus
 import com.example.feature.cockpit.AppLaunchMode
@@ -366,5 +370,169 @@ class ExampleRobolectricTest {
 
     kotlinx.coroutines.runBlocking { manager.stopProjection() }
   }
+
+  @Test
+  fun `shizuku cockpit mode routes app launches, scaled touches with preserved downTime, and hardkeys via ICarLifeShizukuService`() {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+
+    data class RecordedLaunch(val pkg: String, val activity: String, val displayId: Int)
+    data class RecordedTouch(
+      val action: Int,
+      val x: Float,
+      val y: Float,
+      val downTime: Long,
+      val eventTime: Long,
+      val displayId: Int
+    )
+    data class RecordedKey(val keyCode: Int, val displayId: Int)
+
+    val launches = mutableListOf<RecordedLaunch>()
+    val touches = mutableListOf<RecordedTouch>()
+    val keys = mutableListOf<RecordedKey>()
+    var hiddenCallbackDisplayId: Int? = null
+
+    val fakeStub = object : ICarLifeShizukuService.Stub() {
+      override fun launchAppOnDisplay(packageName: String, activityName: String, displayId: Int) {
+        launches.add(RecordedLaunch(packageName, activityName, displayId))
+      }
+
+      override fun injectTouch(
+        action: Int,
+        x: Float,
+        y: Float,
+        downTime: Long,
+        eventTime: Long,
+        displayId: Int
+      ) {
+        touches.add(RecordedTouch(action, x, y, downTime, eventTime, displayId))
+      }
+
+      override fun sendKeyEvent(keyCode: Int, displayId: Int) {
+        keys.add(RecordedKey(keyCode, displayId))
+      }
+
+      override fun destroy() = Unit
+    }
+
+    try {
+      CarLifeShizukuManager.setServiceForTesting(fakeStub)
+      assertEquals("Работает", CarLifeShizukuManager.status.value.statusLabel)
+
+      // 1. Launcher click routes to Shizuku launchAppOnDisplay + notifies hide callback
+      val previousCallback = CarLifeLauncherRepository.onShizukuAppLaunchedOnVirtualDisplay
+      CarLifeLauncherRepository.onShizukuAppLaunchedOnVirtualDisplay = { hiddenCallbackDisplayId = it }
+      CarLifeLauncherRepository.setAppLaunchMode(AppLaunchMode.SHIZUKU_VIRTUAL_DISPLAY)
+      val appInfo = InstalledAppInfo(
+        label = "2GIS",
+        packageName = "ru.dublgis.dgismobile",
+        activityName = "ru.dublgis.dgismobile.MainActivity",
+        iconBitmap = null
+      )
+      val launched = CarLifeLauncherRepository.launchAppOnVirtualDisplay(
+        context = context,
+        app = appInfo,
+        targetDisplayId = 7
+      )
+      CarLifeLauncherRepository.onShizukuAppLaunchedOnVirtualDisplay = previousCallback
+      assertTrue(launched)
+      assertEquals(1, launches.size)
+      assertEquals(RecordedLaunch("ru.dublgis.dgismobile", "ru.dublgis.dgismobile.MainActivity", 7), launches[0])
+      assertEquals(7, hiddenCallbackDisplayId)
+      assertTrue(CarLifeLauncherRepository.lastLaunchStatus.value.contains("VirtualDisplay #7"))
+
+      // 2. Touch routing in SHIZUKU_COCKPIT preserves downTime from DOWN through MOVE and UP
+      val manager = CockpitProjectionManager(
+        context = context,
+        onEncodedVideoNal = { _, _, _ -> }
+      )
+      manager.appMode = AppMode.SHIZUKU_COCKPIT
+
+      var touchStatusAfterInject = ""
+      var hardKeyStatusAfterInject = ""
+      kotlinx.coroutines.runBlocking {
+        manager.injectTouchPacket(
+          CarLifeTouchPacket(
+            androidAction = MotionEvent.ACTION_DOWN,
+            rawX = 320,
+            rawY = 180,
+            huWidth = 1280,
+            huHeight = 720,
+            synthesizeClickUp = false
+          )
+        )
+        manager.injectTouchPacket(
+          CarLifeTouchPacket(
+            androidAction = MotionEvent.ACTION_MOVE,
+            rawX = 640,
+            rawY = 360,
+            huWidth = 1280,
+            huHeight = 720,
+            synthesizeClickUp = false
+          )
+        )
+        manager.injectTouchPacket(
+          CarLifeTouchPacket(
+            androidAction = MotionEvent.ACTION_UP,
+            rawX = 640,
+            rawY = 360,
+            huWidth = 1280,
+            huHeight = 720,
+            synthesizeClickUp = false
+          )
+        )
+        touchStatusAfterInject = manager.stats.value.statusMessage
+
+        manager.injectHardKeyPacket(
+          CarLifeHardKeyPacket(carLifeKeyCode = 0x0E, androidKeyCode = KeyEvent.KEYCODE_BACK)
+        )
+        manager.injectHardKeyPacket(
+          CarLifeHardKeyPacket(carLifeKeyCode = 0x0C, androidKeyCode = KeyEvent.KEYCODE_HOME)
+        )
+        hardKeyStatusAfterInject = manager.stats.value.statusMessage
+        manager.stopProjection()
+      }
+
+      assertEquals(3, touches.size)
+      assertEquals(MotionEvent.ACTION_DOWN, touches[0].action)
+      assertEquals(320f, touches[0].x, 0.5f)
+      assertEquals(180f, touches[0].y, 0.5f)
+      assertEquals(MotionEvent.ACTION_MOVE, touches[1].action)
+      assertEquals(640f, touches[1].x, 0.5f)
+      assertEquals(360f, touches[1].y, 0.5f)
+      assertEquals(MotionEvent.ACTION_UP, touches[2].action)
+      assertEquals(touches[0].downTime, touches[1].downTime)
+      assertEquals(touches[0].downTime, touches[2].downTime)
+      assertTrue(
+        "Expected Shizuku Touch status, got: $touchStatusAfterInject",
+        touchStatusAfterInject.startsWith("Shizuku Touch")
+      )
+
+      assertEquals(2, keys.size)
+      assertEquals(KeyEvent.KEYCODE_BACK, keys[0].keyCode)
+      assertEquals(KeyEvent.KEYCODE_HOME, keys[1].keyCode)
+      assertTrue(
+        "Expected Shizuku HardKey status, got: $hardKeyStatusAfterInject",
+        hardKeyStatusAfterInject.startsWith("Shizuku HardKey")
+      )
+
+      // 3. BridgeForegroundService mode switching supports SHIZUKU_COCKPIT
+      val svcController = Robolectric.buildService(BridgeForegroundService::class.java).create()
+      val svc = svcController.get()
+      val switchShizukuIntent = Intent(context, BridgeForegroundService::class.java).apply {
+        action = BridgeForegroundService.ACTION_SET_APP_MODE
+        putExtra(BridgeForegroundService.EXTRA_APP_MODE, AppMode.SHIZUKU_COCKPIT.id)
+      }
+      svc.onStartCommand(switchShizukuIntent, 0, 1)
+      assertEquals(AppMode.SHIZUKU_COCKPIT, BridgeTelemetryBus.runtimeState.value.appMode)
+      assertEquals(VideoSourceMode.VIRTUAL_DISPLAY, BridgeTelemetryBus.runtimeState.value.videoSourceMode)
+      assertEquals(AppLaunchMode.SHIZUKU_VIRTUAL_DISPLAY, BridgeTelemetryBus.runtimeState.value.appLaunchMode)
+      svcController.destroy()
+    } finally {
+      CarLifeShizukuManager.resetForTesting()
+      CarLifeLauncherRepository.setAppLaunchMode(AppLaunchMode.VIRTUAL_DISPLAY_IF_AVAILABLE)
+      BridgeTelemetryBus.setAppMode(AppMode.MIRRORING)
+    }
+  }
 }
+
 

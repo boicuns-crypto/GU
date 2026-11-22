@@ -116,11 +116,13 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import android.view.KeyEvent
 import android.view.WindowManager
 import com.example.core.input.CarLifeAccessibilityService
 import com.example.core.projection.AppMode
 import com.example.core.projection.MediaProjectionTokenStore
 import com.example.core.projection.VideoSourceMode
+import com.example.core.shizuku.CarLifeShizukuManager
 import com.example.core.usb.BridgeForegroundService
 import com.example.core.usb.BridgeRuntimeState
 import com.example.core.usb.BridgeTelemetryBus
@@ -206,6 +208,7 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        CarLifeShizukuManager.init(this)
         MediaControllerRepository.initialize(this)
         handleUsbAccessoryIntent(intent)
 
@@ -264,6 +267,13 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         MediaControllerRepository.refreshSessions()
+        val snapshot = CarLifeShizukuManager.refreshStatus(this)
+        if (BridgeTelemetryBus.runtimeState.value.appMode == AppMode.SHIZUKU_COCKPIT &&
+            snapshot.isBinderAlive &&
+            snapshot.hasPermission
+        ) {
+            CarLifeShizukuManager.bindUserServiceIfReady(this)
+        }
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -661,10 +671,24 @@ fun CarLifeBridgeApp(
                             MediaControllerRepository.openNotificationListenerSettings(context)
                         },
                         onHomePressed = {
-                            CarLifeAccessibilityService.instance?.performHomeAction()
+                            if (runtimeState.appMode == AppMode.SHIZUKU_COCKPIT) {
+                                CarLifeShizukuManager.sendKeyEventAsync(
+                                    KeyEvent.KEYCODE_HOME,
+                                    runtimeState.projectionStats.virtualDisplayId
+                                )
+                            } else {
+                                CarLifeAccessibilityService.instance?.performHomeAction()
+                            }
                         },
                         onBackPressed = {
-                            CarLifeAccessibilityService.instance?.performBackAction()
+                            if (runtimeState.appMode == AppMode.SHIZUKU_COCKPIT) {
+                                CarLifeShizukuManager.sendKeyEventAsync(
+                                    KeyEvent.KEYCODE_BACK,
+                                    runtimeState.projectionStats.virtualDisplayId
+                                )
+                            } else {
+                                CarLifeAccessibilityService.instance?.performBackAction()
+                            }
                         },
                         modifier = Modifier.fillMaxSize()
                     )
@@ -1404,20 +1428,44 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
         contentPadding = PaddingValues(16.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
-        // 0. Главный переключатель режима работы: «Кокпит (Виртуальный экран)» vs «Зеркалирование (Экран телефона)»
+        // 0. Главный переключатель режима работы: 3 независимых режима
         item {
             val activeAppMode = state.appMode
+            val shizukuStatus by CarLifeShizukuManager.status.collectAsStateWithLifecycle()
+
+            LaunchedEffect(activeAppMode) {
+                CarLifeShizukuManager.refreshStatus(context)
+                if (activeAppMode == AppMode.SHIZUKU_COCKPIT) {
+                    CarLifeShizukuManager.bindUserServiceIfReady(context)
+                }
+            }
+
             fun selectAppMode(mode: AppMode) {
                 BridgeTelemetryBus.setAppMode(mode)
+                when (mode) {
+                    AppMode.SHIZUKU_COCKPIT -> {
+                        CarLifeShizukuManager.init(context)
+                        CarLifeShizukuManager.bindUserServiceIfReady(context)
+                        if (!MediaProjectionTokenStore.hasValidToken.value) {
+                            onRequestMediaProjection()
+                        }
+                    }
+                    AppMode.MIRRORING -> {
+                        CarLifeShizukuManager.unbindUserService(context)
+                        if (!MediaProjectionTokenStore.hasValidToken.value) {
+                            onRequestMediaProjection()
+                        }
+                    }
+                    AppMode.COCKPIT -> {
+                        CarLifeShizukuManager.unbindUserService(context)
+                    }
+                }
                 if (state.isServiceRunning) {
                     val intent = Intent(context, BridgeForegroundService::class.java).apply {
                         action = BridgeForegroundService.ACTION_SET_APP_MODE
                         putExtra(BridgeForegroundService.EXTRA_APP_MODE, mode.id)
                     }
                     safeStartService(context, intent)
-                }
-                if (mode == AppMode.MIRRORING && !MediaProjectionTokenStore.hasValidToken.value) {
-                    onRequestMediaProjection()
                 }
             }
 
@@ -1448,7 +1496,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                             )
                             Spacer(modifier = Modifier.height(2.dp))
                             Text(
-                                text = "Независимые видеопоток и маршрутизация тача (0x0006)",
+                                text = "3 независимых режима: видеопоток + маршрутизация тача (0x0006)",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = TextSecondary
                             )
@@ -1460,7 +1508,11 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                             border = BorderStroke(1.dp, ElectricCyan.copy(alpha = 0.65f))
                         ) {
                             Text(
-                                text = if (activeAppMode == AppMode.COCKPIT) "КОКПИТ VD" else "ЗЕРКАЛО",
+                                text = when (activeAppMode) {
+                                    AppMode.COCKPIT -> "КОКПИТ VD"
+                                    AppMode.MIRRORING -> "ЗЕРКАЛО"
+                                    AppMode.SHIZUKU_COCKPIT -> "SHIZUKU VD"
+                                },
                                 style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
                                 color = ElectricCyan,
                                 softWrap = false,
@@ -1474,48 +1526,139 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                         val isSelected = activeAppMode == mode
                         val rowBg = if (isSelected) ElectricCyan.copy(alpha = 0.12f) else ObsidianBackground
                         val rowBorder = if (isSelected) ElectricCyan else ObsidianBorder
-                        val tag = if (mode == AppMode.COCKPIT) "app_mode_cockpit_btn" else "app_mode_mirroring_btn"
-                        Row(
+                        val tag = when (mode) {
+                            AppMode.COCKPIT -> "app_mode_cockpit_btn"
+                            AppMode.MIRRORING -> "app_mode_mirroring_btn"
+                            AppMode.SHIZUKU_COCKPIT -> "app_mode_shizuku_cockpit_btn"
+                        }
+                        Column(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .heightIn(min = 48.dp)
                                 .clip(RoundedCornerShape(12.dp))
                                 .background(rowBg)
                                 .border(1.dp, rowBorder, RoundedCornerShape(12.dp))
-                                .selectable(
-                                    selected = isSelected,
-                                    onClick = { selectAppMode(mode) },
-                                    role = Role.RadioButton
-                                )
-                                .padding(horizontal = 12.dp, vertical = 10.dp)
-                                .testTag(tag),
-                            verticalAlignment = Alignment.CenterVertically
+                                .testTag(tag)
                         ) {
-                            RadioButton(
-                                selected = isSelected,
-                                onClick = null,
-                                colors = RadioButtonDefaults.colors(
-                                    selectedColor = ElectricCyan,
-                                    unselectedColor = TextMuted
-                                )
-                            )
-                            Spacer(modifier = Modifier.width(10.dp))
-                            Column(
-                                modifier = Modifier.weight(1f),
-                                verticalArrangement = Arrangement.spacedBy(2.dp)
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .heightIn(min = 48.dp)
+                                    .selectable(
+                                        selected = isSelected,
+                                        onClick = { selectAppMode(mode) },
+                                        role = Role.RadioButton
+                                    )
+                                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Text(
-                                    text = mode.title,
-                                    style = MaterialTheme.typography.labelLarge.copy(
-                                        fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Medium
-                                    ),
-                                    color = if (isSelected) ElectricCyan else TextPrimary
+                                RadioButton(
+                                    selected = isSelected,
+                                    onClick = null,
+                                    colors = RadioButtonDefaults.colors(
+                                        selectedColor = ElectricCyan,
+                                        unselectedColor = TextMuted
+                                    )
                                 )
-                                Text(
-                                    text = mode.subtitle,
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = TextSecondary
-                                )
+                                Spacer(modifier = Modifier.width(10.dp))
+                                Column(
+                                    modifier = Modifier.weight(1f),
+                                    verticalArrangement = Arrangement.spacedBy(2.dp)
+                                ) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(
+                                            text = mode.title,
+                                            style = MaterialTheme.typography.labelLarge.copy(
+                                                fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Medium
+                                            ),
+                                            color = if (isSelected) ElectricCyan else TextPrimary,
+                                            modifier = Modifier.weight(1f)
+                                        )
+                                        if (mode == AppMode.SHIZUKU_COCKPIT) {
+                                            Spacer(modifier = Modifier.width(6.dp))
+                                            val shizukuOk = shizukuStatus.isBinderAlive && shizukuStatus.hasPermission
+                                            Surface(
+                                                color = if (shizukuOk) SuccessBadgeBg else WarningBadgeBg,
+                                                shape = RoundedCornerShape(6.dp)
+                                            ) {
+                                                Text(
+                                                    text = shizukuStatus.statusLabel,
+                                                    style = MaterialTheme.typography.labelSmall.copy(
+                                                        fontWeight = FontWeight.SemiBold
+                                                    ),
+                                                    color = if (shizukuOk) SuccessBadgeFg else WarningBadgeFg,
+                                                    softWrap = false,
+                                                    maxLines = 1,
+                                                    modifier = Modifier
+                                                        .padding(horizontal = 8.dp, vertical = 3.dp)
+                                                        .testTag("shizuku_status_badge")
+                                                )
+                                            }
+                                        }
+                                    }
+                                    Text(
+                                        text = mode.subtitle,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = TextSecondary
+                                    )
+                                }
+                            }
+
+                            if (mode == AppMode.SHIZUKU_COCKPIT) {
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(start = 12.dp, end = 12.dp, bottom = 12.dp),
+                                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    Text(
+                                        text = "Статус Shizuku: ${shizukuStatus.statusLabel} • ${shizukuStatus.detailMessage}",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = if (shizukuStatus.hasPermission && shizukuStatus.isBinderAlive) {
+                                            TelemetryEmerald
+                                        } else {
+                                            AmberSignal
+                                        },
+                                        modifier = Modifier.testTag("shizuku_status_detail")
+                                    )
+                                    FilledTonalButton(
+                                        onClick = {
+                                            CarLifeShizukuManager.requestPermission(context)
+                                        },
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .heightIn(min = 48.dp)
+                                            .testTag("request_shizuku_permission_btn"),
+                                        shape = RoundedCornerShape(10.dp),
+                                        colors = ButtonDefaults.filledTonalButtonColors(
+                                            containerColor = if (shizukuStatus.hasPermission && shizukuStatus.isBinderAlive) {
+                                                SuccessBadgeBg
+                                            } else {
+                                                ElectricCyan.copy(alpha = 0.2f)
+                                            },
+                                            contentColor = if (shizukuStatus.hasPermission && shizukuStatus.isBinderAlive) {
+                                                SuccessBadgeFg
+                                            } else {
+                                                ElectricCyan
+                                            }
+                                        )
+                                    ) {
+                                        Text(
+                                            text = when {
+                                                shizukuStatus.isBinderAlive && shizukuStatus.hasPermission && shizukuStatus.isUserServiceBound ->
+                                                    "Shizuku подключён (Обновить)"
+                                                shizukuStatus.isBinderAlive && shizukuStatus.hasPermission ->
+                                                    "Подключить Shizuku UserService"
+                                                else ->
+                                                    "Запросить права Shizuku"
+                                            },
+                                            fontWeight = FontWeight.SemiBold
+                                        )
+                                    }
+                                }
                             }
                         }
                     }
@@ -2197,7 +2340,11 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                             border = BorderStroke(1.dp, ElectricCyan.copy(alpha = 0.65f))
                         ) {
                             Text(
-                                text = if (activeLaunchMode == AppLaunchMode.VIRTUAL_DISPLAY_IF_AVAILABLE) "VD" else "MIRROR",
+                                text = when (activeLaunchMode) {
+                                    AppLaunchMode.VIRTUAL_DISPLAY_IF_AVAILABLE -> "VD"
+                                    AppLaunchMode.SCREEN_MIRRORING -> "MIRROR"
+                                    AppLaunchMode.SHIZUKU_VIRTUAL_DISPLAY -> "SHIZUKU"
+                                },
                                 style = MaterialTheme.typography.labelSmall.copy(
                                     fontWeight = FontWeight.SemiBold
                                 ),
@@ -2221,10 +2368,10 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                         } else {
                             ObsidianBorder
                         }
-                        val tag = if (mode == AppLaunchMode.VIRTUAL_DISPLAY_IF_AVAILABLE) {
-                            "launch_mode_vd_btn"
-                        } else {
-                            "launch_mode_mirror_btn"
+                        val tag = when (mode) {
+                            AppLaunchMode.VIRTUAL_DISPLAY_IF_AVAILABLE -> "launch_mode_vd_btn"
+                            AppLaunchMode.SCREEN_MIRRORING -> "launch_mode_mirror_btn"
+                            AppLaunchMode.SHIZUKU_VIRTUAL_DISPLAY -> "launch_mode_shizuku_btn"
                         }
                         Row(
                             modifier = Modifier

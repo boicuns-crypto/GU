@@ -65,6 +65,7 @@ import androidx.savedstate.setViewTreeSavedStateRegistryOwner
 import com.example.core.carlife.CarLifeHardKeyPacket
 import com.example.core.carlife.CarLifeTouchPacket
 import com.example.core.input.CarLifeAccessibilityService
+import com.example.core.shizuku.CarLifeShizukuManager
 import com.example.feature.cockpit.AppLaunchMode
 import com.example.feature.cockpit.CarLifeAppLauncherScreen
 import com.example.feature.cockpit.CarLifeLauncherRepository
@@ -134,6 +135,7 @@ object MediaProjectionTokenStore {
  * Главный режим работы приложения:
  * - [COCKPIT]: Виртуальный экран (`VirtualDisplay` + `CockpitPresentation`), тач `0x0006` идёт строго в `decorView.dispatchTouchEvent`.
  * - [MIRRORING]: Зеркалирование экрана телефона (`MediaProjection` без `Presentation`), тач `0x0006` идёт строго через `CarLifeAccessibilityService`.
+ * - [SHIZUKU_COCKPIT]: Второй экран (`VirtualDisplay` 1280×720@30fps VBR 160 dpi) с запуском любых приложений через Shizuku (`am start --display`) и тачем через `InputManager`.
  */
 enum class AppMode(
     val id: String,
@@ -142,13 +144,18 @@ enum class AppMode(
 ) {
     COCKPIT(
         id = "cockpit",
-        title = "Кокпит (Виртуальный экран)",
+        title = "Кокпит (Стандартный)",
         subtitle = "Лаунчер ГУ на VirtualDisplay (Presentation). Тач 0x0006 идёт строго в Presentation.decorView без AccessibilityService."
     ),
     MIRRORING(
         id = "mirroring",
         title = "Зеркалирование (Экран телефона)",
         subtitle = "Прямой захват экрана смартфона (MediaProjection, 1280×720@30fps). Тач 0x0006 идёт строго через CarLifeAccessibilityService."
+    ),
+    SHIZUKU_COCKPIT(
+        id = "shizuku_cockpit",
+        title = "Кокпит + Shizuku (Второй экран)",
+        subtitle = "VirtualDisplay (1280×720@30fps, 160 dpi) + запуск 2ГИС/Навигатора/YouTube через Shizuku (--display) и прямой тач через InputManager."
     );
 
     companion object {
@@ -243,6 +250,7 @@ class CockpitProjectionManager(
     private var virtualDisplayHeight: Int = 0
     private var virtualDisplayDpi: Int = 0
     private var virtualDisplayIsMirrorOnly: Boolean = false
+    private var virtualDisplayFlags: Int = 0
     private var cockpitPresentation: CockpitPresentation? = null
     private var encoderDrainJob: Job? = null
     private var canvasFeederJob: Job? = null
@@ -266,6 +274,13 @@ class CockpitProjectionManager(
                 mainHandler.post {
                     runCatching { cockpitPresentation?.dismiss() }
                     cockpitPresentation = null
+                }
+            }
+        }
+        CarLifeLauncherRepository.onShizukuAppLaunchedOnVirtualDisplay = {
+            if (appMode == AppMode.SHIZUKU_COCKPIT) {
+                mainHandler.post {
+                    runCatching { cockpitPresentation?.hide() }
                 }
             }
         }
@@ -416,7 +431,8 @@ class CockpitProjectionManager(
         sourceMode: VideoSourceMode = this.videoSourceMode,
         targetAppMode: AppMode = when (sourceMode) {
             VideoSourceMode.SCREEN_MIRRORING -> AppMode.MIRRORING
-            VideoSourceMode.VIRTUAL_DISPLAY, VideoSourceMode.CANVAS_TEST_CARD -> AppMode.COCKPIT
+            VideoSourceMode.VIRTUAL_DISPLAY, VideoSourceMode.CANVAS_TEST_CARD ->
+                if (appMode == AppMode.SHIZUKU_COCKPIT) AppMode.SHIZUKU_COCKPIT else AppMode.COCKPIT
         }
     ): Boolean = projectionMutex.withLock {
         val modeChanged = appMode != targetAppMode || videoSourceMode != sourceMode
@@ -425,7 +441,7 @@ class CockpitProjectionManager(
 
         if (modeChanged) {
             // Stop previous video source (encoder, canvas feeder, presentation, old VirtualDisplay)
-            // cleanly when switching between COCKPIT and MIRRORING while keeping MediaProjection token intact.
+            // cleanly when switching modes while keeping MediaProjection token intact.
             stopVideoSourceLocked(stopMediaProjection = false, updateStatus = false)
         } else {
             stopEncoderOnlyLocked()
@@ -435,7 +451,7 @@ class CockpitProjectionManager(
         val safeHeight = if (height in 272..2160) height else 720
         val safeFps = if (frameRate in 15..60) frameRate else 30
         val safeBitRate = bitRate.coerceIn(400_000, 12_000_000)
-        // Use 160 dpi for VirtualDisplay Cockpit and 180 dpi (inside 160–200) for MediaProjection Mirroring
+        // Use 160 dpi for VirtualDisplay Cockpit / Shizuku and 180 dpi (inside 160–200) for MediaProjection Mirroring
         // so Android SurfaceFlinger does not render excessive QHD+ pixels from S26 Ultra.
         val effectiveDpi = if (targetAppMode == AppMode.MIRRORING || sourceMode == VideoSourceMode.SCREEN_MIRRORING) {
             densityDpi.coerceIn(160, 200).let { if (it == FIXED_VIRTUAL_DISPLAY_DPI) MIRROR_VIRTUAL_DISPLAY_DPI else it }
@@ -459,6 +475,7 @@ class CockpitProjectionManager(
             virtualDisplayHeight = 0
             virtualDisplayDpi = 0
             virtualDisplayIsMirrorOnly = false
+            virtualDisplayFlags = 0
         } else if (targetAppMode == AppMode.MIRRORING || sourceMode == VideoSourceMode.SCREEN_MIRRORING) {
             // Screen Mirroring mode: Strictly DO NOT show Presentation so the real smartphone screen goes directly into inputSurface.
             dismissPresentationSafely()
@@ -467,6 +484,17 @@ class CockpitProjectionManager(
         val usesMediaProjectionSource =
             sourceMode == VideoSourceMode.SCREEN_MIRRORING || sourceMode == VideoSourceMode.VIRTUAL_DISPLAY
         val wantMirrorOnlyFlags = targetAppMode == AppMode.MIRRORING || sourceMode == VideoSourceMode.SCREEN_MIRRORING
+        val targetVdFlags = when {
+            wantMirrorOnlyFlags -> DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR
+            targetAppMode == AppMode.SHIZUKU_COCKPIT ->
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or
+                    DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION or
+                    DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY
+            else ->
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR or
+                    DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or
+                    DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION
+        }
 
         var codec: MediaCodec? = null
         var inputSurface: Surface? = null
@@ -519,9 +547,10 @@ class CockpitProjectionManager(
                         virtualDisplayWidth == safeWidth &&
                             virtualDisplayHeight == safeHeight &&
                             virtualDisplayDpi == effectiveDpi &&
-                            virtualDisplayIsMirrorOnly == wantMirrorOnlyFlags
+                            virtualDisplayIsMirrorOnly == wantMirrorOnlyFlags &&
+                            virtualDisplayFlags == targetVdFlags
                     if (exactConfigMatches) {
-                        // Reuse VirtualDisplay ONLY when exact (width, height, 160 dpi, flags) already match — zero intermediate resize.
+                        // Reuse VirtualDisplay ONLY when exact (width, height, dpi, flags) already match — zero intermediate resize.
                         runCatching {
                             vDisplay!!.surface = inputSurface
                         }.onFailure { e ->
@@ -532,6 +561,7 @@ class CockpitProjectionManager(
                             virtualDisplayHeight = 0
                             virtualDisplayDpi = 0
                             virtualDisplayIsMirrorOnly = false
+                            virtualDisplayFlags = 0
                             usedMediaProjection = false
                         }
                     } else {
@@ -544,6 +574,7 @@ class CockpitProjectionManager(
                         virtualDisplayHeight = 0
                         virtualDisplayDpi = 0
                         virtualDisplayIsMirrorOnly = false
+                        virtualDisplayFlags = 0
                         usedMediaProjection = false
                     }
                 }
@@ -568,29 +599,41 @@ class CockpitProjectionManager(
                                 }
                                 activeMp = mp
 
-                                val vdFlags = if (wantMirrorOnlyFlags) {
-                                    // Direct screen mirroring onto MediaCodec inputSurface (no Presentation overlay)
-                                    DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR
-                                } else {
-                                    DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR or
-                                        DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or
-                                        DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION
+                                var createdFlags = targetVdFlags
+                                vDisplay = runCatching {
+                                    mp.createVirtualDisplay(
+                                        VIRTUAL_DISPLAY_NAME,
+                                        safeWidth,
+                                        safeHeight,
+                                        effectiveDpi,
+                                        createdFlags,
+                                        inputSurface,
+                                        null,
+                                        mainHandler
+                                    )
+                                }.getOrElse {
+                                    if (targetAppMode == AppMode.SHIZUKU_COCKPIT) {
+                                        createdFlags = DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or
+                                            DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION
+                                        mp.createVirtualDisplay(
+                                            VIRTUAL_DISPLAY_NAME,
+                                            safeWidth,
+                                            safeHeight,
+                                            effectiveDpi,
+                                            createdFlags,
+                                            inputSurface,
+                                            null,
+                                            mainHandler
+                                        )
+                                    } else {
+                                        throw it
+                                    }
                                 }
-
-                                vDisplay = mp.createVirtualDisplay(
-                                    VIRTUAL_DISPLAY_NAME,
-                                    safeWidth,
-                                    safeHeight,
-                                    effectiveDpi,
-                                    vdFlags,
-                                    inputSurface,
-                                    null,
-                                    mainHandler
-                                )
                                 virtualDisplayWidth = safeWidth
                                 virtualDisplayHeight = safeHeight
                                 virtualDisplayDpi = effectiveDpi
                                 virtualDisplayIsMirrorOnly = wantMirrorOnlyFlags
+                                virtualDisplayFlags = createdFlags
                                 usedMediaProjection = true
                             }
                         }.onFailure { e ->
@@ -668,15 +711,21 @@ class CockpitProjectionManager(
                             fps = safeFps,
                             bitRateMbps = (safeBitRate / 1_000_000).coerceAtLeast(1),
                             bitRateKbps = safeBitRate / 1_000,
-                            activeCockpitWidget = if (wantMirrorOnlyFlags) {
-                                "Зеркалирование экрана активно ($safeWidth×$safeHeight @ ${safeFps}fps, ${effectiveDpi}dpi)"
-                            } else {
-                                "Кокпит активен на VD #${createdDisplay.displayId} ($safeWidth×$safeHeight)"
+                            activeCockpitWidget = when {
+                                wantMirrorOnlyFlags ->
+                                    "Зеркалирование экрана активно ($safeWidth×$safeHeight @ ${safeFps}fps, ${effectiveDpi}dpi)"
+                                targetAppMode == AppMode.SHIZUKU_COCKPIT ->
+                                    "Shizuku Второй экран на VD #${createdDisplay.displayId} ($safeWidth×$safeHeight @ ${effectiveDpi}dpi)"
+                                else ->
+                                    "Кокпит активен на VD #${createdDisplay.displayId} ($safeWidth×$safeHeight)"
                             },
-                            statusMessage = if (wantMirrorOnlyFlags) {
-                                "Зеркалирование экрана (MediaProjection): $safeWidth×$safeHeight @ ${safeBitRate / 1000} кбит/с, ${safeFps}fps, ${effectiveDpi}dpi"
-                            } else {
-                                "Кокпит (VD #${createdDisplay.displayId}): $safeWidth×$safeHeight @ ${safeBitRate / 1000} кбит/с, ${effectiveDpi}dpi"
+                            statusMessage = when {
+                                wantMirrorOnlyFlags ->
+                                    "Зеркалирование экрана (MediaProjection): $safeWidth×$safeHeight @ ${safeBitRate / 1000} кбит/с, ${safeFps}fps, ${effectiveDpi}dpi"
+                                targetAppMode == AppMode.SHIZUKU_COCKPIT ->
+                                    "Кокпит + Shizuku (VD #${createdDisplay.displayId}): $safeWidth×$safeHeight @ ${safeBitRate / 1000} кбит/с, ${safeFps}fps, ${effectiveDpi}dpi"
+                                else ->
+                                    "Кокпит (VD #${createdDisplay.displayId}): $safeWidth×$safeHeight @ ${safeBitRate / 1000} кбит/с, ${effectiveDpi}dpi"
                             }
                         )
                     }
@@ -1349,6 +1398,8 @@ class CockpitProjectionManager(
      * Isolated channel `0x0006` (`MSG_TOUCH_ACTION`) routing:
      * - **[AppMode.MIRRORING]:** dispatches **STRICTLY** through [CarLifeAccessibilityService] (`dispatchGesture`),
      *   mapping Head Unit `(1280×720)` coordinates into real smartphone screen bounds (`WindowManager.currentWindowMetrics.bounds`).
+     * - **[AppMode.SHIZUKU_COCKPIT]:** scales `(1280×720)`, preserves `lastDownTime` from `ACTION_DOWN` to `ACTION_UP`,
+     *   and forwards directly to [CarLifeShizukuManager.injectTouch] (`ICarLifeShizukuService`) with `virtualDisplayId`.
      * - **[AppMode.COCKPIT]:** dispatches **STRICTLY** into `presentation.window.decorView.dispatchTouchEvent(event)`
      *   with `lastDownTime` preserved from `ACTION_DOWN` to `ACTION_UP` and `1280×720` scaling. NEVER invokes
      *   [CarLifeAccessibilityService] in Cockpit mode.
@@ -1395,6 +1446,75 @@ class CockpitProjectionManager(
                     )
                 }
                 return@withContext a11yDispatched
+            }
+
+            if (appMode == AppMode.SHIZUKU_COCKPIT) {
+                val vDisplayId = virtualDisplay?.display?.displayId ?: currentStats.virtualDisplayId
+                val targetWidth = currentStats.width.coerceAtLeast(1)
+                val targetHeight = currentStats.height.coerceAtLeast(1)
+                val (scaledX, scaledY) = CarLifeTouchDecoder.scaleTouchCoordinates(
+                    rawX = packet.rawX,
+                    rawY = packet.rawY,
+                    currentSurfaceWidth = targetWidth,
+                    currentSurfaceHeight = targetHeight,
+                    huTouchMaxX = huTouchMaxX,
+                    huTouchMaxY = huTouchMaxY
+                )
+
+                val nowUptime = SystemClock.uptimeMillis()
+                val downTime = when (packet.androidAction) {
+                    MotionEvent.ACTION_DOWN -> {
+                        lastDownTime.set(nowUptime)
+                        nowUptime
+                    }
+                    MotionEvent.ACTION_MOVE,
+                    MotionEvent.ACTION_UP,
+                    MotionEvent.ACTION_CANCEL -> {
+                        val saved = lastDownTime.get()
+                        if (saved > 0L) saved else nowUptime
+                    }
+                    else -> {
+                        val saved = lastDownTime.get()
+                        if (saved > 0L) saved else nowUptime
+                    }
+                }
+                val eventTime = maxOf(downTime, nowUptime)
+
+                var shizukuDispatched = CarLifeShizukuManager.injectTouch(
+                    action = packet.androidAction,
+                    x = scaledX,
+                    y = scaledY,
+                    downTime = downTime,
+                    eventTime = eventTime,
+                    displayId = vDisplayId
+                )
+                if (shizukuDispatched && packet.synthesizeClickUp) {
+                    val upTime = maxOf(downTime + 16L, SystemClock.uptimeMillis())
+                    CarLifeShizukuManager.injectTouch(
+                        action = MotionEvent.ACTION_UP,
+                        x = scaledX,
+                        y = scaledY,
+                        downTime = downTime,
+                        eventTime = upTime,
+                        displayId = vDisplayId
+                    )
+                }
+
+                val statusLabel = if (shizukuDispatched) {
+                    "Shizuku Touch (${scaledX.toInt()}, ${scaledY.toInt()}) -> VD #$vDisplayId"
+                } else {
+                    "Touch 0x0006 получен, но Shizuku UserService (${CarLifeShizukuManager.status.value.statusLabel})"
+                }
+
+                _stats.update {
+                    it.copy(
+                        injectedTouches = it.injectedTouches + 1L,
+                        lastTouchPoint = scaledX to scaledY,
+                        activeCockpitWidget = statusLabel,
+                        statusMessage = statusLabel
+                    )
+                }
+                return@withContext shizukuDispatched
             }
 
             // AppMode.COCKPIT: Strictly dispatch to presentation.window.decorView.dispatchTouchEvent(event)
@@ -1529,7 +1649,7 @@ class CockpitProjectionManager(
                 KeyEvent.KEYCODE_MEDIA_PREVIOUS -> MediaControllerRepository.skipPrevious()
                 KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> MediaControllerRepository.togglePlayPause()
                 KeyEvent.KEYCODE_HOME -> {
-                    if (appMode == AppMode.COCKPIT) {
+                    if (appMode == AppMode.COCKPIT || appMode == AppMode.SHIZUKU_COCKPIT) {
                         runCatching { cockpitPresentation?.show() }
                     }
                 }
@@ -1541,6 +1661,14 @@ class CockpitProjectionManager(
                     it.copy(statusMessage = "Mirror HardKey -> KeyCode=${packet.androidKeyCode}")
                 }
                 return@withContext a11yHandled
+            }
+            if (appMode == AppMode.SHIZUKU_COCKPIT) {
+                val vDisplayId = virtualDisplay?.display?.displayId ?: _stats.value.virtualDisplayId
+                val sent = CarLifeShizukuManager.sendKeyEvent(packet.androidKeyCode, vDisplayId)
+                _stats.update {
+                    it.copy(statusMessage = "Shizuku HardKey -> KeyCode=${packet.androidKeyCode} (VD #$vDisplayId)")
+                }
+                return@withContext sent
             }
             val decorView = cockpitPresentation?.window?.decorView ?: return@withContext false
             val now = SystemClock.uptimeMillis()
@@ -1613,6 +1741,7 @@ class CockpitProjectionManager(
         virtualDisplayHeight = 0
         virtualDisplayDpi = 0
         virtualDisplayIsMirrorOnly = false
+        virtualDisplayFlags = 0
 
         if (stopMediaProjection) {
             runCatching {
@@ -2241,9 +2370,20 @@ private fun ProjectedCarLifeLauncherContainer(
             onNextTrack = { MediaControllerRepository.skipNext() },
             onPreviousTrack = { MediaControllerRepository.skipPrevious() },
             onRequestNotificationAccess = {},
-            onHomePressed = onBringLauncherToFront,
+            onHomePressed = {
+                if (stats.appMode == AppMode.SHIZUKU_COCKPIT) {
+                    CarLifeShizukuManager.sendKeyEventAsync(KeyEvent.KEYCODE_HOME, virtualDisplayId)
+                }
+                onBringLauncherToFront()
+            },
             onBackPressed = {
-                CarLifeAccessibilityService.instance?.performBackAction()
+                when (stats.appMode) {
+                    AppMode.SHIZUKU_COCKPIT ->
+                        CarLifeShizukuManager.sendKeyEventAsync(KeyEvent.KEYCODE_BACK, virtualDisplayId)
+                    AppMode.MIRRORING ->
+                        CarLifeAccessibilityService.instance?.performBackAction()
+                    AppMode.COCKPIT -> Unit
+                }
             }
         )
 

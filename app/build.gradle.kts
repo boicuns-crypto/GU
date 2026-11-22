@@ -63,8 +63,19 @@ android {
   buildFeatures {
     compose = true
     buildConfig = true
+    aidl = true
   }
-  testOptions { unitTests { isIncludeAndroidResources = true } }
+  testOptions {
+    unitTests {
+      isIncludeAndroidResources = true
+      all {
+        it.systemProperty(
+          "robolectric.dependency.repo.url",
+          "https://maven-central.storage-download.googleapis.com/maven2"
+        )
+      }
+    }
+  }
   packaging {
     dex {
       useLegacyPackaging = true
@@ -130,6 +141,8 @@ dependencies {
   // implementation(libs.firebase.appcheck.debug)
   implementation(libs.kotlinx.coroutines.android)
   implementation(libs.kotlinx.coroutines.core)
+  implementation("dev.rikka.shizuku:api:13.1.5")
+  implementation("dev.rikka.shizuku:provider:13.1.5")
   // implementation(libs.logging.interceptor)
   // implementation(libs.moshi.kotlin)
   // implementation(libs.okhttp)

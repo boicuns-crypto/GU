@@ -10,3 +10,9 @@
 -keep class * extends android.content.BroadcastReceiver { *; }
 -keep class * extends android.content.ContentProvider { *; }
 -keep class * extends android.view.View { *; }
+-keep class rikka.shizuku.** { *; }
+-keep class moe.shizuku.** { *; }
+-keep interface com.example.core.shizuku.ICarLifeShizukuService { *; }
+-keep class com.example.core.shizuku.ICarLifeShizukuService$Stub { *; }
+-keep class com.example.core.shizuku.CarLifeShizukuService { *; }
+

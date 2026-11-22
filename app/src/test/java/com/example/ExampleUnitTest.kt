@@ -1205,6 +1205,25 @@ class ExampleUnitTest {
         assertEquals(listOf(1L, 14L, 15L, 16L, 17L), videoTs)
         assertEquals(null, queue.pollNonBlocking())
     }
+
+    @Test
+    fun shizukuCockpitMode_titlesIdsAndTelemetryMapping_verifySpec() {
+        assertEquals("Кокпит (Стандартный)", AppMode.COCKPIT.title)
+        assertEquals("Зеркалирование (Экран телефона)", AppMode.MIRRORING.title)
+        assertEquals("Кокпит + Shizuku (Второй экран)", AppMode.SHIZUKU_COCKPIT.title)
+        assertEquals(AppMode.SHIZUKU_COCKPIT, AppMode.fromId("shizuku_cockpit"))
+        assertEquals(AppLaunchMode.SHIZUKU_VIRTUAL_DISPLAY, AppLaunchMode.fromId("shizuku_virtual_display"))
+
+        BridgeTelemetryBus.setAppMode(AppMode.SHIZUKU_COCKPIT)
+        assertEquals(AppMode.SHIZUKU_COCKPIT, BridgeTelemetryBus.runtimeState.value.appMode)
+        assertEquals(VideoSourceMode.VIRTUAL_DISPLAY, BridgeTelemetryBus.runtimeState.value.videoSourceMode)
+        assertEquals(AppLaunchMode.SHIZUKU_VIRTUAL_DISPLAY, BridgeTelemetryBus.runtimeState.value.appLaunchMode)
+
+        BridgeTelemetryBus.setAppMode(AppMode.MIRRORING)
+        assertEquals(AppMode.MIRRORING, BridgeTelemetryBus.runtimeState.value.appMode)
+        assertEquals(VideoSourceMode.SCREEN_MIRRORING, BridgeTelemetryBus.runtimeState.value.videoSourceMode)
+        assertEquals(AppLaunchMode.SCREEN_MIRRORING, BridgeTelemetryBus.runtimeState.value.appLaunchMode)
+    }
 }
 
 

@@ -77,6 +77,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.core.input.CarLifeAccessibilityService
+import com.example.core.shizuku.CarLifeShizukuManager
 import com.example.ui.theme.CockpitIcons
 import com.example.ui.theme.ElectricCyan
 import com.example.ui.theme.ObsidianBackground
@@ -128,6 +129,11 @@ enum class AppLaunchMode(
         id = "screen_mirroring",
         title = "Зеркалирование экрана (MediaProjection)",
         subtitle = "Запуск приложений сразу на основном экране телефона без ActivityOptions для зеркалирования через MediaProjection."
+    ),
+    SHIZUKU_VIRTUAL_DISPLAY(
+        id = "shizuku_virtual_display",
+        title = "Через Shizuku на VirtualDisplay",
+        subtitle = "Запуск через Shizuku UserService (am start --display <id>) на второй экран в обход ограничений Android 16."
     );
 
     companion object {
@@ -172,6 +178,9 @@ object CarLifeLauncherRepository {
 
     @Volatile
     var onFallbackToPhoneScreen: (() -> Unit)? = null
+
+    @Volatile
+    var onShizukuAppLaunchedOnVirtualDisplay: ((Int) -> Unit)? = null
 
     fun setAppLaunchMode(mode: AppLaunchMode) {
         _appLaunchMode.value = mode
@@ -332,6 +341,34 @@ object CarLifeLauncherRepository {
         }
 
         val currentMode = _appLaunchMode.value
+        if (currentMode == AppLaunchMode.SHIZUKU_VIRTUAL_DISPLAY) {
+            if (targetDisplayId == Display.DEFAULT_DISPLAY) {
+                val msg = "VirtualDisplay #0 не готов для Shizuku — разрешите MediaProjection («Весь экран»)"
+                Log.w(TAG, msg)
+                _lastLaunchStatus.value = msg
+                showLaunchToast(context, msg)
+                return false
+            }
+            val launched = CarLifeShizukuManager.launchAppOnDisplay(
+                packageName = app.packageName,
+                activityName = app.activityName,
+                displayId = targetDisplayId
+            )
+            if (launched) {
+                _lastLaunchStatus.value =
+                    "Shizuku: ${app.label} (${app.packageName}) -> VirtualDisplay #$targetDisplayId"
+                onShizukuAppLaunchedOnVirtualDisplay?.invoke(targetDisplayId)
+                return true
+            } else {
+                val shizukuLabel = CarLifeShizukuManager.status.value.statusLabel
+                val errMsg = "Shizuku ($shizukuLabel): не удалось запустить ${app.label} на VD #$targetDisplayId"
+                Log.w(TAG, errMsg)
+                _lastLaunchStatus.value = errMsg
+                showLaunchToast(context, errMsg)
+                return false
+            }
+        }
+
         val shouldTryVirtualDisplay =
             currentMode == AppLaunchMode.VIRTUAL_DISPLAY_IF_AVAILABLE &&
                 Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&

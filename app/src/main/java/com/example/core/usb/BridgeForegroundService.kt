@@ -30,6 +30,7 @@ import com.example.core.projection.CockpitProjectionManager
 import com.example.core.projection.MediaProjectionTokenStore
 import com.example.core.projection.ProjectionPipelineStats
 import com.example.core.projection.VideoSourceMode
+import com.example.core.shizuku.CarLifeShizukuManager
 import com.example.feature.cockpit.AppLaunchMode
 import com.example.feature.cockpit.CarLifeLauncherRepository
 import com.example.protocol.carlife.CarLifeChannel
@@ -154,15 +155,14 @@ object BridgeTelemetryBus {
     }
 
     fun setAppMode(mode: AppMode) {
-        val mappedSource = if (mode == AppMode.MIRRORING) {
-            VideoSourceMode.SCREEN_MIRRORING
-        } else {
-            VideoSourceMode.VIRTUAL_DISPLAY
+        val mappedSource = when (mode) {
+            AppMode.MIRRORING -> VideoSourceMode.SCREEN_MIRRORING
+            AppMode.COCKPIT, AppMode.SHIZUKU_COCKPIT -> VideoSourceMode.VIRTUAL_DISPLAY
         }
-        val mappedLaunch = if (mode == AppMode.MIRRORING) {
-            AppLaunchMode.SCREEN_MIRRORING
-        } else {
-            AppLaunchMode.VIRTUAL_DISPLAY_IF_AVAILABLE
+        val mappedLaunch = when (mode) {
+            AppMode.MIRRORING -> AppLaunchMode.SCREEN_MIRRORING
+            AppMode.COCKPIT -> AppLaunchMode.VIRTUAL_DISPLAY_IF_AVAILABLE
+            AppMode.SHIZUKU_COCKPIT -> AppLaunchMode.SHIZUKU_VIRTUAL_DISPLAY
         }
         CarLifeLauncherRepository.setAppLaunchMode(mappedLaunch)
         _runtimeState.update {
@@ -203,10 +203,10 @@ object BridgeTelemetryBus {
     }
 
     fun setVideoSourceMode(mode: VideoSourceMode) {
-        val mappedAppMode = if (mode == VideoSourceMode.SCREEN_MIRRORING) {
-            AppMode.MIRRORING
-        } else {
-            AppMode.COCKPIT
+        val mappedAppMode = when {
+            mode == VideoSourceMode.SCREEN_MIRRORING -> AppMode.MIRRORING
+            _runtimeState.value.appMode == AppMode.SHIZUKU_COCKPIT -> AppMode.SHIZUKU_COCKPIT
+            else -> AppMode.COCKPIT
         }
         _runtimeState.update {
             it.copy(
@@ -745,6 +745,11 @@ class BridgeForegroundService : Service() {
         CarLifeFrameCodec.useNestedVideoMsgHeader = currentNestedMode
         isVideoChannelReadyForStreaming = false
 
+        CarLifeShizukuManager.init(applicationContext)
+        if (activeAppMode == AppMode.SHIZUKU_COCKPIT) {
+            CarLifeShizukuManager.bindUserServiceIfReady(applicationContext)
+        }
+
         usbTransport = UsbAccessoryTransport(
             context = applicationContext,
             ioDispatcher = Dispatchers.IO,
@@ -1183,22 +1188,30 @@ class BridgeForegroundService : Service() {
 
             ACTION_SET_APP_MODE -> {
                 val mode = AppMode.fromId(intent.getStringExtra(EXTRA_APP_MODE))
+                val previousMode = activeAppMode
                 activeAppMode = mode
-                val targetSource = if (mode == AppMode.MIRRORING) {
-                    VideoSourceMode.SCREEN_MIRRORING
-                } else {
-                    VideoSourceMode.VIRTUAL_DISPLAY
+                val targetSource = when (mode) {
+                    AppMode.MIRRORING -> VideoSourceMode.SCREEN_MIRRORING
+                    AppMode.COCKPIT, AppMode.SHIZUKU_COCKPIT -> VideoSourceMode.VIRTUAL_DISPLAY
                 }
-                val targetLaunch = if (mode == AppMode.MIRRORING) {
-                    AppLaunchMode.SCREEN_MIRRORING
-                } else {
-                    AppLaunchMode.VIRTUAL_DISPLAY_IF_AVAILABLE
+                val targetLaunch = when (mode) {
+                    AppMode.MIRRORING -> AppLaunchMode.SCREEN_MIRRORING
+                    AppMode.COCKPIT -> AppLaunchMode.VIRTUAL_DISPLAY_IF_AVAILABLE
+                    AppMode.SHIZUKU_COCKPIT -> AppLaunchMode.SHIZUKU_VIRTUAL_DISPLAY
                 }
                 activeVideoSourceMode = targetSource
                 projectionManager.appMode = mode
                 projectionManager.videoSourceMode = targetSource
                 projectionManager.setAppLaunchMode(targetLaunch)
                 BridgeTelemetryBus.setAppMode(mode)
+
+                if (mode == AppMode.SHIZUKU_COCKPIT) {
+                    CarLifeShizukuManager.init(applicationContext)
+                    CarLifeShizukuManager.bindUserServiceIfReady(applicationContext)
+                } else if (previousMode == AppMode.SHIZUKU_COCKPIT) {
+                    CarLifeShizukuManager.unbindUserService(applicationContext)
+                }
+
                 serviceScope.launch {
                     val wasReady = isVideoChannelReadyForStreaming
                     resetVideoLogFlags()
@@ -1359,10 +1372,10 @@ class BridgeForegroundService : Service() {
 
             ACTION_SET_VIDEO_SOURCE_MODE -> {
                 val mode = VideoSourceMode.fromId(intent.getStringExtra(EXTRA_VIDEO_SOURCE_MODE))
-                val mappedAppMode = if (mode == VideoSourceMode.SCREEN_MIRRORING) {
-                    AppMode.MIRRORING
-                } else {
-                    AppMode.COCKPIT
+                val mappedAppMode = when {
+                    mode == VideoSourceMode.SCREEN_MIRRORING -> AppMode.MIRRORING
+                    activeAppMode == AppMode.SHIZUKU_COCKPIT -> AppMode.SHIZUKU_COCKPIT
+                    else -> AppMode.COCKPIT
                 }
                 activeAppMode = mappedAppMode
                 activeVideoSourceMode = mode
@@ -1465,6 +1478,7 @@ class BridgeForegroundService : Service() {
                 lastProtocolEvent = "BridgeForegroundService stopped"
             )
         }
+        runCatching { CarLifeShizukuManager.unbindUserService(applicationContext) }
         runCatching { videoTxQueue.close() }
         serviceScope.cancel()
         runCatching { videoTxDispatcher.close() }
@@ -1703,12 +1717,14 @@ class BridgeForegroundService : Service() {
                 }
 
                 val eventSummary = when (decodedEvent) {
-                    is CarLifeInputEvent.Touch ->
-                        if (activeAppMode == AppMode.MIRRORING) {
+                    is CarLifeInputEvent.Touch -> when (activeAppMode) {
+                        AppMode.MIRRORING ->
                             "Touch ${decodedEvent.type.label}: HU(${decodedEvent.rawX},${decodedEvent.rawY}) -> Mirroring (AccessibilityService)"
-                        } else {
+                        AppMode.SHIZUKU_COCKPIT ->
+                            "Touch ${decodedEvent.type.label}: HU(${decodedEvent.rawX},${decodedEvent.rawY}) -> Shizuku VD #${projStats.virtualDisplayId} (${decodedEvent.scaledX.toInt()},${decodedEvent.scaledY.toInt()})"
+                        AppMode.COCKPIT ->
                             "Touch ${decodedEvent.type.label}: HU(${decodedEvent.rawX},${decodedEvent.rawY}) -> Cockpit VD(${decodedEvent.scaledX.toInt()},${decodedEvent.scaledY.toInt()})"
-                        }
+                    }
                     is CarLifeInputEvent.HardKey ->
                         "HardKey: ${decodedEvent.mappedKey?.label ?: "0x${decodedEvent.rawKeyCode.toString(16)}"} (Android KeyCode=${decodedEvent.androidKeyCode})"
                     null -> "Raw Touch Frame (${frame.payload.size}B)"
