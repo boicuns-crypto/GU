@@ -1133,12 +1133,13 @@ class ExampleUnitTest {
         assertFalse(defaultRuntime.logPacketsInUi)
         assertTrue(defaultRuntime.mutePhoneSpeakerDuringUsbAudio)
         assertTrue(AudioCaptureStats().mutePhoneSpeakerDuringUsbAudio)
-        assertTrue(CockpitProjectionManager.MIRROR_VIRTUAL_DISPLAY_DPI in 160..240)
+        assertTrue(CockpitProjectionManager.MIRROR_VIRTUAL_DISPLAY_DPI in 160..200)
         assertEquals(AppMode.COCKPIT, AppMode.fromId("cockpit"))
         assertEquals(AppMode.MIRRORING, AppMode.fromId("mirroring"))
         assertEquals(AppMode.MIRRORING, AppMode.fromId(null))
 
         BridgeTelemetryBus.clearLogs()
+        BridgeTelemetryBus.setLogPacketsInUi(false)
         BridgeTelemetryBus.setAppMode(AppMode.MIRRORING)
         assertFalse(BridgeTelemetryBus.runtimeState.value.logPacketsInUi)
 
@@ -1155,14 +1156,54 @@ class ExampleUnitTest {
         BridgeTelemetryBus.recordFrame(direction = "TX (S26U -> HU)", frame = videoTestFrame, forceLog = true)
         assertEquals(1, BridgeTelemetryBus.runtimeState.value.videoPacketLogs.size)
 
-        // Switching to COCKPIT enables VirtualDisplay + UI logging, switching back restores Mirroring defaults
+        // Switching to COCKPIT enables VirtualDisplay and keeps UI logging OFF by default unless toggled ON
         BridgeTelemetryBus.setAppMode(AppMode.COCKPIT)
         assertEquals(AppMode.COCKPIT, BridgeTelemetryBus.runtimeState.value.appMode)
         assertEquals(VideoSourceMode.VIRTUAL_DISPLAY, BridgeTelemetryBus.runtimeState.value.videoSourceMode)
-        assertTrue(BridgeTelemetryBus.runtimeState.value.logPacketsInUi)
+        assertFalse(BridgeTelemetryBus.runtimeState.value.logPacketsInUi)
 
         BridgeTelemetryBus.setAppMode(AppMode.MIRRORING)
         BridgeTelemetryBus.clearLogs()
+    }
+
+    @Test
+    fun usbWriteQueue_prioritizesAudio0x0003_andDropsStaleVideoPFramesOver5() {
+        val queue = com.example.core.usb.CarLifeUsbWriteQueue(maxVideoFrames = 5)
+
+        val idrNal = byteArrayOf(0x00, 0x00, 0x00, 0x01, 0x65, 0x88.toByte())
+        fun pFrameWithMarker(marker: Int) = CarLifeFrameCodec.createVideoFrame(
+            nalData = byteArrayOf(0x00, 0x00, 0x00, 0x01, 0x41, marker.toByte()),
+            timestampMs = marker.toLong()
+        )
+        val idrFrame = CarLifeFrameCodec.createVideoFrame(nalData = idrNal, timestampMs = 1L)
+
+        // Enqueue IDR + 7 P-frames (total 8 video frames > max 5): oldest stale P-frames must drop,
+        // keeping max 5 video frames with IDR preserved.
+        queue.enqueue(idrFrame, isKeyFrameHint = true)
+        for (i in 1..7) {
+            queue.enqueue(pFrameWithMarker(10 + i), isKeyFrameHint = false)
+        }
+        assertEquals(5, queue.videoSize)
+        assertEquals(3L, queue.droppedVideoPFrames.get())
+
+        // Now enqueue two 0x0003 audio packets AFTER the buffered video frames:
+        // Audio 0x0003 MUST dequeue FIRST in FIFO order before any 0x0002 video frame!
+        val audio1 = CarLifeFrameCodec.createMediaDataFrame(byteArrayOf(1, 2, 3, 4), timestampSec = 100L)
+        val audio2 = CarLifeFrameCodec.createMediaDataFrame(byteArrayOf(5, 6, 7, 8), timestampSec = 101L)
+        queue.enqueue(audio1)
+        queue.enqueue(audio2)
+
+        val firstOut = queue.pollNonBlocking()!!
+        val secondOut = queue.pollNonBlocking()!!
+        assertEquals(CarLifeChannel.MEDIA_AUDIO, firstOut.channel)
+        assertEquals(100L, firstOut.header.timestamp)
+        assertEquals(CarLifeChannel.MEDIA_AUDIO, secondOut.channel)
+        assertEquals(101L, secondOut.header.timestamp)
+
+        // Next 5 frames come from 0x0002 video queue starting with preserved IDR (ts=1), then newest P-frames (14..17)
+        val videoTs = (1..5).map { queue.pollNonBlocking()!!.header.timestamp }
+        assertEquals(listOf(1L, 14L, 15L, 16L, 17L), videoTs)
+        assertEquals(null, queue.pollNonBlocking())
     }
 }
 

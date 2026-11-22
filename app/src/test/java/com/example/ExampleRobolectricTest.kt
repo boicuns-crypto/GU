@@ -6,6 +6,8 @@ import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.media.AudioManager
+import android.media.MediaCodecInfo
+import android.media.MediaFormat
 import android.os.Bundle
 import android.view.MotionEvent
 import androidx.test.core.app.ApplicationProvider
@@ -233,27 +235,34 @@ class ExampleRobolectricTest {
     service.onStartCommand(switchToCockpit, 0, 1)
     assertEquals(AppMode.COCKPIT, BridgeTelemetryBus.runtimeState.value.appMode)
     assertEquals(VideoSourceMode.VIRTUAL_DISPLAY, BridgeTelemetryBus.runtimeState.value.videoSourceMode)
+    assertFalse(BridgeTelemetryBus.runtimeState.value.logPacketsInUi)
+
+    val enableLog = Intent(context, BridgeForegroundService::class.java).apply {
+      action = BridgeForegroundService.ACTION_SET_LOG_PACKETS_IN_UI
+      putExtra(BridgeForegroundService.EXTRA_LOG_PACKETS_IN_UI, true)
+    }
+    service.onStartCommand(enableLog, 0, 2)
     assertTrue(BridgeTelemetryBus.runtimeState.value.logPacketsInUi)
 
     val disableLog = Intent(context, BridgeForegroundService::class.java).apply {
       action = BridgeForegroundService.ACTION_SET_LOG_PACKETS_IN_UI
       putExtra(BridgeForegroundService.EXTRA_LOG_PACKETS_IN_UI, false)
     }
-    service.onStartCommand(disableLog, 0, 2)
+    service.onStartCommand(disableLog, 0, 3)
     assertFalse(BridgeTelemetryBus.runtimeState.value.logPacketsInUi)
 
     val disableMute = Intent(context, BridgeForegroundService::class.java).apply {
       action = BridgeForegroundService.ACTION_SET_MUTE_PHONE_SPEAKER
       putExtra(BridgeForegroundService.EXTRA_MUTE_PHONE_SPEAKER, false)
     }
-    service.onStartCommand(disableMute, 0, 3)
+    service.onStartCommand(disableMute, 0, 4)
     assertFalse(BridgeTelemetryBus.runtimeState.value.mutePhoneSpeakerDuringUsbAudio)
 
     val switchToMirror = Intent(context, BridgeForegroundService::class.java).apply {
       action = BridgeForegroundService.ACTION_SET_APP_MODE
       putExtra(BridgeForegroundService.EXTRA_APP_MODE, AppMode.MIRRORING.id)
     }
-    service.onStartCommand(switchToMirror, 0, 4)
+    service.onStartCommand(switchToMirror, 0, 5)
     assertEquals(AppMode.MIRRORING, BridgeTelemetryBus.runtimeState.value.appMode)
     assertEquals(VideoSourceMode.SCREEN_MIRRORING, BridgeTelemetryBus.runtimeState.value.videoSourceMode)
     assertFalse(BridgeTelemetryBus.runtimeState.value.logPacketsInUi)
@@ -262,10 +271,32 @@ class ExampleRobolectricTest {
       action = BridgeForegroundService.ACTION_SET_MUTE_PHONE_SPEAKER
       putExtra(BridgeForegroundService.EXTRA_MUTE_PHONE_SPEAKER, true)
     }
-    service.onStartCommand(enableMute, 0, 5)
+    service.onStartCommand(enableMute, 0, 6)
     assertTrue(BridgeTelemetryBus.runtimeState.value.mutePhoneSpeakerDuringUsbAudio)
 
     controller.destroy()
+  }
+
+  @Test
+  fun `cockpit projection manager builds VBR Baseline Level 3 MediaFormat matching MediaFormatUtils`() {
+    val fmt = CockpitProjectionManager.buildPreferredAvcMediaFormat(
+      width = 1280,
+      height = 720,
+      frameRate = 30,
+      bitRate = 2_000_000
+    )
+    assertEquals(MediaFormat.MIMETYPE_VIDEO_AVC, fmt.getString(MediaFormat.KEY_MIME))
+    assertEquals(1280, fmt.getInteger(MediaFormat.KEY_WIDTH))
+    assertEquals(720, fmt.getInteger(MediaFormat.KEY_HEIGHT))
+    assertEquals(30, fmt.getInteger(MediaFormat.KEY_FRAME_RATE))
+    assertEquals(2_000_000, fmt.getInteger(MediaFormat.KEY_BIT_RATE))
+    assertEquals(1, fmt.getInteger(MediaFormat.KEY_I_FRAME_INTERVAL))
+    assertEquals(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR, fmt.getInteger(MediaFormat.KEY_BITRATE_MODE))
+    assertEquals(MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline, fmt.getInteger(MediaFormat.KEY_PROFILE))
+    assertEquals(MediaCodecInfo.CodecProfileLevel.AVCLevel3, fmt.getInteger(MediaFormat.KEY_LEVEL))
+    assertEquals(0, fmt.getInteger(MediaFormat.KEY_PRIORITY))
+    assertEquals(100_000L, fmt.getLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER))
+    assertEquals(36, fmt.getInteger(CockpitProjectionManager.SAMSUNG_QP_P_MAX_KEY))
   }
 
   @Test

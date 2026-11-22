@@ -211,7 +211,7 @@ data class ProjectionPipelineStats(
     val injectedTouches: Long = 0L,
     val lastTouchPoint: Pair<Float, Float>? = null,
     val activeCockpitWidget: String = "Зеркалирование экрана (MediaProjection) готово",
-    val statusMessage: String = "Зеркалирование экрана (1280×720 @ 2.0 Мбит/с, CBR 30fps, AOA 20B)"
+    val statusMessage: String = "Зеркалирование экрана (1280×720 @ 2.0 Мбит/с, VBR 30fps, AOA 20B)"
 )
 
 /**
@@ -435,10 +435,10 @@ class CockpitProjectionManager(
         val safeHeight = if (height in 272..2160) height else 720
         val safeFps = if (frameRate in 15..60) frameRate else 30
         val safeBitRate = bitRate.coerceIn(400_000, 12_000_000)
-        // Use 160 dpi for VirtualDisplay Cockpit and 200 dpi (inside 160–240) for MediaProjection Mirroring
+        // Use 160 dpi for VirtualDisplay Cockpit and 180 dpi (inside 160–200) for MediaProjection Mirroring
         // so Android SurfaceFlinger does not render excessive QHD+ pixels from S26 Ultra.
         val effectiveDpi = if (targetAppMode == AppMode.MIRRORING || sourceMode == VideoSourceMode.SCREEN_MIRRORING) {
-            densityDpi.coerceIn(160, 240).let { if (it == FIXED_VIRTUAL_DISPLAY_DPI) MIRROR_VIRTUAL_DISPLAY_DPI else it }
+            densityDpi.coerceIn(160, 200).let { if (it == FIXED_VIRTUAL_DISPLAY_DPI) MIRROR_VIRTUAL_DISPLAY_DPI else it }
         } else {
             FIXED_VIRTUAL_DISPLAY_DPI
         }
@@ -1656,105 +1656,116 @@ class CockpitProjectionManager(
         val supportsBaseline = caps?.profileLevels?.any {
             it.profile == MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline
         } ?: true
+        val supportsBaselineLevel3 = caps?.profileLevels?.any {
+            it.profile == MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline &&
+                it.level >= MediaCodecInfo.CodecProfileLevel.AVCLevel3
+        } ?: true
         val supportsBaselineLevel31 = caps?.profileLevels?.any {
             it.profile == MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline &&
                 it.level >= MediaCodecInfo.CodecProfileLevel.AVCLevel31
         } ?: true
-        val supportsCbr = caps?.encoderCapabilities?.isBitrateModeSupported(
-            MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR
+        val supportsVbr = caps?.encoderCapabilities?.isBitrateModeSupported(
+            MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR
         ) ?: true
 
-        fun createBaseFormat(
-            includeBaselineProfile: Boolean,
-            includeLevel31: Boolean,
-            includeCbr: Boolean,
-            includeOptionalTimingKeys: Boolean
-        ): MediaFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
-            setInteger(
-                MediaFormat.KEY_COLOR_FORMAT,
-                MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
-            )
-            setInteger(MediaFormat.KEY_BIT_RATE, bitRate)
-            setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-            if (includeBaselineProfile) {
-                setInteger(
-                    MediaFormat.KEY_PROFILE,
-                    MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline
-                )
-                if (includeLevel31) {
-                    setInteger(
-                        MediaFormat.KEY_LEVEL,
-                        MediaCodecInfo.CodecProfileLevel.AVCLevel31
-                    )
-                }
-            }
-            if (includeCbr) {
-                setInteger(
-                    MediaFormat.KEY_BITRATE_MODE,
-                    MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR
-                )
-            }
-            // Note: Do NOT set KEY_PREPEND_HEADER_TO_SYNC_FRAMES — many CCodec encoders reject it with
-            // err 0xffffffea (BAD_VALUE). SPS/PPS are cached into cachedSpsPps from csd-0/csd-1 and
-            // BUFFER_FLAG_CODEC_CONFIG and merged into ONE packet (cachedSpsPps + idrBytes) in emitCombinedSpsPpsAndIdr().
-            if (includeOptionalTimingKeys) {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                    setInteger(MediaFormat.KEY_PRIORITY, 0) // 0 = realtime priority
-                    setInteger(MediaFormat.KEY_OPERATING_RATE, frameRate) // 30 fps
-                }
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
-                }
-                setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000L)
-            }
-        }
-
         val candidates = buildList {
-            if (supportsBaseline && supportsBaselineLevel31 && supportsCbr) {
+            if (supportsBaseline && supportsBaselineLevel3 && supportsVbr) {
                 add(
-                    "AVCProfileBaseline+Level31+CBR" to createBaseFormat(
+                    "AVCProfileBaseline+Level3+VBR+SamsungQP" to buildPreferredAvcMediaFormat(
+                        width = width,
+                        height = height,
+                        frameRate = frameRate,
+                        bitRate = bitRate,
                         includeBaselineProfile = true,
-                        includeLevel31 = true,
-                        includeCbr = true,
-                        includeOptionalTimingKeys = true
+                        targetLevel = MediaCodecInfo.CodecProfileLevel.AVCLevel3,
+                        includeVbr = true,
+                        includeVendorTimingKeys = true,
+                        includeSamsungQpMax = true
+                    )
+                )
+                add(
+                    "AVCProfileBaseline+Level3+VBR" to buildPreferredAvcMediaFormat(
+                        width = width,
+                        height = height,
+                        frameRate = frameRate,
+                        bitRate = bitRate,
+                        includeBaselineProfile = true,
+                        targetLevel = MediaCodecInfo.CodecProfileLevel.AVCLevel3,
+                        includeVbr = true,
+                        includeVendorTimingKeys = true,
+                        includeSamsungQpMax = false
                     )
                 )
             }
-            if (supportsBaseline && supportsCbr) {
+            if (supportsBaseline && supportsBaselineLevel31 && supportsVbr) {
                 add(
-                    "AVCProfileBaseline+CBR" to createBaseFormat(
+                    "AVCProfileBaseline+Level31+VBR" to buildPreferredAvcMediaFormat(
+                        width = width,
+                        height = height,
+                        frameRate = frameRate,
+                        bitRate = bitRate,
                         includeBaselineProfile = true,
-                        includeLevel31 = false,
-                        includeCbr = true,
-                        includeOptionalTimingKeys = true
+                        targetLevel = MediaCodecInfo.CodecProfileLevel.AVCLevel31,
+                        includeVbr = true,
+                        includeVendorTimingKeys = true,
+                        includeSamsungQpMax = true
                     )
                 )
             }
-            if (supportsCbr) {
+            if (supportsBaseline && supportsVbr) {
                 add(
-                    "GenericAVC+CBR" to createBaseFormat(
+                    "AVCProfileBaseline+VBR" to buildPreferredAvcMediaFormat(
+                        width = width,
+                        height = height,
+                        frameRate = frameRate,
+                        bitRate = bitRate,
+                        includeBaselineProfile = true,
+                        targetLevel = null,
+                        includeVbr = true,
+                        includeVendorTimingKeys = true,
+                        includeSamsungQpMax = false
+                    )
+                )
+            }
+            if (supportsVbr) {
+                add(
+                    "GenericAVC+VBR" to buildPreferredAvcMediaFormat(
+                        width = width,
+                        height = height,
+                        frameRate = frameRate,
+                        bitRate = bitRate,
                         includeBaselineProfile = false,
-                        includeLevel31 = false,
-                        includeCbr = true,
-                        includeOptionalTimingKeys = true
+                        targetLevel = null,
+                        includeVbr = true,
+                        includeVendorTimingKeys = true,
+                        includeSamsungQpMax = false
                     )
                 )
             }
             add(
-                "GenericAVC+DefaultBitrateMode" to createBaseFormat(
+                "GenericAVC+DefaultBitrateMode" to buildPreferredAvcMediaFormat(
+                    width = width,
+                    height = height,
+                    frameRate = frameRate,
+                    bitRate = bitRate,
                     includeBaselineProfile = false,
-                    includeLevel31 = false,
-                    includeCbr = false,
-                    includeOptionalTimingKeys = true
+                    targetLevel = null,
+                    includeVbr = false,
+                    includeVendorTimingKeys = true,
+                    includeSamsungQpMax = false
                 )
             )
             add(
-                "MinimalAVC" to createBaseFormat(
+                "MinimalAVC" to buildPreferredAvcMediaFormat(
+                    width = width,
+                    height = height,
+                    frameRate = frameRate,
+                    bitRate = bitRate,
                     includeBaselineProfile = false,
-                    includeLevel31 = false,
-                    includeCbr = false,
-                    includeOptionalTimingKeys = false
+                    targetLevel = null,
+                    includeVbr = false,
+                    includeVendorTimingKeys = false,
+                    includeSamsungQpMax = false
                 )
             )
         }
@@ -2035,7 +2046,63 @@ class CockpitProjectionManager(
         const val DEFAULT_HEIGHT = 720
         const val DEFAULT_BITRATE_BPS = 2_000_000
         const val FIXED_VIRTUAL_DISPLAY_DPI = DisplayMetrics.DENSITY_MEDIUM // 160 dpi
-        const val MIRROR_VIRTUAL_DISPLAY_DPI = 200 // 160..240 dpi for smooth QHD+ -> 720p mirroring
+        const val MIRROR_VIRTUAL_DISPLAY_DPI = 180 // 160..200 dpi for smooth QHD+ -> 720p mirroring
+        const val SAMSUNG_QP_P_MAX_KEY = "video-qp-p-max"
+        const val SAMSUNG_QP_P_MAX_VALUE = 36
+
+        /**
+         * Builds the preferred H.264 [MediaFormat] matching `MediaFormatUtils.smali`:
+         * `1280×720`, VBR (`BITRATE_MODE_VBR = 1`), `AVCProfileBaseline (1)`, `AVCLevel3 (0x100)`,
+         * `KEY_I_FRAME_INTERVAL = 1`, `KEY_REPEAT_PREVIOUS_FRAME_AFTER = 100_000L`,
+         * `KEY_PRIORITY = 0` (realtime), and Samsung `video-qp-p-max = 36`.
+         */
+        internal fun buildPreferredAvcMediaFormat(
+            width: Int = DEFAULT_WIDTH,
+            height: Int = DEFAULT_HEIGHT,
+            frameRate: Int = 30,
+            bitRate: Int = DEFAULT_BITRATE_BPS,
+            includeBaselineProfile: Boolean = true,
+            targetLevel: Int? = MediaCodecInfo.CodecProfileLevel.AVCLevel3,
+            includeVbr: Boolean = true,
+            includeVendorTimingKeys: Boolean = true,
+            includeSamsungQpMax: Boolean = true
+        ): MediaFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
+            setInteger(
+                MediaFormat.KEY_COLOR_FORMAT,
+                MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
+            )
+            setInteger(MediaFormat.KEY_BIT_RATE, bitRate)
+            setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+            if (includeBaselineProfile) {
+                setInteger(
+                    MediaFormat.KEY_PROFILE,
+                    MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline
+                )
+                if (targetLevel != null) {
+                    setInteger(MediaFormat.KEY_LEVEL, targetLevel)
+                }
+            }
+            if (includeVbr) {
+                setInteger(
+                    MediaFormat.KEY_BITRATE_MODE,
+                    MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR
+                )
+            }
+            if (includeVendorTimingKeys) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                    setInteger(MediaFormat.KEY_PRIORITY, 0) // 0 = realtime priority
+                    setInteger(MediaFormat.KEY_OPERATING_RATE, frameRate)
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
+                }
+                setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000L)
+                if (includeSamsungQpMax) {
+                    setInteger(SAMSUNG_QP_P_MAX_KEY, SAMSUNG_QP_P_MAX_VALUE)
+                }
+            }
+        }
     }
 }
 

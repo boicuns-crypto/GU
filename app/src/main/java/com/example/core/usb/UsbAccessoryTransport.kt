@@ -26,6 +26,8 @@ import java.nio.channels.FileChannel
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
@@ -115,7 +117,10 @@ class UsbAccessoryTransport(
     private var writerThread: Thread? = null
 
     @Volatile
-    private var outgoingQueue: LinkedBlockingQueue<CarLifeFrame> = LinkedBlockingQueue(WRITER_QUEUE_CAPACITY)
+    private var outgoingQueue: CarLifeUsbWriteQueue = CarLifeUsbWriteQueue(maxVideoFrames = MAX_QUEUED_VIDEO_FRAMES)
+
+    val droppedVideoPFrames: Long
+        get() = outgoingQueue.droppedVideoPFrames.get()
 
     private val _state = MutableStateFlow<UsbTransportState>(UsbTransportState.Disconnected)
     val state: StateFlow<UsbTransportState> = _state.asStateFlow()
@@ -231,7 +236,7 @@ class UsbAccessoryTransport(
         outChannel = fos.channel
         activeAccessory = accessory
 
-        val writeQueue = LinkedBlockingQueue<CarLifeFrame>(WRITER_QUEUE_CAPACITY)
+        val writeQueue = CarLifeUsbWriteQueue(maxVideoFrames = MAX_QUEUED_VIDEO_FRAMES)
         outgoingQueue = writeQueue
         writerRunning.set(true)
 
@@ -260,21 +265,24 @@ class UsbAccessoryTransport(
     }
 
     /**
-     * Enqueues a [CarLifeFrame] into the lock-free [LinkedBlockingQueue] without blocking
-     * `MediaCodec` (`0x0002`) or `AudioRecord` (`0x0003`) threads on USB I/O.
+     * Enqueues a [CarLifeFrame] into [CarLifeUsbWriteQueue] without blocking `MediaCodec` (`0x0002`)
+     * or `AudioRecord` (`0x0003`) threads on USB I/O:
+     * - Audio (`0x0003`) and Control (`0x0001`) packets take strict priority over video frames.
+     * - Stale video `0x0002` P-frames are evicted when > 5 video frames accumulate in the queue.
      */
-    fun enqueueFrameNonBlocking(frame: CarLifeFrame): Boolean {
+    fun enqueueFrameNonBlocking(
+        frame: CarLifeFrame,
+        isKeyFrameHint: Boolean? = null
+    ): Boolean {
         if (_state.value !is UsbTransportState.Connected || !writerRunning.get()) return false
-        val queue = outgoingQueue
-        if (queue.offer(frame)) return true
-        // Queue congested: evict one stale queued item so codecs/audio never stall
-        queue.poll()
-        return queue.offer(frame)
+        return outgoingQueue.enqueue(frame, isKeyFrameHint)
     }
 
-    suspend fun sendFrame(frame: CarLifeFrame): Boolean = enqueueFrameNonBlocking(frame)
+    suspend fun sendFrame(frame: CarLifeFrame, isKeyFrameHint: Boolean? = null): Boolean =
+        enqueueFrameNonBlocking(frame, isKeyFrameHint)
 
-    suspend fun sendFrameImmediate(frame: CarLifeFrame): Boolean = enqueueFrameNonBlocking(frame)
+    suspend fun sendFrameImmediate(frame: CarLifeFrame, isKeyFrameHint: Boolean? = null): Boolean =
+        enqueueFrameNonBlocking(frame, isKeyFrameHint)
 
     /**
      * Writes any CarLife frame to `/dev/usb_accessory` (`FileOutputStream`) in strict
@@ -456,12 +464,13 @@ class UsbAccessoryTransport(
     }
 
     /**
-     * Dedicated high-priority writer loop draining [LinkedBlockingQueue] sequentially into [FileOutputStream]
-     * in 16,384-byte chunks without blocking `MediaCodec` or `AudioRecord`.
+     * Dedicated high-priority writer loop draining [CarLifeUsbWriteQueue] (`0x0003` audio & `0x0001` control
+     * prioritized ahead of `0x0002` video) into [FileOutputStream] in 16,384-byte chunks without
+     * blocking `MediaCodec` or `AudioRecord`.
      */
     private fun runDedicatedUsbWriterLoop(
         fos: FileOutputStream,
-        queue: LinkedBlockingQueue<CarLifeFrame>
+        queue: CarLifeUsbWriteQueue
     ) {
         try {
             while (writerRunning.get() && !Thread.currentThread().isInterrupted) {
@@ -576,6 +585,7 @@ class UsbAccessoryTransport(
         const val MAX_AOA_CHUNK = 16_384
         const val MAX_AOA_WRITE_SIZE = MAX_AOA_CHUNK
         const val WRITER_QUEUE_CAPACITY = 512
+        const val MAX_QUEUED_VIDEO_FRAMES = 5
 
         val KNOWN_MANUFACTURERS = setOf(
             "Baidu",
@@ -590,5 +600,148 @@ class UsbAccessoryTransport(
             "CarLife",
             "CarLife_Module"
         )
+    }
+}
+
+/**
+ * Thread-safe USB AOA write queue backed by [LinkedBlockingQueue]s with two guarantees:
+ * 1. Audio (`0x0003`) and Control (`0x0001`) packets ALWAYS dequeue ahead of buffered `0x0002` video frames.
+ * 2. When more than [maxVideoFrames] (default `5`) video frames build up in the queue, stale `0x0002`
+ *    P-frames are evicted cleanly so head-unit latency never accumulates.
+ */
+internal class CarLifeUsbWriteQueue(
+    val maxVideoFrames: Int = UsbAccessoryTransport.MAX_QUEUED_VIDEO_FRAMES
+) {
+    private data class QueuedVideoFrame(
+        val frame: CarLifeFrame,
+        val isKeyFrame: Boolean
+    )
+
+    private val priorityQueue = LinkedBlockingQueue<CarLifeFrame>(UsbAccessoryTransport.WRITER_QUEUE_CAPACITY)
+    private val videoQueue = LinkedBlockingQueue<QueuedVideoFrame>()
+    private val lock = ReentrantLock()
+    private val notEmpty = lock.newCondition()
+
+    val droppedVideoPFrames = AtomicLong(0L)
+
+    val prioritySize: Int
+        get() = priorityQueue.size
+
+    val videoSize: Int
+        get() = videoQueue.size
+
+    fun enqueue(frame: CarLifeFrame, isKeyFrameHint: Boolean? = null): Boolean {
+        lock.withLock {
+            if (frame.channel != CarLifeChannel.VIDEO) {
+                if (!priorityQueue.offer(frame)) {
+                    // Preserve audio/control responsiveness even under extreme burst
+                    priorityQueue.poll()
+                    priorityQueue.offer(frame)
+                }
+            } else {
+                val isKeyOrConfig = isKeyFrameHint ?: isVideoKeyFrameOrHeartbeat(frame)
+                while (videoQueue.size >= maxVideoFrames) {
+                    val dropped = evictOldestStaleVideoFrameLocked()
+                    if (!dropped) break
+                }
+                videoQueue.offer(QueuedVideoFrame(frame = frame, isKeyFrame = isKeyOrConfig))
+            }
+            notEmpty.signal()
+            return true
+        }
+    }
+
+    @Throws(InterruptedException::class)
+    fun take(): CarLifeFrame {
+        lock.withLock {
+            while (priorityQueue.isEmpty() && videoQueue.isEmpty()) {
+                notEmpty.await()
+            }
+            priorityQueue.poll()?.let { return it }
+            return videoQueue.poll()!!.frame
+        }
+    }
+
+    fun pollNonBlocking(): CarLifeFrame? {
+        lock.withLock {
+            priorityQueue.poll()?.let { return it }
+            return videoQueue.poll()?.frame
+        }
+    }
+
+    fun clear() {
+        lock.withLock {
+            priorityQueue.clear()
+            videoQueue.clear()
+        }
+    }
+
+    private fun evictOldestStaleVideoFrameLocked(): Boolean {
+        val iterator = videoQueue.iterator()
+        while (iterator.hasNext()) {
+            val candidate = iterator.next()
+            if (!candidate.isKeyFrame) {
+                iterator.remove()
+                droppedVideoPFrames.incrementAndGet()
+                return true
+            }
+        }
+        // If only keyframes remain above limit, drop the oldest queued video frame
+        val oldest = videoQueue.poll()
+        if (oldest != null) {
+            if (!oldest.isKeyFrame) droppedVideoPFrames.incrementAndGet()
+            return true
+        }
+        return false
+    }
+
+    companion object {
+        fun isVideoKeyFrameOrHeartbeat(frame: CarLifeFrame): Boolean {
+            if (frame.channel != CarLifeChannel.VIDEO) return false
+            val payload = frame.payload
+            if (payload.isEmpty()) return true
+            val isAoA20B = !frame.header.includeOuterTimestamp && payload.size >= 12
+            val nalOffset = if (isAoA20B) {
+                val serviceType = ((payload[8].toInt() and 0xFF) shl 24) or
+                    ((payload[9].toInt() and 0xFF) shl 16) or
+                    ((payload[10].toInt() and 0xFF) shl 8) or
+                    (payload[11].toInt() and 0xFF)
+                if (serviceType == com.example.protocol.carlife.CarLifeMsgType.MSG_VIDEO_HEARTBEAT) {
+                    return true
+                }
+                12
+            } else {
+                0
+            }
+            if (payload.size <= nalOffset + 4) return false
+            // Scan the leading bytes of the frame for Annex-B start codes marking SPS(7), PPS(8), or IDR(5)
+            val scanLimit = minOf(payload.size - 4, nalOffset + 128)
+            var i = nalOffset
+            while (i < scanLimit) {
+                if (payload[i] == 0.toByte() &&
+                    payload[i + 1] == 0.toByte() &&
+                    payload[i + 2] == 0.toByte() &&
+                    payload[i + 3] == 1.toByte() &&
+                    i + 4 < payload.size
+                ) {
+                    val nalType = payload[i + 4].toInt() and 0x1F
+                    if (nalType == 5 || nalType == 7 || nalType == 8) return true
+                    i += 4
+                    continue
+                }
+                if (payload[i] == 0.toByte() &&
+                    payload[i + 1] == 0.toByte() &&
+                    payload[i + 2] == 1.toByte() &&
+                    i + 3 < payload.size
+                ) {
+                    val nalType = payload[i + 3].toInt() and 0x1F
+                    if (nalType == 5 || nalType == 7 || nalType == 8) return true
+                    i += 3
+                    continue
+                }
+                i++
+            }
+            return false
+        }
     }
 }

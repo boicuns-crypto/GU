@@ -94,9 +94,9 @@ data class AutoTestState(
     val isRunning: Boolean = false,
     val currentStep: Int = 0,
     val totalSteps: Int = 0,
-    val activeProfileLabel: String = "1280×720 • 2.0 Мбит/с • CBR 30fps • 160 dpi • AOA 20B (0x00020001)",
-    val statusMessage: String = "Авто-тестер отключён: зафиксирован профиль Jetta VS7 (1280×720 • 2.0 Мбит/с • CBR 30fps • 160 dpi • AOA 20B)",
-    val matchedProfileLabel: String? = "1280×720 • 2.0 Мбит/с • CBR 30fps • 160 dpi • AOA 20B (0x00020001)",
+    val activeProfileLabel: String = "1280×720 • 2.0 Мбит/с • VBR 30fps • Baseline L3 • AOA 20B (0x00020001)",
+    val statusMessage: String = "Авто-тестер отключён: зафиксирован профиль Jetta VS7 (1280×720 • 2.0 Мбит/с • VBR 30fps • AOA 20B)",
+    val matchedProfileLabel: String? = "1280×720 • 2.0 Мбит/с • VBR 30fps • Baseline L3 • AOA 20B (0x00020001)",
     val audioInitForced: Boolean = true
 )
 
@@ -170,7 +170,6 @@ object BridgeTelemetryBus {
                 appMode = mode,
                 videoSourceMode = mappedSource,
                 appLaunchMode = mappedLaunch,
-                logPacketsInUi = (mode == AppMode.COCKPIT),
                 lastProtocolEvent = "Режим работы: ${mode.title}"
             )
         }
@@ -507,7 +506,7 @@ class BridgeForegroundService : Service() {
             nalData = annexB4Frame,
             timestampMs = timestampMs
         )
-        val sentOk = usbTransport.sendFrameImmediate(videoFrame)
+        val sentOk = usbTransport.sendFrameImmediate(videoFrame, isKeyFrameHint = isBundledKeyFrame)
         if (!sentOk) return false
         val now = SystemClock.elapsedRealtime()
         lastVideoTxElapsedMs = now
@@ -572,7 +571,7 @@ class BridgeForegroundService : Service() {
             return false
         }
         val hb = CarLifeFrameCodec.createVideoHeartbeatFrame(timestampMs = timestampMs)
-        val sentOk = usbTransport.sendFrameImmediate(hb)
+        val sentOk = usbTransport.sendFrameImmediate(hb, isKeyFrameHint = true)
         if (!sentOk) return false
         lastVideoTxElapsedMs = SystemClock.elapsedRealtime()
         BridgeTelemetryBus.recordFrame(
@@ -709,12 +708,12 @@ class BridgeForegroundService : Service() {
                     isRunning = false,
                     currentStep = 0,
                     totalSteps = 0,
-                    activeProfileLabel = "1280×720 • 2.0 Мбит/с • CBR 30fps • 160 dpi • AOA 20B (0x00020001)",
-                    statusMessage = "Авто-тестер отключён: зафиксирован профиль Jetta VS7 (1280×720 • 2.0 Мбит/с • CBR 30fps • 160 dpi • AOA 20B)",
-                    matchedProfileLabel = "1280×720 • 2.0 Мбит/с • CBR 30fps • 160 dpi • AOA 20B (0x00020001)",
+                    activeProfileLabel = "1280×720 • 2.0 Мбит/с • VBR 30fps • Baseline L3 • AOA 20B (0x00020001)",
+                    statusMessage = "Авто-тестер отключён: зафиксирован профиль Jetta VS7 (1280×720 • 2.0 Мбит/с • VBR 30fps • AOA 20B)",
+                    matchedProfileLabel = "1280×720 • 2.0 Мбит/с • VBR 30fps • Baseline L3 • AOA 20B (0x00020001)",
                     audioInitForced = true
                 ),
-                lastProtocolEvent = "Locked Jetta VS7 Profile: 1280×720 @ 2.0 Mbps CBR 30fps (160 dpi), AOA 20B (0x00020001) + Audio Init"
+                lastProtocolEvent = "Locked Jetta VS7 Profile: 1280×720 @ 2.0 Mbps VBR 30fps (Baseline L3), AOA 20B (0x00020001) + Audio Init"
             )
         }
 
@@ -874,7 +873,7 @@ class BridgeForegroundService : Service() {
                 configuredWidth = activeWidth,
                 configuredHeight = activeHeight,
                 configuredBitrateBps = activeBitrateBps,
-                lastProtocolEvent = "BridgeForegroundService active (${activeWidth}×${activeHeight} @ ${activeBitrateBps / 1000}kbps CBR 30fps, ${activeAppMode.title}; Awaiting 0x00018001)"
+                lastProtocolEvent = "BridgeForegroundService active (${activeWidth}×${activeHeight} @ ${activeBitrateBps / 1000}kbps VBR 30fps, ${activeAppMode.title}; Awaiting 0x00018001)"
             )
         }
 

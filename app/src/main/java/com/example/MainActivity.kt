@@ -2431,7 +2431,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                             border = BorderStroke(1.dp, ObsidianBorder)
                         ) {
                             Text(
-                                text = "Baseline CBR • 30fps • I=1s",
+                                text = "Baseline L3 VBR • 30fps • I=1s",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = ElectricCyan,
                                 softWrap = false,
@@ -2475,7 +2475,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                     }
 
                     Text(
-                        text = "Битрейт кодека (AVCProfileBaseline CBR, 30fps, I=1s, 2.0 Мбит/с по умолчанию)",
+                        text = "Битрейт кодека (AVCProfileBaseline L3 VBR, QP≤36, 30fps, I=1s, 2.0 Мбит/с)",
                         style = MaterialTheme.typography.labelMedium,
                         color = TextSecondary
                     )
