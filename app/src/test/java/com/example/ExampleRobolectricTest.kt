@@ -1,5 +1,6 @@
 package com.example
 
+import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
 import android.content.Intent
@@ -16,7 +17,9 @@ import com.example.core.audio.CarLifeAudioCaptureManager
 import com.example.core.carlife.CarLifeHardKeyPacket
 import com.example.core.carlife.CarLifeTouchPacket
 import com.example.core.projection.AppMode
+import com.example.core.projection.AppModePreferences
 import com.example.core.projection.CockpitProjectionManager
+import com.example.core.projection.MediaProjectionTokenStore
 import com.example.core.projection.VideoSourceMode
 import com.example.core.shizuku.CarLifeShizukuManager
 import com.example.core.shizuku.ICarLifeShizukuService
@@ -532,8 +535,115 @@ class ExampleRobolectricTest {
     } finally {
       CarLifeShizukuManager.resetForTesting()
       CarLifeLauncherRepository.setAppLaunchMode(AppLaunchMode.VIRTUAL_DISPLAY_IF_AVAILABLE)
-      BridgeTelemetryBus.setAppMode(AppMode.MIRRORING)
+      AppModePreferences.clear(context)
+      BridgeTelemetryBus.setAppMode(AppMode.MIRRORING, context)
     }
+  }
+
+  @Test
+  fun `app mode persists in SharedPreferences and restores across BridgeForegroundService restart`() {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    try {
+      // Save SHIZUKU_COCKPIT via BridgeTelemetryBus -> must persist in SharedPreferences
+      BridgeTelemetryBus.setAppMode(AppMode.SHIZUKU_COCKPIT, context)
+      assertEquals(AppMode.SHIZUKU_COCKPIT, AppModePreferences.loadAppMode(context))
+
+      // Reset in-memory state to COCKPIT, then start BridgeForegroundService -> must restore SHIZUKU_COCKPIT
+      BridgeTelemetryBus.setAppMode(AppMode.COCKPIT, context = null)
+      val svc1Controller = Robolectric.buildService(BridgeForegroundService::class.java).create()
+      assertEquals(AppMode.SHIZUKU_COCKPIT, BridgeTelemetryBus.runtimeState.value.appMode)
+      svc1Controller.destroy()
+
+      // Switch to MIRRORING and verify service restart preserves MIRRORING (never resets to COCKPIT)
+      BridgeTelemetryBus.setAppMode(AppMode.MIRRORING, context)
+      BridgeTelemetryBus.setAppMode(AppMode.COCKPIT, context = null)
+      val svc2Controller = Robolectric.buildService(BridgeForegroundService::class.java).create()
+      assertEquals(AppMode.MIRRORING, BridgeTelemetryBus.runtimeState.value.appMode)
+      assertEquals(VideoSourceMode.SCREEN_MIRRORING, BridgeTelemetryBus.runtimeState.value.videoSourceMode)
+      assertEquals(AppLaunchMode.SCREEN_MIRRORING, BridgeTelemetryBus.runtimeState.value.appLaunchMode)
+      svc2Controller.destroy()
+    } finally {
+      AppModePreferences.clear(context)
+      BridgeTelemetryBus.setAppMode(AppMode.MIRRORING, context)
+    }
+  }
+
+  @Test
+  fun `media projection token store consumes resultData single-use and tracks active and error diagnostics`() {
+    MediaProjectionTokenStore.clearToken()
+    try {
+      val tokenIntent = Intent("android.media.projection.TEST").putExtra("token_nonce", 42)
+      MediaProjectionTokenStore.saveToken(Activity.RESULT_OK, tokenIntent)
+
+      assertTrue(MediaProjectionTokenStore.hasPendingToken.value)
+      assertTrue(MediaProjectionTokenStore.hasValidToken.value)
+      assertFalse(MediaProjectionTokenStore.isProjectionActive.value)
+
+      // First consume returns the copy and immediately nullifies resultData (Android 14+ single-use)
+      val firstConsume = MediaProjectionTokenStore.consumeToken()
+      assertTrue("Expected non-null token on first consume", firstConsume != null)
+      assertEquals(Activity.RESULT_OK, firstConsume!!.first)
+      assertEquals(42, firstConsume.second.getIntExtra("token_nonce", -1))
+      assertEquals(null, MediaProjectionTokenStore.resultData)
+      assertFalse(MediaProjectionTokenStore.hasPendingToken.value)
+
+      // Second consume must return null — never reuse stale resultData!
+      assertEquals(null, MediaProjectionTokenStore.consumeToken())
+
+      // Activating live MediaProjection keeps hasValidToken true for FGS & UI without keeping stale Intent
+      MediaProjectionTokenStore.setActiveProjection(active = true, detail = "Live MP")
+      assertTrue(MediaProjectionTokenStore.isProjectionActive.value)
+      assertTrue(MediaProjectionTokenStore.hasValidToken.value)
+
+      // Recording an error preserves exact diagnostic message
+      MediaProjectionTokenStore.setActiveProjection(
+        active = false,
+        detail = "Stopped",
+        error = "SecurityException: single-use token expired"
+      )
+      assertFalse(MediaProjectionTokenStore.isProjectionActive.value)
+      assertEquals("SecurityException: single-use token expired", MediaProjectionTokenStore.lastError.value)
+    } finally {
+      MediaProjectionTokenStore.clearToken()
+    }
+  }
+
+  @Test
+  fun `mirroring mode renders diagnostic waiting screen without falling back to cockpit launcher`() {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val manager = CockpitProjectionManager(
+      context = context,
+      onEncodedVideoNal = { _, _, _ -> }
+    )
+    manager.appMode = AppMode.MIRRORING
+    manager.videoSourceMode = VideoSourceMode.SCREEN_MIRRORING
+
+    val drawnTexts = mutableListOf<String>()
+    val bitmap = Bitmap.createBitmap(1280, 720, Bitmap.Config.ARGB_8888)
+    val recordingCanvas = object : Canvas(bitmap) {
+      override fun drawText(text: String, x: Float, y: Float, paint: android.graphics.Paint) {
+        drawnTexts.add(text)
+        super.drawText(text, x, y, paint)
+      }
+    }
+
+    manager.drawMirroringWaitingOrErrorFrame(
+      canvas = recordingCanvas,
+      width = 1280,
+      height = 720,
+      frameSeq = 5L,
+      timeString = "12:00:00.000",
+      diagnosticError = "Нет токена Весь экран"
+    )
+
+    assertTrue(drawnTexts.any { it.contains("РЕЖИМ ЗЕРКАЛИРОВАНИЯ ЭКРАНА") })
+    assertTrue(drawnTexts.any { it.contains("MediaProjection: Нет токена Весь экран") })
+    assertTrue(drawnTexts.any { it.contains("Откат в Кокпит отключён") })
+    assertFalse("Must never draw Cockpit Launcher header in Mirroring mode", drawnTexts.any { it.contains("CarLife Кокпит") })
+    assertEquals(AppMode.MIRRORING, manager.appMode)
+
+    bitmap.recycle()
+    kotlinx.coroutines.runBlocking { manager.stopProjection() }
   }
 }
 

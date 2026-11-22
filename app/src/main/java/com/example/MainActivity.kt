@@ -9,6 +9,7 @@ import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.hardware.usb.UsbAccessory
 import android.hardware.usb.UsbManager
+import android.media.projection.MediaProjectionConfig
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
@@ -116,6 +117,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import android.view.Display
 import android.view.KeyEvent
 import android.view.WindowManager
 import com.example.core.input.CarLifeAccessibilityService
@@ -181,6 +183,8 @@ class MainActivity : ComponentActivity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         enableEdgeToEdge()
 
+        BridgeTelemetryBus.restoreSavedAppMode(this)
+
         recordAudioPermissionLauncher = registerForActivityResult(
             ActivityResultContracts.RequestPermission()
         ) { granted ->
@@ -204,6 +208,18 @@ class MainActivity : ComponentActivity() {
                 )
                 if (!CarLifeAudioCaptureManager.hasRecordAudioPermission(this)) {
                     requestRecordAudioPermission()
+                }
+            } else {
+                val deniedMsg = "Разрешение MediaProjection («Весь экран») отклонено пользователем (code=${result.resultCode})"
+                MediaProjectionTokenStore.recordError(deniedMsg)
+                BridgeTelemetryBus.updateState { current ->
+                    current.copy(
+                        lastProtocolEvent = deniedMsg,
+                        projectionStats = current.projectionStats.copy(
+                            mediaProjectionState = "Отклонено",
+                            lastMediaProjectionError = deniedMsg
+                        )
+                    )
                 }
             }
         }
@@ -285,7 +301,26 @@ class MainActivity : ComponentActivity() {
     private fun requestScreenCapturePermission() {
         runCatching {
             val mpManager = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-            mediaProjectionLauncher.launch(mpManager.createScreenCaptureIntent())
+            val captureIntent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                mpManager.createScreenCaptureIntent(
+                    MediaProjectionConfig.createConfigForDefaultDisplay()
+                )
+            } else {
+                mpManager.createScreenCaptureIntent()
+            }
+            mediaProjectionLauncher.launch(captureIntent)
+        }.onFailure { e ->
+            val errMsg = "Не удалось открыть запрос MediaProjection («Весь экран»): ${e.message}"
+            MediaProjectionTokenStore.recordError(errMsg)
+            BridgeTelemetryBus.updateState { current ->
+                current.copy(
+                    lastProtocolEvent = errMsg,
+                    projectionStats = current.projectionStats.copy(
+                        mediaProjectionState = "Ошибка запуска запроса",
+                        lastMediaProjectionError = errMsg
+                    )
+                )
+            }
         }
     }
 
@@ -1047,6 +1082,39 @@ private fun OnboardingChecklistScreen(
                         )
                     }
 
+                    val mpDetail by MediaProjectionTokenStore.statusDetail.collectAsStateWithLifecycle()
+                    val mpError by MediaProjectionTokenStore.lastError.collectAsStateWithLifecycle()
+                    val effectiveMpError = mpError ?: runtimeState.projectionStats.lastMediaProjectionError
+
+                    Surface(
+                        color = ObsidianBackground,
+                        shape = RoundedCornerShape(10.dp),
+                        border = BorderStroke(
+                            1.dp,
+                            if (effectiveMpError != null) CoralAlert.copy(alpha = 0.7f) else ObsidianBorder
+                        )
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 12.dp, vertical = 8.dp),
+                            verticalArrangement = Arrangement.spacedBy(2.dp)
+                        ) {
+                            Text(
+                                text = "Диагностика MP: ${runtimeState.projectionStats.mediaProjectionState} • $mpDetail",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (status.step5MediaProjectionGranted) TelemetryEmerald else AmberSignal
+                            )
+                            if (!effectiveMpError.isNullOrBlank()) {
+                                Text(
+                                    text = "Ошибка: $effectiveMpError",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = CoralAlert
+                                )
+                            }
+                        }
+                    }
+
                     Button(
                         onClick = onRequestMediaProjection,
                         modifier = Modifier
@@ -1432,6 +1500,10 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
         item {
             val activeAppMode = state.appMode
             val shizukuStatus by CarLifeShizukuManager.status.collectAsStateWithLifecycle()
+            val mpIsActive by MediaProjectionTokenStore.isProjectionActive.collectAsStateWithLifecycle()
+            val mpHasPending by MediaProjectionTokenStore.hasPendingToken.collectAsStateWithLifecycle()
+            val mpError by MediaProjectionTokenStore.lastError.collectAsStateWithLifecycle()
+            val mpDetail by MediaProjectionTokenStore.statusDetail.collectAsStateWithLifecycle()
 
             LaunchedEffect(activeAppMode) {
                 CarLifeShizukuManager.refreshStatus(context)
@@ -1441,7 +1513,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
             }
 
             fun selectAppMode(mode: AppMode) {
-                BridgeTelemetryBus.setAppMode(mode)
+                BridgeTelemetryBus.setAppMode(mode, context)
                 when (mode) {
                     AppMode.SHIZUKU_COCKPIT -> {
                         CarLifeShizukuManager.init(context)
@@ -1663,6 +1735,123 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                         }
                     }
 
+                    // Панель точной диагностики активного режима и MediaProjection (Android 14–16)
+                    val effectiveDiagnosticError = mpError ?: state.projectionStats.lastMediaProjectionError
+                    val diagBorderColor = when {
+                        effectiveDiagnosticError != null -> CoralAlert.copy(alpha = 0.75f)
+                        state.projectionStats.usingMediaProjection || mpIsActive -> TelemetryEmerald.copy(alpha = 0.7f)
+                        else -> AmberSignal.copy(alpha = 0.7f)
+                    }
+                    Surface(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("mediaprojection_diagnostic_panel"),
+                        color = ObsidianBackground,
+                        shape = RoundedCornerShape(12.dp),
+                        border = BorderStroke(1.dp, diagBorderColor)
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(12.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "Диагностика режима и MediaProjection",
+                                    style = MaterialTheme.typography.labelLarge,
+                                    color = TextPrimary
+                                )
+                                val mpChipBg = when {
+                                    effectiveDiagnosticError != null -> WarningBadgeBg
+                                    state.projectionStats.usingMediaProjection || mpIsActive -> SuccessBadgeBg
+                                    else -> ObsidianSurfaceHigh
+                                }
+                                val mpChipFg = when {
+                                    effectiveDiagnosticError != null -> CoralAlert
+                                    state.projectionStats.usingMediaProjection || mpIsActive -> SuccessBadgeFg
+                                    else -> AmberSignal
+                                }
+                                Surface(color = mpChipBg, shape = RoundedCornerShape(6.dp)) {
+                                    Text(
+                                        text = when {
+                                            state.projectionStats.usingMediaProjection || mpIsActive -> "MP LIVE"
+                                            mpHasPending -> "ТОКЕН ГОТОВ"
+                                            effectiveDiagnosticError != null -> "ОШИБКА MP"
+                                            else -> "НЕТ ТОКЕНА"
+                                        },
+                                        style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+                                        color = mpChipFg,
+                                        softWrap = false,
+                                        maxLines = 1,
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                                    )
+                                }
+                            }
+
+                            Text(
+                                text = "Режим (сохранён): ${activeAppMode.title} • Источник: ${state.videoSourceMode.title}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = ElectricCyan
+                            )
+                            Text(
+                                text = "MediaProjection: ${state.projectionStats.mediaProjectionState} ($mpDetail)",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (state.projectionStats.usingMediaProjection || mpIsActive) {
+                                    TelemetryEmerald
+                                } else {
+                                    TextSecondary
+                                }
+                            )
+                            Text(
+                                text = if (state.projectionStats.usingMediaProjection &&
+                                    state.projectionStats.virtualDisplayId != Display.DEFAULT_DISPLAY
+                                ) {
+                                    "VirtualDisplay: #${state.projectionStats.virtualDisplayId} (${state.projectionStats.width}×${state.projectionStats.height}@${state.projectionStats.fps}fps, ${state.projectionStats.virtualDisplayDpi} dpi)"
+                                } else if (activeAppMode == AppMode.MIRRORING) {
+                                    "VirtualDisplay: не создан • Откат в Кокпит СТРОГО ЗАПРЕЩЁН"
+                                } else {
+                                    "VirtualDisplay: Surface ${state.projectionStats.width}×${state.projectionStats.height}@${state.projectionStats.fps}fps"
+                                },
+                                style = MaterialTheme.typography.labelSmall,
+                                color = TextSecondary
+                            )
+                            if (!effectiveDiagnosticError.isNullOrBlank()) {
+                                Text(
+                                    text = "Причина / ошибка: $effectiveDiagnosticError",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = CoralAlert,
+                                    modifier = Modifier.testTag("mediaprojection_diagnostic_error")
+                                )
+                            }
+                            if (activeAppMode != AppMode.COCKPIT &&
+                                (!state.projectionStats.usingMediaProjection || !effectiveDiagnosticError.isNullOrBlank())
+                            ) {
+                                FilledTonalButton(
+                                    onClick = onRequestMediaProjection,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .heightIn(min = 48.dp)
+                                        .testTag("request_mediaprojection_diag_btn"),
+                                    shape = RoundedCornerShape(10.dp),
+                                    colors = ButtonDefaults.filledTonalButtonColors(
+                                        containerColor = ElectricCyan.copy(alpha = 0.2f),
+                                        contentColor = ElectricCyan
+                                    )
+                                ) {
+                                    Text(
+                                        text = "Выдать MediaProjection («Весь экран»)",
+                                        fontWeight = FontWeight.SemiBold
+                                    )
+                                }
+                            }
+                        }
+                    }
+
                     // Тумблер «Логировать пакеты в UI» (выкл. по умолчанию в режиме Зеркалирования для плавных 30 fps)
                     Row(
                         modifier = Modifier
@@ -1826,9 +2015,14 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                             when (state.videoSourceMode) {
                                 VideoSourceMode.SCREEN_MIRRORING ->
                                     if (state.projectionStats.usingMediaProjection) {
-                                        "Зеркалирование экрана активно (${state.configuredWidth}×${state.configuredHeight} @ ${state.configuredBitrateBps / 1000} кбит/с, 30 fps, без Presentation)"
+                                        "Зеркалирование экрана активно (${state.configuredWidth}×${state.configuredHeight} @ ${state.configuredBitrateBps / 1000} кбит/с, 30 fps, ${state.projectionStats.virtualDisplayDpi} dpi, без Presentation)"
                                     } else {
-                                        "Ожидание разрешения MediaProjection («Весь экран») — нажмите кнопку «Начать трансляцию»"
+                                        val err = state.projectionStats.lastMediaProjectionError
+                                        if (!err.isNullOrBlank()) {
+                                            "Ошибка Зеркалирования: $err (откат в Кокпит запрещён)"
+                                        } else {
+                                            "Ожидание MediaProjection («Весь экран») — откат в Кокпит запрещён"
+                                        }
                                     }
                                 VideoSourceMode.CANVAS_TEST_CARD ->
                                     "Тест-карта (Canvas) активна на Surface (${state.configuredWidth}×${state.configuredHeight} @ ${state.configuredBitrateBps / 1000} кбит/с, 30 fps)"
@@ -1843,7 +2037,12 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                         Text(
                             text = vdStatusLine,
                             style = MaterialTheme.typography.labelMedium,
-                            color = if (state.projectionStats.isRunning) TelemetryEmerald else TextSecondary,
+                            color = when {
+                                state.videoSourceMode == VideoSourceMode.SCREEN_MIRRORING &&
+                                    !state.projectionStats.usingMediaProjection -> AmberSignal
+                                state.projectionStats.isRunning -> TelemetryEmerald
+                                else -> TextSecondary
+                            },
                             maxLines = 2,
                             overflow = TextOverflow.Ellipsis,
                             modifier = Modifier
@@ -2154,7 +2353,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
         item {
             val activeSource = state.videoSourceMode
             fun selectVideoSource(mode: VideoSourceMode) {
-                BridgeTelemetryBus.setVideoSourceMode(mode)
+                BridgeTelemetryBus.setVideoSourceMode(mode, context)
                 if (state.isServiceRunning) {
                     val intent = Intent(context, BridgeForegroundService::class.java).apply {
                         action = BridgeForegroundService.ACTION_SET_VIDEO_SOURCE_MODE
@@ -3237,20 +3436,27 @@ private fun ProjectionEngineCard(
                 MetricPill(
                     label = "TOUCH INJECT",
                     value = "${proj.injectedTouches}",
-                    subValue = when (state.videoSourceMode) {
-                        VideoSourceMode.SCREEN_MIRRORING -> "MIRROR A11Y"
-                        VideoSourceMode.CANVAS_TEST_CARD -> "CANVAS"
-                        VideoSourceMode.VIRTUAL_DISPLAY -> "VD #${proj.virtualDisplayId}"
+                    subValue = when (state.appMode) {
+                        AppMode.MIRRORING -> "MIRROR A11Y"
+                        AppMode.SHIZUKU_COCKPIT -> "SHIZUKU #${proj.virtualDisplayId}"
+                        AppMode.COCKPIT -> if (state.videoSourceMode == VideoSourceMode.CANVAS_TEST_CARD) "CANVAS" else "VD #${proj.virtualDisplayId}"
                     },
                     modifier = Modifier.weight(1f)
                 )
                 MetricPill(
                     label = "SURFACE",
                     value = "${state.configuredWidth}×${state.configuredHeight}",
-                    subValue = "${proj.fps} FPS",
+                    subValue = "${proj.fps} FPS • ${proj.virtualDisplayDpi}dpi",
                     modifier = Modifier.weight(1f)
                 )
             }
+
+            Text(
+                text = "Режим: ${state.appMode.title} • MP: ${proj.mediaProjectionState}" +
+                    (proj.lastMediaProjectionError?.let { " • $it" } ?: ""),
+                style = MaterialTheme.typography.labelSmall,
+                color = if (proj.lastMediaProjectionError != null) CoralAlert else TextSecondary
+            )
 
             Row(
                 modifier = Modifier.fillMaxWidth(),

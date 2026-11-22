@@ -100,9 +100,11 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 /**
- * Holds the user-granted [MediaProjection] consent result (`resultCode` + `data` [Intent])
- * from Step 5 of the Onboarding Checklist so `BridgeForegroundService` can promote its FGS type
- * to `mediaProjection` and create a full-screen `VirtualDisplay` without hanging at 90%.
+ * Holds the single-use [MediaProjection] consent result (`resultCode` + `data` [Intent])
+ * from Android 14–16 screen capture prompt as well as active projection lifecycle & diagnostic state.
+ *
+ * On Android 14+, the `Intent` token is strictly single-use: [consumeToken] clears `resultData`
+ * immediately upon calling `mediaProjectionManager.getMediaProjection(...)`.
  */
 object MediaProjectionTokenStore {
     @Volatile
@@ -113,21 +115,130 @@ object MediaProjectionTokenStore {
     var resultData: Intent? = null
         private set
 
+    private val _hasPendingToken = MutableStateFlow(false)
+    val hasPendingToken: StateFlow<Boolean> = _hasPendingToken.asStateFlow()
+
+    private val _isProjectionActive = MutableStateFlow(false)
+    val isProjectionActive: StateFlow<Boolean> = _isProjectionActive.asStateFlow()
+
     private val _hasValidToken = MutableStateFlow(false)
     val hasValidToken: StateFlow<Boolean> = _hasValidToken.asStateFlow()
 
+    private val _lastError = MutableStateFlow<String?>(null)
+    val lastError: StateFlow<String?> = _lastError.asStateFlow()
+
+    private val _statusDetail = MutableStateFlow("Разрешение MediaProjection («Весь экран») не выдано")
+    val statusDetail: StateFlow<String> = _statusDetail.asStateFlow()
+
+    @Synchronized
     fun saveToken(code: Int, data: Intent?) {
         if (code == Activity.RESULT_OK && data != null) {
             resultCode = code
             resultData = Intent(data)
+            _hasPendingToken.value = true
             _hasValidToken.value = true
+            _lastError.value = null
+            _statusDetail.value = "Одноразовый токен «Весь экран» получен"
         }
     }
 
-    fun clearToken() {
+    /**
+     * Atomically extracts and clears the single-use `resultData` [Intent] so it is NEVER reused
+     * on Android 14–16 after calling `getMediaProjection(...)`.
+     */
+    @Synchronized
+    fun consumeToken(): Pair<Int, Intent>? {
+        val code = resultCode
+        val data = resultData
+        if (code != Activity.RESULT_OK || data == null) {
+            return null
+        }
+        val copy = Intent(data)
         resultCode = Activity.RESULT_CANCELED
         resultData = null
+        _hasPendingToken.value = false
+        _hasValidToken.value = _isProjectionActive.value
+        _statusDetail.value = "Одноразовый токен передан в MediaProjection"
+        return code to copy
+    }
+
+    @Synchronized
+    fun setActiveProjection(
+        active: Boolean,
+        detail: String? = null,
+        error: String? = null
+    ) {
+        _isProjectionActive.value = active
+        _hasValidToken.value = active || (_hasPendingToken.value && resultData != null)
+        if (error != null) {
+            _lastError.value = error
+        } else if (active) {
+            _lastError.value = null
+        }
+        _statusDetail.value = detail ?: if (active) {
+            "MediaProjection активен (Весь экран)"
+        } else {
+            error ?: "MediaProjection не активен"
+        }
+    }
+
+    @Synchronized
+    fun recordError(errorMessage: String) {
+        _lastError.value = errorMessage
+        _statusDetail.value = errorMessage
+    }
+
+    @Synchronized
+    fun clearToken(reason: String? = null) {
+        resultCode = Activity.RESULT_CANCELED
+        resultData = null
+        _hasPendingToken.value = false
+        _isProjectionActive.value = false
         _hasValidToken.value = false
+        if (reason != null) {
+            _lastError.value = reason
+            _statusDetail.value = reason
+        } else {
+            _statusDetail.value = "Токен MediaProjection сброшен"
+        }
+    }
+}
+
+/**
+ * Persistent SharedPreferences store for the selected [AppMode] so reconnecting USB AOA or restarting
+ * the Activity/Service never silently resets `MIRRORING` or `SHIZUKU_COCKPIT` back to `COCKPIT`.
+ */
+object AppModePreferences {
+    private const val PREFS_NAME = "carlife_bridge_prefs"
+    private const val KEY_APP_MODE = "selected_app_mode"
+
+    fun saveAppMode(context: Context, mode: AppMode) {
+        runCatching {
+            context.applicationContext
+                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putString(KEY_APP_MODE, mode.id)
+                .commit()
+        }
+    }
+
+    fun loadAppMode(context: Context): AppMode {
+        val savedId = runCatching {
+            context.applicationContext
+                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .getString(KEY_APP_MODE, null)
+        }.getOrNull()
+        return AppMode.fromId(savedId)
+    }
+
+    fun clear(context: Context) {
+        runCatching {
+            context.applicationContext
+                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .remove(KEY_APP_MODE)
+                .commit()
+        }
     }
 }
 
@@ -206,6 +317,9 @@ data class ProjectionPipelineStats(
     val videoSourceMode: VideoSourceMode = VideoSourceMode.SCREEN_MIRRORING,
     val usingMediaProjection: Boolean = false,
     val virtualDisplayId: Int = Display.DEFAULT_DISPLAY,
+    val virtualDisplayDpi: Int = CockpitProjectionManager.MIRROR_VIRTUAL_DISPLAY_DPI,
+    val mediaProjectionState: String = "Ожидает разрешения («Весь экран»)",
+    val lastMediaProjectionError: String? = null,
     val width: Int = 1280,
     val height: Int = 720,
     val fps: Int = 30,
@@ -304,35 +418,115 @@ class CockpitProjectionManager(
     val activeMediaProjection: MediaProjection?
         get() = mediaProjection
 
-    /**
-     * Returns the active [MediaProjection], or lazily instantiates it from [MediaProjectionTokenStore]
-     * so `AudioPlaybackCapture` works even while video is in `CANVAS_TEST_CARD` mode.
-     */
-    suspend fun getOrCreateMediaProjectionForAudio(): MediaProjection? = projectionMutex.withLock {
-        mediaProjection?.let { return@withLock it }
-        val tokenCode = MediaProjectionTokenStore.resultCode
-        val tokenData = MediaProjectionTokenStore.resultData
-        if (tokenCode != Activity.RESULT_OK || tokenData == null) {
-            return@withLock null
-        }
-        return@withLock runCatching {
-            val mp = mediaProjectionManager.getMediaProjection(tokenCode, Intent(tokenData))
-            if (mp != null) {
-                if (mediaProjectionCallback == null) {
-                    val callback = object : MediaProjection.Callback() {
-                        override fun onStop() {
-                            Log.w(TAG, "MediaProjection stopped by system")
-                            MediaProjectionTokenStore.clearToken()
+    private fun createMediaProjectionCallback(targetMp: MediaProjection): MediaProjection.Callback {
+        return object : MediaProjection.Callback() {
+            override fun onStop() {
+                if (mediaProjection !== targetMp && mediaProjection != null) {
+                    Log.d(TAG, "Ignoring stale MediaProjection.Callback.onStop()")
+                    return
+                }
+                Log.w(TAG, "MediaProjection stopped by system (onStop)")
+                val stopReason = "MediaProjection остановлен системой (onStop)"
+                MediaProjectionTokenStore.setActiveProjection(
+                    active = false,
+                    detail = stopReason,
+                    error = stopReason
+                )
+                externalScope.launch {
+                    projectionMutex.withLock {
+                        if (mediaProjection === targetMp) {
+                            mediaProjection = null
+                            mediaProjectionCallback = null
+                        }
+                        runCatching { virtualDisplay?.surface = null }
+                        runCatching { virtualDisplay?.release() }
+                        virtualDisplay = null
+                        virtualDisplayWidth = 0
+                        virtualDisplayHeight = 0
+                        virtualDisplayDpi = 0
+                        virtualDisplayIsMirrorOnly = false
+                        virtualDisplayFlags = 0
+                        if (appMode == AppMode.MIRRORING) {
+                            dismissPresentationSafely()
+                        }
+                        _stats.update {
+                            it.copy(
+                                usingMediaProjection = false,
+                                virtualDisplayId = Display.DEFAULT_DISPLAY,
+                                virtualDisplayDpi = 0,
+                                mediaProjectionState = "Остановлен системой (onStop)",
+                                lastMediaProjectionError = stopReason,
+                                statusMessage = if (appMode == AppMode.MIRRORING) {
+                                    "Зеркалирование остановлено системой — требуется «Весь экран» (откат в Кокпит ЗАПРЕЩЁН)"
+                                } else {
+                                    stopReason
+                                }
+                            )
+                        }
+                        val surface = encoderInputSurface
+                        if (isEncoding.get() && surface != null && surface.isValid) {
+                            startCanvasFeederLoopIfNeeded(
+                                surface = surface,
+                                width = _stats.value.width,
+                                height = _stats.value.height,
+                                frameRate = _stats.value.fps,
+                                sourceMode = videoSourceMode,
+                                targetAppMode = appMode,
+                                diagnosticError = stopReason
+                            )
                         }
                     }
-                    mp.registerCallback(callback, mainHandler)
-                    mediaProjectionCallback = callback
                 }
+            }
+        }
+    }
+
+    /**
+     * Returns the active [MediaProjection], or consumes the single-use [MediaProjectionTokenStore]
+     * intent token once to instantiate it so `AudioPlaybackCapture` works even while video is in `CANVAS_TEST_CARD` mode.
+     */
+    suspend fun getOrCreateMediaProjectionForAudio(): MediaProjection? = projectionMutex.withLock {
+        val currentMp = mediaProjection
+        if (currentMp != null && !MediaProjectionTokenStore.hasPendingToken.value) {
+            return@withLock currentMp
+        }
+        val (tokenCode, tokenData) = MediaProjectionTokenStore.consumeToken()
+            ?: return@withLock currentMp
+
+        return@withLock runCatching {
+            val mp = mediaProjectionManager.getMediaProjection(tokenCode, tokenData)
+            if (mp != null) {
+                if (currentMp != null && currentMp !== mp) {
+                    runCatching {
+                        mediaProjectionCallback?.let { cb -> currentMp.unregisterCallback(cb) }
+                        currentMp.stop()
+                    }
+                    mediaProjectionCallback = null
+                }
+                val callback = createMediaProjectionCallback(mp)
+                mp.registerCallback(callback, mainHandler)
+                mediaProjectionCallback = callback
                 mediaProjection = mp
+                MediaProjectionTokenStore.setActiveProjection(
+                    active = true,
+                    detail = "MediaProjection активен (аудио/видео)"
+                )
             }
             mp
         }.onFailure { e ->
-            Log.w(TAG, "Unable to create MediaProjection for audio capture: ${e.message}")
+            val err = "Ошибка getMediaProjection (audio): ${e.javaClass.simpleName}: ${e.message}"
+            Log.w(TAG, err)
+            MediaProjectionTokenStore.setActiveProjection(
+                active = false,
+                detail = err,
+                error = err
+            )
+            _stats.update {
+                it.copy(
+                    mediaProjectionState = "Ошибка",
+                    lastMediaProjectionError = err
+                )
+            }
         }.getOrNull()
     }
 
@@ -477,8 +671,10 @@ class CockpitProjectionManager(
             virtualDisplayIsMirrorOnly = false
             virtualDisplayFlags = 0
         } else if (targetAppMode == AppMode.MIRRORING || sourceMode == VideoSourceMode.SCREEN_MIRRORING) {
-            // Screen Mirroring mode: Strictly DO NOT show Presentation so the real smartphone screen goes directly into inputSurface.
+            // Screen Mirroring mode: Strictly FORBIDDEN to create/show CockpitPresentation even on MediaProjection errors.
             dismissPresentationSafely()
+            presentationRefreshJob?.cancel()
+            presentationRefreshJob = null
         }
 
         val usesMediaProjectionSource =
@@ -500,7 +696,22 @@ class CockpitProjectionManager(
         var inputSurface: Surface? = null
         var vDisplay: VirtualDisplay? = if (usesMediaProjectionSource) virtualDisplay else null
         var activeMp: MediaProjection? = if (usesMediaProjectionSource) mediaProjection else null
-        var usedMediaProjection = (usesMediaProjectionSource && vDisplay != null && activeMp != null)
+        val hasFreshPendingToken = usesMediaProjectionSource && MediaProjectionTokenStore.hasPendingToken.value
+        if (hasFreshPendingToken && vDisplay != null) {
+            // User explicitly re-granted a fresh MediaProjection token: release stale VD/MP so the new token takes over cleanly.
+            dismissPresentationSafely()
+            runCatching { vDisplay.surface = null }
+            runCatching { vDisplay.release() }
+            vDisplay = null
+            virtualDisplay = null
+            virtualDisplayWidth = 0
+            virtualDisplayHeight = 0
+            virtualDisplayDpi = 0
+            virtualDisplayIsMirrorOnly = false
+            virtualDisplayFlags = 0
+        }
+        var usedMediaProjection = (usesMediaProjectionSource && vDisplay != null && activeMp != null && !hasFreshPendingToken)
+        var mpErrorMessage: String? = MediaProjectionTokenStore.lastError.value
 
         return@withLock try {
             codec = configureLowLatencyAvcEncoder(safeWidth, safeHeight, safeFps, safeBitRate)
@@ -522,7 +733,8 @@ class CockpitProjectionManager(
                     width = safeWidth,
                     height = safeHeight,
                     frameRate = safeFps,
-                    sourceMode = VideoSourceMode.CANVAS_TEST_CARD
+                    sourceMode = VideoSourceMode.CANVAS_TEST_CARD,
+                    targetAppMode = targetAppMode
                 )
 
                 _stats.update {
@@ -532,6 +744,9 @@ class CockpitProjectionManager(
                         videoSourceMode = VideoSourceMode.CANVAS_TEST_CARD,
                         usingMediaProjection = false,
                         virtualDisplayId = Display.DEFAULT_DISPLAY,
+                        virtualDisplayDpi = 0,
+                        mediaProjectionState = if (MediaProjectionTokenStore.isProjectionActive.value) "Активен (в фоне)" else "Не требуется (Canvas)",
+                        lastMediaProjectionError = null,
                         width = safeWidth,
                         height = safeHeight,
                         fps = safeFps,
@@ -579,25 +794,38 @@ class CockpitProjectionManager(
                     }
                 }
 
-                // If no existing VirtualDisplay, check if user granted MediaProjection (Step 5)
+                // If no existing VirtualDisplay, obtain MediaProjection from a newly consumed single-use token or reuse live activeMp
                 if (!usedMediaProjection) {
-                    val tokenData = MediaProjectionTokenStore.resultData
-                    val tokenCode = MediaProjectionTokenStore.resultCode
-                    if (tokenCode == Activity.RESULT_OK && tokenData != null) {
+                    val consumedToken = MediaProjectionTokenStore.consumeToken()
+                    if (consumedToken != null || activeMp != null) {
                         runCatching {
-                            val mp = activeMp ?: mediaProjectionManager.getMediaProjection(tokenCode, Intent(tokenData))
-                            if (mp != null) {
-                                if (mediaProjectionCallback == null) {
-                                    val callback = object : MediaProjection.Callback() {
-                                        override fun onStop() {
-                                            Log.w(TAG, "MediaProjection stopped by system")
-                                            MediaProjectionTokenStore.clearToken()
-                                        }
+                            val mp: MediaProjection? = if (consumedToken != null) {
+                                // Stop any stale MediaProjection before exchanging the fresh single-use Intent
+                                activeMp?.let { oldMp ->
+                                    runCatching {
+                                        mediaProjectionCallback?.let { cb -> oldMp.unregisterCallback(cb) }
+                                        oldMp.stop()
                                     }
+                                    mediaProjectionCallback = null
+                                    mediaProjection = null
+                                }
+                                mediaProjectionManager.getMediaProjection(consumedToken.first, consumedToken.second)
+                            } else {
+                                activeMp
+                            }
+
+                            if (mp != null) {
+                                if (mediaProjectionCallback == null || mp !== activeMp) {
+                                    val callback = createMediaProjectionCallback(mp)
                                     mp.registerCallback(callback, mainHandler)
                                     mediaProjectionCallback = callback
                                 }
                                 activeMp = mp
+                                mediaProjection = mp
+                                MediaProjectionTokenStore.setActiveProjection(
+                                    active = true,
+                                    detail = "MediaProjection активен (${if (wantMirrorOnlyFlags) "Зеркало" else "VD"})"
+                                )
 
                                 var createdFlags = targetVdFlags
                                 vDisplay = runCatching {
@@ -611,7 +839,7 @@ class CockpitProjectionManager(
                                         null,
                                         mainHandler
                                     )
-                                }.getOrElse {
+                                }.getOrElse { firstErr ->
                                     if (targetAppMode == AppMode.SHIZUKU_COCKPIT) {
                                         createdFlags = DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or
                                             DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION
@@ -626,7 +854,7 @@ class CockpitProjectionManager(
                                             mainHandler
                                         )
                                     } else {
-                                        throw it
+                                        throw firstErr
                                     }
                                 }
                                 virtualDisplayWidth = safeWidth
@@ -635,11 +863,41 @@ class CockpitProjectionManager(
                                 virtualDisplayIsMirrorOnly = wantMirrorOnlyFlags
                                 virtualDisplayFlags = createdFlags
                                 usedMediaProjection = true
+                                mpErrorMessage = null
+                            } else {
+                                mpErrorMessage = "getMediaProjection() вернул null — требуется повторно выдать «Весь экран»"
+                                MediaProjectionTokenStore.setActiveProjection(
+                                    active = false,
+                                    detail = mpErrorMessage,
+                                    error = mpErrorMessage
+                                )
                             }
                         }.onFailure { e ->
-                            Log.w(TAG, "MediaProjection VirtualDisplay creation failed, switching to Canvas Surface Feeder: ${e.message}")
-                            MediaProjectionTokenStore.clearToken()
+                            mpErrorMessage = "${e.javaClass.simpleName}: ${e.message ?: "Ошибка MediaProjection"}"
+                            Log.w(TAG, "MediaProjection / VirtualDisplay failed ($mpErrorMessage)")
+                            runCatching {
+                                mediaProjectionCallback?.let { cb -> activeMp?.unregisterCallback(cb) }
+                                activeMp?.stop()
+                            }
+                            mediaProjectionCallback = null
+                            mediaProjection = null
+                            activeMp = null
+                            vDisplay = null
+                            virtualDisplay = null
+                            virtualDisplayWidth = 0
+                            virtualDisplayHeight = 0
+                            virtualDisplayDpi = 0
+                            virtualDisplayIsMirrorOnly = false
+                            virtualDisplayFlags = 0
+                            MediaProjectionTokenStore.setActiveProjection(
+                                active = false,
+                                detail = mpErrorMessage,
+                                error = mpErrorMessage
+                            )
                         }
+                    } else {
+                        mpErrorMessage = MediaProjectionTokenStore.lastError.value
+                            ?: "Токен MediaProjection отсутствует — выдайте «Весь экран»"
                     }
                 }
 
@@ -647,7 +905,7 @@ class CockpitProjectionManager(
                     val createdDisplay = vDisplay!!.display
                     awaitDisplayRegistered(createdDisplay.displayId)
 
-                    // Strictly attach CockpitPresentation in COCKPIT mode, and suppress it in MIRRORING mode
+                    // Strictly attach CockpitPresentation in COCKPIT / SHIZUKU_COCKPIT mode, and NEVER in MIRRORING mode
                     val shouldSuppressPresentation =
                         targetAppMode == AppMode.MIRRORING ||
                             sourceMode == VideoSourceMode.SCREEN_MIRRORING
@@ -706,6 +964,9 @@ class CockpitProjectionManager(
                             videoSourceMode = sourceMode,
                             usingMediaProjection = true,
                             virtualDisplayId = createdDisplay.displayId,
+                            virtualDisplayDpi = effectiveDpi,
+                            mediaProjectionState = "Активен (Весь экран)",
+                            lastMediaProjectionError = null,
                             width = safeWidth,
                             height = safeHeight,
                             fps = safeFps,
@@ -746,20 +1007,35 @@ class CockpitProjectionManager(
                                     width = safeWidth,
                                     height = safeHeight,
                                     frameRate = safeFps,
-                                    sourceMode = VideoSourceMode.VIRTUAL_DISPLAY
+                                    sourceMode = VideoSourceMode.VIRTUAL_DISPLAY,
+                                    targetAppMode = targetAppMode
                                 )
                             }
                         }
                     }
                 } else {
-                    // MediaProjection not yet granted: run Canvas Surface Feeder so H.264 stream stays live until user approves
+                    // MediaProjection missing or failed:
+                    // STRICT NO-FALLBACK RULE: When MIRRORING is selected, NEVER show CockpitPresentation or drawCarLifeLauncherFrame!
+                    // Instead keep appMode = MIRRORING and feed a dedicated Mirroring standby/error diagnostic frame so USB 0x0002 stays alive.
+                    if (targetAppMode == AppMode.MIRRORING) {
+                        dismissPresentationSafely()
+                    }
                     startCanvasFeederLoopIfNeeded(
                         surface = inputSurface,
                         width = safeWidth,
                         height = safeHeight,
                         frameRate = safeFps,
-                        sourceMode = sourceMode
+                        sourceMode = sourceMode,
+                        targetAppMode = targetAppMode,
+                        diagnosticError = mpErrorMessage
                     )
+                    val mpStateLabel = if (MediaProjectionTokenStore.lastError.value != null ||
+                        (mpErrorMessage != null && !mpErrorMessage!!.startsWith("Токен MediaProjection отсутствует"))
+                    ) {
+                        "Ошибка MediaProjection"
+                    } else {
+                        "Ожидает разрешения («Весь экран»)"
+                    }
                     _stats.update {
                         it.copy(
                             isRunning = true,
@@ -767,13 +1043,24 @@ class CockpitProjectionManager(
                             videoSourceMode = sourceMode,
                             usingMediaProjection = false,
                             virtualDisplayId = Display.DEFAULT_DISPLAY,
+                            virtualDisplayDpi = 0,
+                            mediaProjectionState = mpStateLabel,
+                            lastMediaProjectionError = mpErrorMessage,
                             width = safeWidth,
                             height = safeHeight,
                             fps = safeFps,
                             bitRateMbps = (safeBitRate / 1_000_000).coerceAtLeast(1),
                             bitRateKbps = safeBitRate / 1_000,
-                            activeCockpitWidget = "Ожидание MediaProjection («Весь экран»)",
-                            statusMessage = "Ожидание разрешения MediaProjection («Весь экран») — резервный H.264 поток активен"
+                            activeCockpitWidget = if (targetAppMode == AppMode.MIRRORING) {
+                                mpErrorMessage ?: "Ожидание MediaProjection («Весь экран») — откат в Кокпит отключён"
+                            } else {
+                                "Ожидание MediaProjection («Весь экран»)"
+                            },
+                            statusMessage = if (targetAppMode == AppMode.MIRRORING) {
+                                "Зеркалирование: ${mpErrorMessage ?: "ожидание разрешения «Весь экран»"} (откат в Кокпит запрещён)"
+                            } else {
+                                "Ожидание разрешения MediaProjection («Весь экран») — резервный H.264 поток активен"
+                            }
                         )
                     }
                 }
@@ -822,7 +1109,9 @@ class CockpitProjectionManager(
         width: Int,
         height: Int,
         frameRate: Int,
-        sourceMode: VideoSourceMode
+        sourceMode: VideoSourceMode,
+        targetAppMode: AppMode = this.appMode,
+        diagnosticError: String? = null
     ) {
         if (canvasFeederJob?.isActive == true) return
         val frameIntervalMs = if (frameRate == 30) {
@@ -895,34 +1184,49 @@ class CockpitProjectionManager(
                     if (canvas != null) {
                         try {
                             val currentSeq = frameSeq++
-                            if (sourceMode == VideoSourceMode.CANVAS_TEST_CARD) {
-                                drawTestCardFrame(
-                                    canvas = canvas,
-                                    width = width,
-                                    height = height,
-                                    frameSeq = currentSeq,
-                                    timeWithMsString = testTimeFmt.format(Date()),
-                                    paint = testCardPaint
-                                )
-                            } else {
-                                drawCarLifeLauncherFrame(
-                                    canvas = canvas,
-                                    width = width,
-                                    height = height,
-                                    frameSeq = currentSeq,
-                                    timeString = timeFmt.format(Date()),
-                                    bgPaint = bgPaint,
-                                    cardPaint = cardPaint,
-                                    tilePaint = tilePaint,
-                                    borderPaint = borderPaint,
-                                    accentPaint = accentPaint,
-                                    emeraldBadgeBgPaint = emeraldBadgeBgPaint,
-                                    emeraldTextPaint = emeraldTextPaint,
-                                    clockPaint = clockPaint,
-                                    titlePaint = titlePaint,
-                                    subtitlePaint = subtitlePaint,
-                                    appLabelPaint = appLabelPaint
-                                )
+                            when {
+                                sourceMode == VideoSourceMode.CANVAS_TEST_CARD -> {
+                                    drawTestCardFrame(
+                                        canvas = canvas,
+                                        width = width,
+                                        height = height,
+                                        frameSeq = currentSeq,
+                                        timeWithMsString = testTimeFmt.format(Date()),
+                                        paint = testCardPaint
+                                    )
+                                }
+                                targetAppMode == AppMode.MIRRORING || sourceMode == VideoSourceMode.SCREEN_MIRRORING -> {
+                                    // Strict No-Fallback rule: never render Cockpit Launcher UI in MIRRORING mode
+                                    drawMirroringWaitingOrErrorFrame(
+                                        canvas = canvas,
+                                        width = width,
+                                        height = height,
+                                        frameSeq = currentSeq,
+                                        timeString = testTimeFmt.format(Date()),
+                                        diagnosticError = diagnosticError ?: _stats.value.lastMediaProjectionError,
+                                        paint = testCardPaint
+                                    )
+                                }
+                                else -> {
+                                    drawCarLifeLauncherFrame(
+                                        canvas = canvas,
+                                        width = width,
+                                        height = height,
+                                        frameSeq = currentSeq,
+                                        timeString = timeFmt.format(Date()),
+                                        bgPaint = bgPaint,
+                                        cardPaint = cardPaint,
+                                        tilePaint = tilePaint,
+                                        borderPaint = borderPaint,
+                                        accentPaint = accentPaint,
+                                        emeraldBadgeBgPaint = emeraldBadgeBgPaint,
+                                        emeraldTextPaint = emeraldTextPaint,
+                                        clockPaint = clockPaint,
+                                        titlePaint = titlePaint,
+                                        subtitlePaint = subtitlePaint,
+                                        appLabelPaint = appLabelPaint
+                                    )
+                                }
                             }
                         } finally {
                             surface.unlockCanvasAndPost(canvas)
@@ -938,6 +1242,81 @@ class CockpitProjectionManager(
                 delay(sleepMs)
             }
         }
+    }
+
+    /**
+     * Dedicated diagnostic frame rendered ONLY when [AppMode.MIRRORING] is selected and
+     * `MediaProjection` has not yet been granted or threw an error, so the HU never receives
+     * Cockpit Launcher UI by mistake and H.264 keep-alive stays active.
+     */
+    fun drawMirroringWaitingOrErrorFrame(
+        canvas: AndroidCanvas,
+        width: Int,
+        height: Int,
+        frameSeq: Long,
+        timeString: String,
+        diagnosticError: String?,
+        paint: Paint = Paint(Paint.ANTI_ALIAS_FLAG)
+    ) {
+        val w = width.toFloat().coerceAtLeast(1f)
+        val h = height.toFloat().coerceAtLeast(1f)
+        val scale = (h / 720f).coerceIn(0.6f, 1.4f)
+
+        paint.style = Paint.Style.FILL
+        paint.setShadowLayer(0f, 0f, 0f, AndroidColor.TRANSPARENT)
+        paint.color = AndroidColor.parseColor("#0B0E14")
+        canvas.drawRect(0f, 0f, w, h, paint)
+
+        val cardRect = RectF(w * 0.08f, h * 0.14f, w * 0.92f, h * 0.86f)
+        paint.color = AndroidColor.parseColor("#151A24")
+        canvas.drawRoundRect(cardRect, 24f * scale, 24f * scale, paint)
+
+        paint.style = Paint.Style.STROKE
+        paint.strokeWidth = 3f * scale
+        paint.color = if (diagnosticError != null) AndroidColor.parseColor("#F59E0B") else AndroidColor.parseColor("#00B4D8")
+        canvas.drawRoundRect(cardRect, 24f * scale, 24f * scale, paint)
+
+        paint.style = Paint.Style.FILL
+        paint.textAlign = Paint.Align.CENTER
+        paint.color = AndroidColor.parseColor("#00B4D8")
+        paint.typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
+        paint.textSize = 36f * scale
+        canvas.drawText(
+            "РЕЖИМ ЗЕРКАЛИРОВАНИЯ ЭКРАНА",
+            w * 0.5f,
+            h * 0.34f,
+            paint
+        )
+
+        paint.color = if (diagnosticError != null) AndroidColor.parseColor("#F59E0B") else AndroidColor.WHITE
+        paint.textSize = 26f * scale
+        val mainMsg = if (diagnosticError != null) {
+            "MediaProjection: ${diagnosticError.take(64)}"
+        } else {
+            "Подтвердите захват «Весь экран» на телефоне"
+        }
+        canvas.drawText(mainMsg, w * 0.5f, h * 0.48f, paint)
+
+        paint.color = AndroidColor.parseColor("#94A3B8")
+        paint.typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.NORMAL)
+        paint.textSize = 20f * scale
+        canvas.drawText(
+            "Откат в Кокпит отключён • $timeString • Кадр #$frameSeq",
+            w * 0.5f,
+            h * 0.62f,
+            paint
+        )
+
+        val barWidth = (cardRect.width() - 80f * scale).coerceAtLeast(40f)
+        val progress = ((frameSeq % 30L) / 30f) * barWidth
+        paint.color = AndroidColor.parseColor("#00B4D8")
+        canvas.drawRect(
+            cardRect.left + 40f * scale,
+            cardRect.bottom - 48f * scale,
+            cardRect.left + 40f * scale + progress.coerceAtLeast(16f),
+            cardRect.bottom - 40f * scale,
+            paint
+        )
     }
 
     /**
@@ -1752,6 +2131,10 @@ class CockpitProjectionManager(
             }
             mediaProjectionCallback = null
             mediaProjection = null
+            MediaProjectionTokenStore.setActiveProjection(
+                active = false,
+                detail = "Проекция остановлена"
+            )
         }
 
         if (updateStatus) {
@@ -1760,6 +2143,8 @@ class CockpitProjectionManager(
                     isRunning = false,
                     usingMediaProjection = false,
                     virtualDisplayId = Display.DEFAULT_DISPLAY,
+                    virtualDisplayDpi = 0,
+                    mediaProjectionState = if (stopMediaProjection) "Остановлена" else it.mediaProjectionState,
                     spsPpsConfigured = false,
                     statusMessage = "Projection Stopped"
                 )

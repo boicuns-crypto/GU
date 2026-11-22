@@ -26,6 +26,7 @@ import com.example.core.audio.CarLifeAudioCaptureManager
 import com.example.core.carlife.CarLifeHardKeyPacket
 import com.example.core.carlife.CarLifeTouchPacket
 import com.example.core.projection.AppMode
+import com.example.core.projection.AppModePreferences
 import com.example.core.projection.CockpitProjectionManager
 import com.example.core.projection.MediaProjectionTokenStore
 import com.example.core.projection.ProjectionPipelineStats
@@ -154,7 +155,20 @@ object BridgeTelemetryBus {
         }
     }
 
-    fun setAppMode(mode: AppMode) {
+    fun restoreSavedAppMode(context: Context): AppMode {
+        val saved = AppModePreferences.loadAppMode(context)
+        applyAppModeState(saved, eventNote = "Восстановлен режим: ${saved.title}")
+        return saved
+    }
+
+    fun setAppMode(mode: AppMode, context: Context? = null) {
+        if (context != null) {
+            AppModePreferences.saveAppMode(context, mode)
+        }
+        applyAppModeState(mode, eventNote = "Режим работы: ${mode.title}")
+    }
+
+    private fun applyAppModeState(mode: AppMode, eventNote: String) {
         val mappedSource = when (mode) {
             AppMode.MIRRORING -> VideoSourceMode.SCREEN_MIRRORING
             AppMode.COCKPIT, AppMode.SHIZUKU_COCKPIT -> VideoSourceMode.VIRTUAL_DISPLAY
@@ -170,7 +184,7 @@ object BridgeTelemetryBus {
                 appMode = mode,
                 videoSourceMode = mappedSource,
                 appLaunchMode = mappedLaunch,
-                lastProtocolEvent = "Режим работы: ${mode.title}"
+                lastProtocolEvent = eventNote
             )
         }
     }
@@ -202,11 +216,14 @@ object BridgeTelemetryBus {
         }
     }
 
-    fun setVideoSourceMode(mode: VideoSourceMode) {
+    fun setVideoSourceMode(mode: VideoSourceMode, context: Context? = null) {
         val mappedAppMode = when {
             mode == VideoSourceMode.SCREEN_MIRRORING -> AppMode.MIRRORING
             _runtimeState.value.appMode == AppMode.SHIZUKU_COCKPIT -> AppMode.SHIZUKU_COCKPIT
             else -> AppMode.COCKPIT
+        }
+        if (context != null) {
+            AppModePreferences.saveAppMode(context, mappedAppMode)
         }
         _runtimeState.update {
             it.copy(
@@ -737,6 +754,8 @@ class BridgeForegroundService : Service() {
         createNotificationChannel()
         acquireWakeLock()
 
+        // Restore persisted AppMode (COCKPIT / MIRRORING / SHIZUKU_COCKPIT) before initializing engines
+        BridgeTelemetryBus.restoreSavedAppMode(applicationContext)
         // Default Jetta VS7 Mode 1: AOA 20B (8B AOA [00 00 00 02][len+12] + 12B video header [len][ts][00 02 00 01])
         val initialRuntime = BridgeTelemetryBus.runtimeState.value
         val currentNestedMode = initialRuntime.useNestedVideoMsgHeader
@@ -1060,7 +1079,9 @@ class BridgeForegroundService : Service() {
                 controlStateMachine.setPreferredResolution(requestedW, requestedH)
 
                 if (resultCode == Activity.RESULT_OK && resultData != null) {
-                    MediaProjectionTokenStore.saveToken(resultCode, resultData)
+                    if (!MediaProjectionTokenStore.hasPendingToken.value && !MediaProjectionTokenStore.isProjectionActive.value) {
+                        MediaProjectionTokenStore.saveToken(resultCode, resultData)
+                    }
                     promoteToForeground(usbTransport.state.value)
                     val targetW = activeWidth
                     val targetH = activeHeight
@@ -1100,6 +1121,18 @@ class BridgeForegroundService : Service() {
                             } else {
                                 "MediaProjection granted ($targetW×$targetH) — SPS/PPS cached in memory"
                             }
+                        )
+                    }
+                } else {
+                    val deniedMsg = "Разрешение MediaProjection («Весь экран») отклонено (code=$resultCode)"
+                    MediaProjectionTokenStore.recordError(deniedMsg)
+                    BridgeTelemetryBus.updateState {
+                        it.copy(
+                            lastProtocolEvent = deniedMsg,
+                            projectionStats = it.projectionStats.copy(
+                                mediaProjectionState = "Отклонено",
+                                lastMediaProjectionError = deniedMsg
+                            )
                         )
                     }
                 }
@@ -1203,7 +1236,7 @@ class BridgeForegroundService : Service() {
                 projectionManager.appMode = mode
                 projectionManager.videoSourceMode = targetSource
                 projectionManager.setAppLaunchMode(targetLaunch)
-                BridgeTelemetryBus.setAppMode(mode)
+                BridgeTelemetryBus.setAppMode(mode, applicationContext)
 
                 if (mode == AppMode.SHIZUKU_COCKPIT) {
                     CarLifeShizukuManager.init(applicationContext)
@@ -1381,7 +1414,7 @@ class BridgeForegroundService : Service() {
                 activeVideoSourceMode = mode
                 projectionManager.appMode = mappedAppMode
                 projectionManager.videoSourceMode = mode
-                BridgeTelemetryBus.setVideoSourceMode(mode)
+                BridgeTelemetryBus.setVideoSourceMode(mode, applicationContext)
                 serviceScope.launch {
                     val wasReady = isVideoChannelReadyForStreaming
                     resetVideoLogFlags()
@@ -1805,7 +1838,8 @@ class BridgeForegroundService : Service() {
     private fun promoteToForeground(state: UsbTransportState) {
         val notification = buildNotification(state)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            val hasMpToken = MediaProjectionTokenStore.hasValidToken.value
+            val hasMpToken = MediaProjectionTokenStore.hasValidToken.value ||
+                (::projectionManager.isInitialized && projectionManager.activeMediaProjection != null)
             val isUsbSessionActive = state is UsbTransportState.Connected || state is UsbTransportState.Connecting
 
             var desiredType = ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
