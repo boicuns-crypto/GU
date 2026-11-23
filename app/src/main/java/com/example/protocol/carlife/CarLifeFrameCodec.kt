@@ -975,10 +975,93 @@ object CarLifeFrameCodec {
     var useNestedVideoMsgHeader: Boolean = true
 
     /**
+     * Zero-allocation inspection result for the leading NAL units of an H.264 Annex-B buffer.
+     */
+    data class LeadingNalInfo(
+        val hasSps: Boolean,
+        val hasPps: Boolean,
+        val hasIdr: Boolean,
+        val hasAnnexBStartCode: Boolean,
+        val firstNalType: Int
+    ) {
+        val hasSpsAndPps: Boolean
+            get() = hasSps && hasPps
+    }
+
+    /**
+     * Zero-allocation fast inspection of the leading [maxScanBytes] bytes of an H.264 buffer
+     * for Annex-B start codes (`00 00 00 01` / `00 00 01`) and NAL types (`7`=SPS, `8`=PPS, `5`=IDR).
+     * Eliminates per-frame `ByteArray` copies and full-frame scans on the 30 fps video hot path.
+     */
+    fun inspectLeadingNalHeader(
+        h264Buffer: ByteArray,
+        maxScanBytes: Int = 192
+    ): LeadingNalInfo {
+        if (h264Buffer.size < 4) {
+            return LeadingNalInfo(
+                hasSps = false,
+                hasPps = false,
+                hasIdr = false,
+                hasAnnexBStartCode = false,
+                firstNalType = 0
+            )
+        }
+        val limit = minOf(h264Buffer.size - 3, maxScanBytes.coerceAtLeast(16))
+        var hasSps = false
+        var hasPps = false
+        var hasIdr = false
+        var hasAnnexB = false
+        var firstNalType = 0
+        var i = 0
+        while (i < limit) {
+            if (h264Buffer[i] == 0x00.toByte() && h264Buffer[i + 1] == 0x00.toByte()) {
+                val payloadPos = when {
+                    h264Buffer[i + 2] == 0x01.toByte() -> i + 3
+                    h264Buffer[i + 2] == 0x00.toByte() && i + 3 < h264Buffer.size && h264Buffer[i + 3] == 0x01.toByte() -> i + 4
+                    else -> -1
+                }
+                if (payloadPos > 0 && payloadPos < h264Buffer.size) {
+                    hasAnnexB = true
+                    val nalType = h264Buffer[payloadPos].toInt() and 0x1F
+                    if (firstNalType == 0) firstNalType = nalType
+                    when (nalType) {
+                        7 -> hasSps = true
+                        8 -> hasPps = true
+                        5 -> {
+                            hasIdr = true
+                            // Once IDR slice starts, SPS/PPS headers precede it — no need to scan payload bytes
+                            break
+                        }
+                        1 -> {
+                            // Non-IDR P-slice started directly — no need to scan payload bytes
+                            break
+                        }
+                    }
+                    i = payloadPos + 1
+                    continue
+                }
+            }
+            i++
+        }
+        return LeadingNalInfo(
+            hasSps = hasSps,
+            hasPps = hasPps,
+            hasIdr = hasIdr,
+            hasAnnexBStartCode = hasAnnexB,
+            firstNalType = firstNalType
+        )
+    }
+
+    /**
      * Returns `true` if [h264Buffer] already contains both H.264 SPS (NAL type 7) and PPS (NAL type 8).
+     * Uses zero-allocation leading-header scan for Annex-B frames and falls back to full split only
+     * for non-Annex-B (AVCC) or oversized header buffers.
      */
     fun containsSpsAndPps(h264Buffer: ByteArray): Boolean {
         if (h264Buffer.size < 10) return false
+        val leading = inspectLeadingNalHeader(h264Buffer, maxScanBytes = 256)
+        if (leading.hasSpsAndPps) return true
+        if (leading.hasAnnexBStartCode && !leading.hasSps && !leading.hasPps) return false
         val nals = splitAnnexBNalUnits(h264Buffer)
         var hasSps = false
         var hasPps = false

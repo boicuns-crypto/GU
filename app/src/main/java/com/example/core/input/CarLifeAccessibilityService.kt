@@ -102,20 +102,23 @@ class CarLifeAccessibilityService : AccessibilityService() {
     fun getPhysicalScreenSize(): Pair<Int, Int> = computePhysicalScreenSize(this)
 
     /**
-     * Synthesizes a single tap gesture (`40–60 ms`, default `50 ms`) at `(x, y)` on [displayId].
+     * Synthesizes a single tap gesture (configured via [TouchSettingsPreferences], default `50 ms`) at `(x, y)` on [displayId].
      */
     fun injectTap(
         displayId: Int = Display.DEFAULT_DISPLAY,
         x: Float,
         y: Float,
-        durationMs: Long = DEFAULT_TAP_DURATION_MS
+        durationMs: Long = TouchSettingsPreferences.config.value.tapDurationMs
     ): Boolean {
         val safeX = x.coerceAtLeast(0f)
         val safeY = y.coerceAtLeast(0f)
         val path = Path().apply {
             moveTo(safeX, safeY)
         }
-        val clampedDuration = durationMs.coerceIn(MIN_TAP_DURATION_MS, MAX_TAP_DURATION_MS)
+        val clampedDuration = durationMs.coerceIn(
+            TouchSensitivityConfig.MIN_TAP_DURATION_MS,
+            TouchSensitivityConfig.MAX_TAP_DURATION_MS
+        )
         val stroke = GestureDescription.StrokeDescription(path, 0L, clampedDuration)
         val builder = GestureDescription.Builder().addStroke(stroke)
         applyTargetDisplayId(builder, displayId)
@@ -125,20 +128,23 @@ class CarLifeAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * Synthesizes a long-press gesture (`600 ms` default) at `(x, y)` on [displayId].
+     * Synthesizes a long-press gesture (configured via [TouchSettingsPreferences], default `550 ms`) at `(x, y)` on [displayId].
      */
     fun injectLongPress(
         displayId: Int = Display.DEFAULT_DISPLAY,
         x: Float,
         y: Float,
-        durationMs: Long = DEFAULT_LONG_PRESS_DURATION_MS
+        durationMs: Long = TouchSettingsPreferences.config.value.longPressDurationMs
     ): Boolean {
         val safeX = x.coerceAtLeast(0f)
         val safeY = y.coerceAtLeast(0f)
         val path = Path().apply {
             moveTo(safeX, safeY)
         }
-        val clampedDuration = durationMs.coerceIn(MIN_LONG_PRESS_DURATION_MS, MAX_SWIPE_DURATION_MS)
+        val clampedDuration = durationMs.coerceIn(
+            TouchSensitivityConfig.MIN_LONG_PRESS_DURATION_MS,
+            MAX_SWIPE_DURATION_MS
+        )
         val stroke = GestureDescription.StrokeDescription(path, 0L, clampedDuration)
         val builder = GestureDescription.Builder().addStroke(stroke)
         applyTargetDisplayId(builder, displayId)
@@ -148,17 +154,18 @@ class CarLifeAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * Synthesizes a double-tap gesture (two 50 ms taps separated by an 80 ms gap) at `(x, y)`.
+     * Synthesizes a double-tap gesture (two taps separated by an interval) at `(x, y)`.
      */
     fun injectDoubleTap(
         displayId: Int = Display.DEFAULT_DISPLAY,
         x: Float,
         y: Float
     ): Boolean {
-        val firstOk = injectTap(displayId = displayId, x = x, y = y, durationMs = DEFAULT_TAP_DURATION_MS)
+        val tapDuration = TouchSettingsPreferences.config.value.tapDurationMs
+        val firstOk = injectTap(displayId = displayId, x = x, y = y, durationMs = tapDuration)
         if (!firstOk) return false
         Handler(Looper.getMainLooper()).postDelayed(
-            { injectTap(displayId = displayId, x = x, y = y, durationMs = DEFAULT_TAP_DURATION_MS) },
+            { injectTap(displayId = displayId, x = x, y = y, durationMs = tapDuration) },
             DOUBLE_TAP_INTERVAL_MS
         )
         return true
@@ -235,6 +242,8 @@ class CarLifeAccessibilityService : AccessibilityService() {
         isDoubleClick: Boolean = false,
         isLongPress: Boolean = false
     ): Boolean {
+        val touchCfg = TouchSettingsPreferences.config.value
+
         if (isDoubleClick) {
             isTrackingGesture = false
             movementPoints.clear()
@@ -243,12 +252,22 @@ class CarLifeAccessibilityService : AccessibilityService() {
         if (isLongPress) {
             isTrackingGesture = false
             movementPoints.clear()
-            return injectLongPress(displayId = displayId, x = x, y = y)
+            return injectLongPress(
+                displayId = displayId,
+                x = x,
+                y = y,
+                durationMs = touchCfg.longPressDurationMs
+            )
         }
         if (synthesizeClickUp) {
             isTrackingGesture = false
             movementPoints.clear()
-            return injectTap(displayId = displayId, x = x, y = y, durationMs = DEFAULT_TAP_DURATION_MS)
+            return injectTap(
+                displayId = displayId,
+                x = x,
+                y = y,
+                durationMs = touchCfg.tapDurationMs
+            )
         }
 
         return when (action) {
@@ -271,8 +290,9 @@ class CarLifeAccessibilityService : AccessibilityService() {
                     isTrackingGesture = true
                 }
                 val lastPt = movementPoints.lastOrNull()
+                val deadzoneSq = touchCfg.moveDeadzonePxSq
                 val shouldAppend = lastPt == null ||
-                    ((x - lastPt.first) * (x - lastPt.first) + (y - lastPt.second) * (y - lastPt.second) >= 4f)
+                    ((x - lastPt.first) * (x - lastPt.first) + (y - lastPt.second) * (y - lastPt.second) >= deadzoneSq)
                 if (shouldAppend) {
                     if (movementPoints.size >= MAX_PATH_POINTS) {
                         // Keep start point and decimate interior points smoothly for long map drags
@@ -291,7 +311,12 @@ class CarLifeAccessibilityService : AccessibilityService() {
 
             MotionEvent.ACTION_UP -> {
                 if (!isTrackingGesture) {
-                    injectTap(displayId = displayId, x = x, y = y, durationMs = DEFAULT_TAP_DURATION_MS)
+                    injectTap(
+                        displayId = displayId,
+                        x = x,
+                        y = y,
+                        durationMs = touchCfg.tapDurationMs
+                    )
                 } else {
                     isTrackingGesture = false
                     movementPoints.add(x to y)
@@ -302,17 +327,22 @@ class CarLifeAccessibilityService : AccessibilityService() {
                         startY = touchStartY,
                         endX = x,
                         endY = y,
-                        points = movementPoints
+                        points = movementPoints,
+                        tapSlopPx = touchCfg.tapSlopPx
                     )
                     val result = if (isTap) {
                         injectTap(
                             displayId = displayId,
                             x = x,
                             y = y,
-                            durationMs = DEFAULT_TAP_DURATION_MS
+                            durationMs = touchCfg.tapDurationMs
                         )
                     } else {
-                        val swipeDurationMs = computeSwipeDurationMs(touchDownUptimeMs, upTimeMs)
+                        val swipeDurationMs = computeSwipeDurationMs(
+                            downTimeMs = touchDownUptimeMs,
+                            upTimeMs = upTimeMs,
+                            swipeSpeedFactor = touchCfg.swipeSpeedFactor
+                        )
                         injectPathGesture(
                             displayId = displayId,
                             points = movementPoints.toList(),
@@ -322,7 +352,7 @@ class CarLifeAccessibilityService : AccessibilityService() {
                     movementPoints.clear()
                     Log.d(
                         TAG,
-                        "0x0006 gesture dispatched (${if (isTap) "TAP 50ms" else "SWIPE ${elapsedMs}ms"}) -> display=$displayId (${x.toInt()},${y.toInt()}) ok=$result"
+                        "0x0006 gesture dispatched (${if (isTap) "TAP ${touchCfg.tapDurationMs}ms" else "SWIPE ${elapsedMs}ms×${touchCfg.swipeSpeedFactor}"}) -> display=$displayId (${x.toInt()},${y.toInt()}) ok=$result"
                     )
                     result
                 }
@@ -539,8 +569,18 @@ class CarLifeAccessibilityService : AccessibilityService() {
             return mapped.x to mapped.y
         }
 
-        fun computeSwipeDurationMs(downTimeMs: Long, upTimeMs: Long): Long {
-            return (upTimeMs - downTimeMs).coerceIn(MIN_SWIPE_DURATION_MS, MAX_SWIPE_DURATION_MS)
+        fun computeSwipeDurationMs(
+            downTimeMs: Long,
+            upTimeMs: Long,
+            swipeSpeedFactor: Float = 1.0f
+        ): Long {
+            val safeFactor = swipeSpeedFactor.coerceIn(
+                TouchSensitivityConfig.MIN_SWIPE_SPEED_FACTOR,
+                TouchSensitivityConfig.MAX_SWIPE_SPEED_FACTOR
+            )
+            val rawMs = (upTimeMs - downTimeMs).coerceAtLeast(0L)
+            val adjustedMs = (rawMs / safeFactor).toLong()
+            return adjustedMs.coerceIn(MIN_SWIPE_DURATION_MS, MAX_SWIPE_DURATION_MS)
         }
 
         fun isShortTapGesture(
@@ -548,15 +588,17 @@ class CarLifeAccessibilityService : AccessibilityService() {
             startY: Float,
             endX: Float,
             endY: Float,
-            points: List<Pair<Float, Float>>
+            points: List<Pair<Float, Float>>,
+            tapSlopPx: Float = 16f
         ): Boolean {
+            val slopSq = (tapSlopPx.coerceAtLeast(1f)).let { it * it }
             val endDx = endX - startX
             val endDy = endY - startY
-            if (endDx * endDx + endDy * endDy >= TAP_SLOP_PX_SQ) return false
+            if (endDx * endDx + endDy * endDy >= slopSq) return false
             for (pt in points) {
                 val dx = pt.first - startX
                 val dy = pt.second - startY
-                if (dx * dx + dy * dy >= TAP_SLOP_PX_SQ) return false
+                if (dx * dx + dy * dy >= slopSq) return false
             }
             return true
         }

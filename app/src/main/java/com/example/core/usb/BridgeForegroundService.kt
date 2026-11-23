@@ -26,11 +26,15 @@ import com.example.core.audio.AudioCaptureStats
 import com.example.core.audio.CarLifeAudioCaptureManager
 import com.example.core.carlife.CarLifeHardKeyPacket
 import com.example.core.carlife.CarLifeTouchPacket
+import com.example.core.input.TouchSettingsPreferences
 import com.example.core.projection.AppMode
 import com.example.core.projection.AppModePreferences
 import com.example.core.projection.CockpitProjectionManager
 import com.example.core.projection.MediaProjectionTokenStore
 import com.example.core.projection.ProjectionPipelineStats
+import com.example.core.projection.ScreenKeepAliveManager
+import com.example.core.projection.ScreenKeepAlivePreferences
+import com.example.core.projection.ScreenKeepAliveState
 import com.example.core.projection.VideoSourceMode
 import com.example.core.shizuku.CarLifeShizukuManager
 import com.example.feature.cockpit.AppLaunchMode
@@ -114,6 +118,8 @@ data class BridgeRuntimeState(
     val controlSession: CarLifeControlSessionState = CarLifeControlSessionState(),
     val projectionStats: ProjectionPipelineStats = ProjectionPipelineStats(),
     val audioCaptureStats: AudioCaptureStats = AudioCaptureStats(),
+    val screenKeepAliveState: ScreenKeepAliveState = ScreenKeepAliveState(),
+    val droppedVideoPFrames: Long = 0L,
     val isVideoChannelReadyForStreaming: Boolean = false,
     val useNestedVideoMsgHeader: Boolean = true,
     val appMode: AppMode = AppMode.MIRRORING,
@@ -413,9 +419,6 @@ class BridgeForegroundService : Service() {
 
     private val binder = LocalBinder()
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val videoTxDispatcher = Executors.newSingleThreadExecutor { runnable ->
-        Thread(runnable, "CarLifeVideoTxFifo").apply { isDaemon = true }
-    }.asCoroutineDispatcher()
 
     private var wakeLock: PowerManager.WakeLock? = null
     private var screenWakeLock: PowerManager.WakeLock? = null
@@ -429,19 +432,8 @@ class BridgeForegroundService : Service() {
     lateinit var audioCaptureManager: CarLifeAudioCaptureManager
         private set
 
-    private sealed interface VideoTxItem {
-        data class VideoFrame(
-            val nalBytes: ByteArray,
-            val timestampMs: Long,
-            val isKeyFrame: Boolean
-        ) : VideoTxItem
+    private lateinit var screenKeepAliveManager: ScreenKeepAliveManager
 
-        data class VideoHeartbeat(
-            val timestampMs: Long
-        ) : VideoTxItem
-    }
-
-    private val videoTxQueue = Channel<VideoTxItem>(capacity = Channel.UNLIMITED)
     private val controlStateMachine = CarLifeControlStateMachine()
     private val videoPacketCounter = java.util.concurrent.atomic.AtomicLong(0L)
     private val audioPacketCounter = java.util.concurrent.atomic.AtomicLong(0L)
@@ -497,16 +489,9 @@ class BridgeForegroundService : Service() {
     private val isMediaProjectionFgsActive = java.util.concurrent.atomic.AtomicBoolean(false)
     private val hasStartedInitialProjection = java.util.concurrent.atomic.AtomicBoolean(false)
 
-    private fun clearPendingVideoTxQueue() {
-        while (videoTxQueue.tryReceive().isSuccess) {
-            // Drain stale video frames/heartbeats from closed/reset sessions
-        }
-    }
-
     private fun setVideoStreamingReady(ready: Boolean) {
         isVideoChannelReadyForStreaming = ready
         if (!ready) {
-            clearPendingVideoTxQueue()
             lastVideoTxElapsedMs = 0L
             lastRealVideoFrameElapsedMs = 0L
         } else {
@@ -524,15 +509,15 @@ class BridgeForegroundService : Service() {
 
     private fun resetVideoLogFlags() {
         videoPacketCounter.set(0L)
-        clearPendingVideoTxQueue()
     }
 
     /**
      * Wraps a complete H.264 frame (combined `SPS+PPS+IDR` keyframe OR single `P-slice` frame)
      * into ONE CarLife `0x0002` video packet (default: Mode 1 AOA 20B with `0x00020001`) and
-     * transmits it over USB AOA without splitting NAL units.
+     * enqueues it directly into [UsbAccessoryTransport.enqueueFrameNonBlocking] (zero intermediate
+     * thread/channel hops) without splitting NAL units.
      */
-    private suspend fun sendVideoFrame(
+    private fun sendVideoFrameDirect(
         nalBytes: ByteArray,
         timestampMs: Long,
         isKeyFrame: Boolean = false
@@ -541,20 +526,25 @@ class BridgeForegroundService : Service() {
             return false
         }
         val annexB4Frame = CarLifeFrameCodec.ensureAnnexBStartCode(nalBytes)
-        val firstNalType = if (annexB4Frame.size > 4) (annexB4Frame[4].toInt() and 0x1F) else 0
-        val hasSpsPpsPrefix = CarLifeFrameCodec.containsSpsAndPps(annexB4Frame)
-        val isBundledKeyFrame = isKeyFrame || firstNalType == 5 || hasSpsPpsPrefix
+        val leading = CarLifeFrameCodec.inspectLeadingNalHeader(annexB4Frame)
+        val hasSpsPpsPrefix = leading.hasSpsAndPps
+        val isBundledKeyFrame = isKeyFrame || leading.hasIdr || hasSpsPpsPrefix
         val pktIndex = videoPacketCounter.incrementAndGet()
 
         val videoFrame = CarLifeFrameCodec.createVideoFrame(
             nalData = annexB4Frame,
             timestampMs = timestampMs
         )
-        val sentOk = usbTransport.sendFrameImmediate(videoFrame, isKeyFrameHint = isBundledKeyFrame)
+        val sentOk = usbTransport.enqueueFrameNonBlocking(videoFrame, isKeyFrameHint = isBundledKeyFrame)
         if (!sentOk) return false
         val now = SystemClock.elapsedRealtime()
         lastVideoTxElapsedMs = now
         lastRealVideoFrameElapsedMs = now
+
+        val droppedNow = usbTransport.droppedVideoPFrames
+        if (::projectionManager.isInitialized) {
+            projectionManager.updateDroppedVideoPFrames(droppedNow)
+        }
 
         val logPacketsInUi = BridgeTelemetryBus.runtimeState.value.logPacketsInUi
         if (logPacketsInUi) {
@@ -592,6 +582,9 @@ class BridgeForegroundService : Service() {
                 rxFramesTotal = usbTransport.rxFrames,
                 txFramesTotal = usbTransport.txFrames
             )
+            if (BridgeTelemetryBus.runtimeState.value.droppedVideoPFrames != droppedNow) {
+                BridgeTelemetryBus.updateState { it.copy(droppedVideoPFrames = droppedNow) }
+            }
         }
         return true
     }
@@ -600,7 +593,7 @@ class BridgeForegroundService : Service() {
      * Sends an empty `MSG_VIDEO_HEARTBEAT (0x00020002, payloadLen = 0)` packet in AOA 20B mode
      * when no H.264 frames have arrived from the codec for > 200 ms.
      */
-    private suspend fun sendVideoHeartbeatIfStillIdle(timestampMs: Long): Boolean {
+    private fun sendVideoHeartbeatIfStillIdleDirect(timestampMs: Long): Boolean {
         if (!isVideoChannelReadyForStreaming ||
             usbTransport.state.value !is UsbTransportState.Connected ||
             !CarLifeFrameCodec.useNestedVideoMsgHeader
@@ -615,7 +608,7 @@ class BridgeForegroundService : Service() {
             return false
         }
         val hb = CarLifeFrameCodec.createVideoHeartbeatFrame(timestampMs = timestampMs)
-        val sentOk = usbTransport.sendFrameImmediate(hb, isKeyFrameHint = true)
+        val sentOk = usbTransport.enqueueFrameNonBlocking(hb, isKeyFrameHint = true)
         if (!sentOk) return false
         lastVideoTxElapsedMs = SystemClock.elapsedRealtime()
         BridgeTelemetryBus.recordFrame(
@@ -781,8 +774,10 @@ class BridgeForegroundService : Service() {
         createNotificationChannel()
         acquireWakeLock()
 
-        // Restore persisted AppMode (COCKPIT / MIRRORING / SHIZUKU_COCKPIT) and ThemeMode before initializing engines
+        // Restore persisted AppMode, ThemeMode, Touch Sensitivity, and Screen Keep-Alive before initializing engines
         ThemePreferences.init(applicationContext)
+        TouchSettingsPreferences.init(applicationContext)
+        ScreenKeepAlivePreferences.init(applicationContext)
         BridgeTelemetryBus.restoreSavedAppMode(applicationContext)
         // Default Jetta VS7 Mode 1: AOA 20B (8B AOA [00 00 00 02][len+12] + 12B video header [len][ts][00 02 00 01])
         val initialRuntime = BridgeTelemetryBus.runtimeState.value
@@ -802,23 +797,9 @@ class BridgeForegroundService : Service() {
             ioDispatcher = Dispatchers.IO,
             externalScope = serviceScope
         )
-
-        // Single sequential FIFO consumer for 0x0002 packets so bundled SPS+PPS+IDR, P-slices, and heartbeats never reorder
-        serviceScope.launch(videoTxDispatcher) {
-            for (item in videoTxQueue) {
-                if (!isVideoChannelReadyForStreaming || usbTransport.state.value !is UsbTransportState.Connected) {
-                    continue
-                }
-                when (item) {
-                    is VideoTxItem.VideoFrame -> sendVideoFrame(
-                        nalBytes = item.nalBytes,
-                        timestampMs = item.timestampMs,
-                        isKeyFrame = item.isKeyFrame
-                    )
-                    is VideoTxItem.VideoHeartbeat -> sendVideoHeartbeatIfStillIdle(
-                        timestampMs = item.timestampMs
-                    )
-                }
+        usbTransport.onVideoCongestionDrop = {
+            if (::projectionManager.isInitialized) {
+                projectionManager.requestRecoveryIdrOnCongestion()
             }
         }
 
@@ -831,15 +812,11 @@ class BridgeForegroundService : Service() {
                     return@CockpitProjectionManager
                 }
 
-                // Per VideoOutputThread.smali: NEVER split SPS+PPS+IDR or P-frame buffers into separate packets.
-                // Enqueue the entire frame (combined cachedSpsPps + idrBytes for keyframes, raw slice for P-frames)
-                // for ONE sendVideoFrame(...) call with ONE header.
-                videoTxQueue.trySend(
-                    VideoTxItem.VideoFrame(
-                        nalBytes = frameBytes,
-                        timestampMs = timestampMs,
-                        isKeyFrame = isKeyFrame
-                    )
+                // Direct non-blocking enqueue onto dedicated CarLifeUsbWriterThread (zero intermediate queue hop)
+                sendVideoFrameDirect(
+                    nalBytes = frameBytes,
+                    timestampMs = timestampMs,
+                    isKeyFrame = isKeyFrame
                 )
             },
             onVideoIdleHeartbeat = { timestampMs ->
@@ -847,7 +824,7 @@ class BridgeForegroundService : Service() {
                     usbTransport.state.value is UsbTransportState.Connected &&
                     CarLifeFrameCodec.useNestedVideoMsgHeader
                 ) {
-                    videoTxQueue.trySend(VideoTxItem.VideoHeartbeat(timestampMs = timestampMs))
+                    sendVideoHeartbeatIfStillIdleDirect(timestampMs = timestampMs)
                 }
             },
             onMediaProjectionStopped = {
@@ -866,6 +843,45 @@ class BridgeForegroundService : Service() {
         projectionManager.videoSourceMode = activeVideoSourceMode
         projectionManager.setMediaProjectionFgsReady(false)
         projectionManager.setVideoChannelReady(false)
+
+        screenKeepAliveManager = ScreenKeepAliveManager(
+            context = applicationContext,
+            onScreenOff = {
+                // Keep MediaProjection, H.264, USB AOA, and AudioPlaybackCapture strictly ALIVE when phone display turns off
+                if (::projectionManager.isInitialized) {
+                    projectionManager.onPhoneScreenStateChanged(isScreenOff = true)
+                }
+                BridgeTelemetryBus.updateState {
+                    it.copy(
+                        lastProtocolEvent = "Экран погашен — Зеркалирование и звук 0x0003 продолжают работу (KeepAlive)"
+                    )
+                }
+                serviceScope.launch {
+                    kotlinx.coroutines.delay(500L)
+                    if (ScreenKeepAlivePreferences.config.value.keepAliveOnScreenOff &&
+                        usbTransport.state.value is UsbTransportState.Connected &&
+                        ::audioCaptureManager.isInitialized &&
+                        !audioCaptureManager.isCapturing
+                    ) {
+                        startAudioCaptureIfReady(reason = "ScreenOff Audio KeepAlive Recovery")
+                    }
+                }
+            },
+            onScreenOn = {
+                if (::projectionManager.isInitialized) {
+                    projectionManager.onPhoneScreenStateChanged(isScreenOff = false)
+                }
+                serviceScope.launch {
+                    if (usbTransport.state.value is UsbTransportState.Connected &&
+                        ::audioCaptureManager.isInitialized &&
+                        !audioCaptureManager.isCapturing
+                    ) {
+                        startAudioCaptureIfReady(reason = "ScreenOn Audio Recovery")
+                    }
+                }
+            }
+        )
+        screenKeepAliveManager.start(isSessionActive = true, isMirroringOrUsbActive = false)
 
         audioCaptureManager = CarLifeAudioCaptureManager(
             context = applicationContext,
@@ -951,6 +967,23 @@ class BridgeForegroundService : Service() {
             projectionManager.stats.collect { projStats ->
                 BridgeTelemetryBus.updateState { current ->
                     current.copy(projectionStats = projStats)
+                }
+                if (::screenKeepAliveManager.isInitialized) {
+                    val activeMirrorOrUsb = projStats.usingMediaProjection ||
+                        usbTransport.state.value is UsbTransportState.Connected
+                    screenKeepAliveManager.updateSessionState(
+                        isSessionActive = true,
+                        isMirroringOrUsbActive = activeMirrorOrUsb
+                    )
+                }
+            }
+        }
+
+        // Observe Screen Keep-Alive & OLED Dimming state
+        serviceScope.launch {
+            screenKeepAliveManager.state.collect { keepAliveState ->
+                BridgeTelemetryBus.updateState { current ->
+                    current.copy(screenKeepAliveState = keepAliveState)
                 }
             }
         }
@@ -1048,6 +1081,14 @@ class BridgeForegroundService : Service() {
                     }
                 }
                 updateForegroundNotification(newState)
+                if (::screenKeepAliveManager.isInitialized) {
+                    val activeMirrorOrUsb = newState is UsbTransportState.Connected ||
+                        (::projectionManager.isInitialized && projectionManager.stats.value.usingMediaProjection)
+                    screenKeepAliveManager.updateSessionState(
+                        isSessionActive = true,
+                        isMirroringOrUsbActive = activeMirrorOrUsb
+                    )
+                }
             }
         }
 
@@ -1070,7 +1111,7 @@ class BridgeForegroundService : Service() {
                     val now = SystemClock.elapsedRealtime()
                     if (lastVideoTxElapsedMs == 0L || (now - lastVideoTxElapsedMs) >= 200L) {
                         val tsMs = SystemClock.uptimeMillis() and 0x7FFF_FFFFL
-                        videoTxQueue.trySend(VideoTxItem.VideoHeartbeat(timestampMs = tsMs))
+                        sendVideoHeartbeatIfStillIdleDirect(timestampMs = tsMs)
                     }
                 }
             }
@@ -1548,10 +1589,25 @@ class BridgeForegroundService : Service() {
                 }
             }
 
+            ACTION_UPDATE_SCREEN_KEEP_ALIVE -> {
+                ScreenKeepAlivePreferences.init(applicationContext)
+                if (::screenKeepAliveManager.isInitialized) {
+                    val activeMirrorOrUsb = usbTransport.state.value is UsbTransportState.Connected ||
+                        (::projectionManager.isInitialized && projectionManager.stats.value.usingMediaProjection)
+                    screenKeepAliveManager.updateSessionState(
+                        isSessionActive = true,
+                        isMirroringOrUsbActive = activeMirrorOrUsb
+                    )
+                }
+            }
+
             ACTION_DISCONNECT_STOP -> {
                 autoTestJob?.cancel()
                 autoTestJob = null
                 setVideoStreamingReady(false)
+                if (::screenKeepAliveManager.isInitialized) {
+                    screenKeepAliveManager.stop()
+                }
                 serviceScope.launch {
                     audioCaptureManager.stopCapture(
                         sendMediaStop = usbTransport.state.value is UsbTransportState.Connected
@@ -1572,6 +1628,9 @@ class BridgeForegroundService : Service() {
     override fun onBind(intent: Intent?): IBinder = binder
 
     override fun onDestroy() {
+        if (::screenKeepAliveManager.isInitialized) {
+            screenKeepAliveManager.stop()
+        }
         releaseWakeLock()
         val wasConnected = ::usbTransport.isInitialized && usbTransport.state.value is UsbTransportState.Connected
         runCatching {
@@ -1583,6 +1642,7 @@ class BridgeForegroundService : Service() {
                     }
                     if (::projectionManager.isInitialized) {
                         projectionManager.stopProjection()
+                        projectionManager.shutdown()
                     }
                     if (::usbTransport.isInitialized) {
                         usbTransport.shutdown()
@@ -1599,9 +1659,7 @@ class BridgeForegroundService : Service() {
             )
         }
         runCatching { CarLifeShizukuManager.unbindUserService(applicationContext) }
-        runCatching { videoTxQueue.close() }
         serviceScope.cancel()
-        runCatching { videoTxDispatcher.close() }
         super.onDestroy()
     }
 
@@ -2083,6 +2141,7 @@ class BridgeForegroundService : Service() {
         const val ACTION_STOP_AUTO_TEST = "com.example.core.usb.action.STOP_AUTO_TEST"
         const val ACTION_START_AUDIO_CAPTURE = "com.example.core.usb.action.START_AUDIO_CAPTURE"
         const val ACTION_STOP_AUDIO_CAPTURE = "com.example.core.usb.action.STOP_AUDIO_CAPTURE"
+        const val ACTION_UPDATE_SCREEN_KEEP_ALIVE = "com.example.core.usb.action.UPDATE_SCREEN_KEEP_ALIVE"
         const val ACTION_DISCONNECT_STOP = "com.example.core.usb.action.DISCONNECT_STOP"
 
         const val EXTRA_RESULT_CODE = "extra_result_code"

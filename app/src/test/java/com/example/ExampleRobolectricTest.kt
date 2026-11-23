@@ -18,15 +18,21 @@ import com.example.core.audio.CarLifeAudioCaptureManager
 import com.example.core.carlife.CarLifeHardKeyPacket
 import com.example.core.carlife.CarLifeTouchPacket
 import com.example.core.input.CarLifeAccessibilityService
+import com.example.core.input.TouchSensitivityConfig
+import com.example.core.input.TouchSensitivityPreset
+import com.example.core.input.TouchSettingsPreferences
 import com.example.core.projection.AppMode
 import com.example.core.projection.AppModePreferences
 import com.example.core.projection.CockpitProjectionManager
 import com.example.core.projection.MediaProjectionTokenStore
+import com.example.core.projection.ScreenKeepAlivePreferences
 import com.example.core.projection.VideoSourceMode
 import com.example.core.shizuku.CarLifeShizukuManager
 import com.example.core.shizuku.ICarLifeShizukuService
 import com.example.core.usb.BridgeForegroundService
 import com.example.core.usb.BridgeTelemetryBus
+import com.example.core.usb.CarLifeUsbWriteQueue
+import com.example.protocol.carlife.CarLifeFrameCodec
 import androidx.compose.ui.graphics.Color
 import com.example.feature.cockpit.AppLaunchMode
 import com.example.feature.cockpit.CarLifeLauncherRepository
@@ -930,6 +936,173 @@ class ExampleRobolectricTest {
     } finally {
       ThemePreferences.clear(context)
     }
+  }
+
+  @Test
+  fun `touch sensitivity presets and custom sliders persist and drive tap slop and swipe speed`() {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    try {
+      TouchSettingsPreferences.clear(context)
+      assertEquals(TouchSensitivityPreset.STANDARD, TouchSettingsPreferences.config.value.preset)
+
+      // Apply SMOOTH preset (42 px tap slop, 70 ms tap, 0.85x swipe speed)
+      val smooth = TouchSettingsPreferences.applyPreset(TouchSensitivityPreset.SMOOTH, context)
+      assertEquals(TouchSensitivityPreset.SMOOTH, smooth.preset)
+      assertEquals(42f, smooth.tapSlopPx, 0.01f)
+      assertEquals(70L, smooth.tapDurationMs)
+
+      // A 30 px road wobble is rejected as swipe under HIGH (12 px) but accepted as TAP under SMOOTH (42 px)
+      assertTrue(
+        CarLifeAccessibilityService.isShortTapGesture(
+          startX = 500f,
+          startY = 500f,
+          endX = 530f,
+          endY = 500f,
+          points = listOf(500f to 500f, 515f to 502f, 530f to 500f),
+          tapSlopPx = smooth.tapSlopPx
+        )
+      )
+      val high = TouchSettingsPreferences.applyPreset(TouchSensitivityPreset.HIGH, context)
+      assertFalse(
+        CarLifeAccessibilityService.isShortTapGesture(
+          startX = 500f,
+          startY = 500f,
+          endX = 530f,
+          endY = 500f,
+          points = listOf(500f to 500f, 515f to 502f, 530f to 500f),
+          tapSlopPx = high.tapSlopPx
+        )
+      )
+
+      // Higher swipeSpeedFactor reduces dispatched swipe duration for snappier response
+      val stdSwipeMs = CarLifeAccessibilityService.computeSwipeDurationMs(1000L, 1400L, swipeSpeedFactor = 1.0f)
+      val fastSwipeMs = CarLifeAccessibilityService.computeSwipeDurationMs(1000L, 1400L, swipeSpeedFactor = high.swipeSpeedFactor)
+      assertTrue("Expected fast swipe ($fastSwipeMs) < standard swipe ($stdSwipeMs)", fastSwipeMs < stdSwipeMs)
+
+      // Manual slider adjustment transitions to CUSTOM and persists across init()
+      val custom = TouchSettingsPreferences.updateConfig(context) {
+        it.copy(tapSlopPx = 55f, edgeBackGuardEnabled = false)
+      }
+      assertEquals(TouchSensitivityPreset.CUSTOM, custom.preset)
+      assertEquals(55f, custom.tapSlopPx, 0.01f)
+      assertFalse(custom.edgeBackGuardEnabled)
+
+      val reloaded = TouchSettingsPreferences.init(context)
+      assertEquals(TouchSensitivityPreset.CUSTOM, reloaded.preset)
+      assertEquals(55f, reloaded.tapSlopPx, 0.01f)
+      assertFalse(reloaded.edgeBackGuardEnabled)
+
+      // Reset restores STANDARD defaults
+      val resetCfg = TouchSettingsPreferences.reset(context)
+      assertEquals(TouchSensitivityPreset.STANDARD, resetCfg.preset)
+      assertEquals(TouchSensitivityConfig.DEFAULT_TAP_SLOP_PX, resetCfg.tapSlopPx, 0.01f)
+      assertTrue(resetCfg.edgeBackGuardEnabled)
+    } finally {
+      TouchSettingsPreferences.clear(context)
+    }
+  }
+
+  @Test
+  fun `screen keep-alive preferences persist and BridgeForegroundService handles config updates cleanly`() {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    try {
+      ScreenKeepAlivePreferences.clear(context)
+      val initial = ScreenKeepAlivePreferences.init(context)
+      assertTrue(initial.keepAliveOnScreenOff)
+      assertTrue(initial.keepScreenAwakeOverlay)
+      assertFalse(initial.dimPhoneScreenDuringMirroring)
+      assertFalse(initial.autoWakeOnScreenOff)
+
+      ScreenKeepAlivePreferences.updateConfig(context) {
+        it.copy(
+          dimPhoneScreenDuringMirroring = true,
+          autoWakeOnScreenOff = true
+        )
+      }
+      val reloaded = ScreenKeepAlivePreferences.init(context)
+      assertTrue(reloaded.dimPhoneScreenDuringMirroring)
+      assertTrue(reloaded.autoWakeOnScreenOff)
+
+      val updateIntent = Intent(context, BridgeForegroundService::class.java).apply {
+        action = BridgeForegroundService.ACTION_UPDATE_SCREEN_KEEP_ALIVE
+      }
+      val svcController = Robolectric.buildService(BridgeForegroundService::class.java, updateIntent)
+        .create()
+        .startCommand(0, 1)
+      val service = svcController.get()
+      service.projectionManager.onPhoneScreenStateChanged(isScreenOff = true)
+      assertTrue(service.projectionManager.stats.value.isPhoneScreenOff)
+      service.projectionManager.onPhoneScreenStateChanged(isScreenOff = false)
+      assertFalse(service.projectionManager.stats.value.isPhoneScreenOff)
+      svcController.destroy()
+    } finally {
+      ScreenKeepAlivePreferences.clear(context)
+    }
+  }
+
+  @Test
+  fun `mirroring zero-alloc NAL inspection and GOP-safe USB write queue prevent decoder freezes`() {
+    // 1. Verify zero-alloc leading NAL inspector on SPS+PPS+IDR and P-slice buffers
+    val spsPpsIdr = byteArrayOf(
+      0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x1E,
+      0x00, 0x00, 0x00, 0x01, 0x68, 0xCE.toByte(), 0x3C, 0x80.toByte(),
+      0x00, 0x00, 0x00, 0x01, 0x65, 0x88.toByte(), 0x84.toByte(), 0x00
+    )
+    val infoKey = CarLifeFrameCodec.inspectLeadingNalHeader(spsPpsIdr)
+    assertTrue(infoKey.hasSps)
+    assertTrue(infoKey.hasPps)
+    assertTrue(infoKey.hasIdr)
+    assertTrue(infoKey.hasSpsAndPps)
+    assertTrue(CarLifeFrameCodec.containsSpsAndPps(spsPpsIdr))
+
+    val pSlice = byteArrayOf(0x00, 0x00, 0x00, 0x01, 0x41, 0x9A.toByte(), 0x12, 0x34, 0x56, 0x78)
+    val infoP = CarLifeFrameCodec.inspectLeadingNalHeader(pSlice)
+    assertFalse(infoP.hasSps)
+    assertFalse(infoP.hasPps)
+    assertFalse(infoP.hasIdr)
+    assertEquals(1, infoP.firstNalType)
+    assertFalse(CarLifeFrameCodec.containsSpsAndPps(pSlice))
+
+    // 2. Verify CarLifeUsbWriteQueue GOP-safe congestion dropping + recovery IDR flush
+    var congestionTriggers = 0
+    val queue = CarLifeUsbWriteQueue(
+      maxVideoFrames = 3,
+      onVideoCongestionDrop = { congestionTriggers++ }
+    )
+    val idrFrame1 = CarLifeFrameCodec.createVideoFrame(spsPpsIdr, timestampMs = 100L)
+    val pFrame1 = CarLifeFrameCodec.createVideoFrame(pSlice, timestampMs = 133L)
+    val pFrame2 = CarLifeFrameCodec.createVideoFrame(pSlice, timestampMs = 166L)
+    val pFrame3Overflow = CarLifeFrameCodec.createVideoFrame(pSlice, timestampMs = 200L)
+    val pFrame4BrokenGop = CarLifeFrameCodec.createVideoFrame(pSlice, timestampMs = 233L)
+    val recoveryIdr = CarLifeFrameCodec.createVideoFrame(spsPpsIdr, timestampMs = 266L)
+
+    queue.enqueue(idrFrame1, isKeyFrameHint = true)
+    queue.enqueue(pFrame1, isKeyFrameHint = false)
+    queue.enqueue(pFrame2, isKeyFrameHint = false)
+    assertEquals(3, queue.videoSize)
+    assertFalse(queue.isAwaitingRecoveryKeyFrame)
+
+    // Overflow triggers GOP recovery and requests an instant IDR
+    queue.enqueue(pFrame3Overflow, isKeyFrameHint = false)
+    assertEquals(1, congestionTriggers)
+    assertTrue(queue.isAwaitingRecoveryKeyFrame)
+    assertTrue(queue.droppedVideoPFrames.get() >= 2L)
+
+    // Subsequent dependent P-frame is dropped instead of feeding broken GOP to HU decoder
+    val droppedBefore = queue.droppedVideoPFrames.get()
+    queue.enqueue(pFrame4BrokenGop, isKeyFrameHint = false)
+    assertEquals(droppedBefore + 1L, queue.droppedVideoPFrames.get())
+
+    // Fresh recovery IDR flushes stale queued frames and resets recovery flag
+    queue.enqueue(recoveryIdr, isKeyFrameHint = true)
+    assertFalse(queue.isAwaitingRecoveryKeyFrame)
+    assertEquals(1, queue.videoSize)
+    val dequeued = queue.pollNonBlocking()
+    assertEquals(recoveryIdr.header.timestamp, dequeued?.header?.timestamp)
+
+    // 3. Verify LowLatency candidate key on API 30+ (SDK 36)
+    val lowLatencyFmt = CockpitProjectionManager.buildPreferredAvcMediaFormat(includeLowLatency = true)
+    assertEquals(1, lowLatencyFmt.getInteger(MediaFormat.KEY_LOW_LATENCY))
   }
 }
 

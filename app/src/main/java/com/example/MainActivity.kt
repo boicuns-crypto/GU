@@ -126,10 +126,14 @@ import android.view.Display
 import android.view.KeyEvent
 import android.view.WindowManager
 import com.example.core.input.CarLifeAccessibilityService
+import com.example.core.input.TouchSettingsPreferences
 import com.example.core.projection.AppMode
 import com.example.core.projection.MediaProjectionTokenStore
+import com.example.core.projection.ScreenKeepAlivePreferences
 import com.example.core.projection.VideoSourceMode
 import com.example.core.shizuku.CarLifeShizukuManager
+import com.example.ui.settings.ScreenKeepAliveSettingsCard
+import com.example.ui.settings.TouchSensitivitySettingsCard
 import com.example.core.usb.BridgeForegroundService
 import com.example.core.usb.BridgeRuntimeState
 import com.example.core.usb.BridgeTelemetryBus
@@ -178,6 +182,8 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
 
         ThemePreferences.init(this)
+        TouchSettingsPreferences.init(this)
+        ScreenKeepAlivePreferences.init(this)
         BridgeTelemetryBus.restoreSavedAppMode(this)
 
         recordAudioPermissionLauncher = registerForActivityResult(
@@ -487,15 +493,20 @@ fun CarLifeBridgeApp(
         }
     }
 
-    LaunchedEffect(a11yEnabled, hasMediaProjectionToken, runtimeState.transportState) {
+    LaunchedEffect(selectedTab, a11yEnabled, hasMediaProjectionToken, runtimeState.transportState) {
         while (isActive) {
-            checklistStatus = evaluateSetupChecklist(
+            val latest = evaluateSetupChecklist(
                 context = context,
                 a11yRealtimeFlag = a11yEnabled,
                 hasMediaProjectionToken = hasMediaProjectionToken,
                 transportState = runtimeState.transportState
             )
-            delay(1_000L)
+            checklistStatus = latest
+            // Avoid unnecessary 1s Binder IPC polling when setup is complete and user is on Launcher/Settings tabs
+            if (selectedTab != 1 && latest.allPrerequisitesReady) {
+                break
+            }
+            delay(if (selectedTab == 1) 1_000L else 3_000L)
         }
     }
 
@@ -2112,12 +2123,20 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                             } else {
                                 "СТОП"
                             }
+                            val lowLatencyTag = if (projStats.isLowLatencyEncoderActive) " • LowLatency" else ""
+                            val droppedTotal = maxOf(projStats.droppedVideoPFrames, state.droppedVideoPFrames)
+                            val dropTag = if (droppedTotal > 0L) " • сброс P: $droppedTotal" else " • 0 потерь"
+                            val screenTag = if (projStats.isPhoneScreenOff || state.screenKeepAliveState.isPhoneScreenOff) {
+                                " • Экран погашен (KeepAlive)"
+                            } else {
+                                ""
+                            }
                             MirroringNodeStatusRow(
                                 index = "3",
                                 label = "Видео H.264 / 30 FPS",
                                 statusBadge = fpsBadgeText,
                                 badgePositive = projStats.isRunning && (projStats.actualFps == 0f || projStats.actualFps <= 35f),
-                                detail = "${projStats.width}×${projStats.height} • ${projStats.idrPerSec} IDR/с • ${projStats.activeEncoderProfile} • $vdLabel • $orientationLabel"
+                                detail = "${projStats.width}×${projStats.height} • ${projStats.idrPerSec} IDR/с$lowLatencyTag$dropTag$screenTag • $vdLabel • $orientationLabel"
                             )
 
                             // Узел 4: Тач 0x0006 (CarLifeAccessibilityService)
@@ -2299,6 +2318,28 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                     }
                 }
             }
+        }
+
+        // 0.1 Чувствительность тача (0x0006) — пресеты, слайдеры и защита краёв One UI
+        item {
+            TouchSensitivitySettingsCard()
+        }
+
+        // 0.2 Экран и питание — работа Зеркалирования и звука 0x0003 при погашенном экране + 1% OLED
+        item {
+            ScreenKeepAliveSettingsCard(
+                keepAliveState = state.screenKeepAliveState,
+                hasOverlayPermission = checklistStatus.step2OverlayGranted,
+                onOpenOverlaySettings = onOpenOverlaySettings,
+                onNotifyServiceConfigChanged = {
+                    if (state.isServiceRunning) {
+                        val intent = Intent(context, BridgeForegroundService::class.java).apply {
+                            action = BridgeForegroundService.ACTION_UPDATE_SCREEN_KEEP_ALIVE
+                        }
+                        safeStartService(context, intent)
+                    }
+                }
+            )
         }
 
         // 1. Блок управления виртуальным экраном и статусами (Start VD, Touch ON, Overlay OK + лог запуска)

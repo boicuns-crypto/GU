@@ -21,6 +21,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.Process
 import android.os.SystemClock
 import android.util.DisplayMetrics
 import android.util.Log
@@ -67,6 +68,7 @@ import androidx.savedstate.setViewTreeSavedStateRegistryOwner
 import com.example.core.carlife.CarLifeHardKeyPacket
 import com.example.core.carlife.CarLifeTouchPacket
 import com.example.core.input.CarLifeAccessibilityService
+import com.example.core.input.TouchSettingsPreferences
 import com.example.core.shizuku.CarLifeShizukuManager
 import com.example.feature.cockpit.AppLaunchMode
 import com.example.feature.cockpit.CarLifeAppLauncherScreen
@@ -80,6 +82,7 @@ import java.io.ByteArrayOutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
@@ -88,6 +91,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -99,6 +103,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.yield
 
 /**
  * Holds the single-use [MediaProjection] consent result (`resultCode` + `data` [Intent])
@@ -328,6 +333,9 @@ data class ProjectionPipelineStats(
     val actualFps: Float = 0f,
     val idrPerSec: Float = 0f,
     val activeEncoderProfile: String = "AVCProfileBaseline+Level3+VBR",
+    val isLowLatencyEncoderActive: Boolean = false,
+    val isPhoneScreenOff: Boolean = false,
+    val droppedVideoPFrames: Long = 0L,
     val phoneScreenWidth: Int = 0,
     val phoneScreenHeight: Int = 0,
     val isPhoneLandscape: Boolean = false,
@@ -381,6 +389,33 @@ class CockpitProjectionManager(
 
     private val projectionMutex = Mutex()
     private val isEncoding = AtomicBoolean(false)
+    private val lastCongestionIdrRequestMs = AtomicLong(0L)
+    private val isDisplayListenerRegistered = AtomicBoolean(false)
+
+    // Dedicated high-priority H.264 drain thread so encoder frames never wait behind Dispatchers.IO tasks
+    private val encoderDrainDispatcher = Executors.newSingleThreadExecutor { runnable ->
+        Thread({
+            runCatching { Process.setThreadPriority(Process.THREAD_PRIORITY_DISPLAY) }
+            runnable.run()
+        }, "CarLifeH264DrainThread").apply {
+            isDaemon = true
+            priority = Thread.MAX_PRIORITY
+        }
+    }.asCoroutineDispatcher()
+
+    @Volatile
+    private var lastKnownScreenSize: Pair<Int, Int>? = null
+
+    @Volatile
+    private var isPhoneScreenOffFlag: Boolean = false
+
+    @Volatile
+    private var lastConfiguredLowLatency: Boolean = false
+
+    private var lastCockpitMoveX: Float = Float.NaN
+    private var lastCockpitMoveY: Float = Float.NaN
+    private var lastShizukuMoveX: Float = Float.NaN
+    private var lastShizukuMoveY: Float = Float.NaN
 
     @Volatile
     var appMode: AppMode = AppMode.MIRRORING
@@ -404,6 +439,60 @@ class CockpitProjectionManager(
 
     @Volatile
     private var lastConfiguredEncoderProfile: String = "AVCProfileBaseline+Level3+VBR"
+
+    private val defaultDisplayListener = object : DisplayManager.DisplayListener {
+        override fun onDisplayAdded(displayId: Int) = Unit
+        override fun onDisplayRemoved(displayId: Int) = Unit
+        override fun onDisplayChanged(displayId: Int) {
+            if (displayId != Display.DEFAULT_DISPLAY || appMode != AppMode.MIRRORING) return
+            refreshPhysicalScreenOrientation(requestSyncOnChange = true)
+        }
+    }
+
+    private fun registerDisplayListenerIfNeeded() {
+        if (isDisplayListenerRegistered.compareAndSet(false, true)) {
+            runCatching {
+                displayManager.registerDisplayListener(defaultDisplayListener, mainHandler)
+            }.onFailure {
+                isDisplayListenerRegistered.set(false)
+            }
+        }
+    }
+
+    private fun unregisterDisplayListenerIfNeeded() {
+        if (isDisplayListenerRegistered.compareAndSet(true, false)) {
+            runCatching { displayManager.unregisterDisplayListener(defaultDisplayListener) }
+        }
+    }
+
+    private fun refreshPhysicalScreenOrientation(requestSyncOnChange: Boolean) {
+        val currentSize = CarLifeAccessibilityService.instance?.getPhysicalScreenSize()
+            ?: CarLifeAccessibilityService.computePhysicalScreenSize(appContext)
+        val prev = lastKnownScreenSize
+        if (prev != currentSize) {
+            lastKnownScreenSize = currentSize
+            _stats.update {
+                it.copy(
+                    phoneScreenWidth = currentSize.first,
+                    phoneScreenHeight = currentSize.second,
+                    isPhoneLandscape = currentSize.first > currentSize.second
+                )
+            }
+            if (requestSyncOnChange && prev != null && isVideoChannelReadyForStreaming) {
+                requestEncoderSyncFrameOnly()
+            }
+        }
+    }
+
+    private fun requestEncoderSyncFrameOnly() {
+        val codec = mediaCodec ?: return
+        runCatching {
+            val syncParams = Bundle().apply {
+                putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
+            }
+            codec.setParameters(syncParams)
+        }
+    }
 
     fun setMediaProjectionFgsReady(ready: Boolean) {
         isMediaProjectionFgsReady = ready
@@ -761,8 +850,12 @@ class CockpitProjectionManager(
             encoderInputSurface = inputSurface
             isEncoding.set(true)
 
-            // Start draining MediaCodec immediately so SPS/PPS + IDR are captured as soon as the first frame lands
-            encoderDrainJob = externalScope.launch(Dispatchers.IO) {
+            // Event-driven orientation tracking via DisplayListener (zero Binder IPC inside encoder drain loop)
+            registerDisplayListenerIfNeeded()
+            refreshPhysicalScreenOrientation(requestSyncOnChange = false)
+
+            // Start draining MediaCodec immediately on dedicated high-priority thread
+            encoderDrainJob = externalScope.launch(encoderDrainDispatcher) {
                 drainHardwareEncoderLoop(codec, safeBitRate)
             }
 
@@ -1818,6 +1911,42 @@ class CockpitProjectionManager(
     }
 
     /**
+     * Rate-limited recovery IDR request invoked when [CarLifeUsbWriteQueue] drops stale P-frames
+     * under USB congestion so the Jetta VS7 decoder heals immediately without IDR storms.
+     */
+    fun requestRecoveryIdrOnCongestion() {
+        if (!isVideoChannelReadyForStreaming || !isEncoding.get()) return
+        val now = SystemClock.elapsedRealtime()
+        val prev = lastCongestionIdrRequestMs.get()
+        if (now - prev < CONGESTION_IDR_COOLDOWN_MS) return
+        if (lastCongestionIdrRequestMs.compareAndSet(prev, now)) {
+            requestEncoderSyncFrameOnly()
+        }
+    }
+
+    /**
+     * Updates the observed dropped P-frame counter from USB transport for live diagnostics.
+     */
+    fun updateDroppedVideoPFrames(droppedCount: Long) {
+        if (_stats.value.droppedVideoPFrames != droppedCount) {
+            _stats.update { it.copy(droppedVideoPFrames = droppedCount) }
+        }
+    }
+
+    /**
+     * Notifies the projection pipeline when the physical phone display turns off or back on:
+     * - On screen OFF: NEVER stops `MediaProjection` or `MediaCodec`; keeps CarLife `0x0002` alive.
+     * - On screen ON: immediately requests a crisp IDR keyframe so the Head Unit resumes live video without delay.
+     */
+    fun onPhoneScreenStateChanged(isScreenOff: Boolean) {
+        isPhoneScreenOffFlag = isScreenOff
+        _stats.update { it.copy(isPhoneScreenOff = isScreenOff) }
+        if (!isScreenOff && isVideoChannelReadyForStreaming && isEncoding.get()) {
+            requestInstantIdrKeyFrame()
+        }
+    }
+
+    /**
      * Matches original `VideoOutputThread.smali` (`outputSpsPpsAndFirstFrame` / `firstSendEncodeFrame`):
      * merges `cachedSpsPps + idrBytes` (avoiding duplicate SPS/PPS if the codec already prepended them)
      * and dispatches the entire keyframe in ONE `onEncodedVideoNal` call (ONE `sendVideoFrame` header).
@@ -1857,6 +1986,7 @@ class CockpitProjectionManager(
      */
     suspend fun injectTouchPacket(packet: CarLifeTouchPacket): Boolean {
         val currentStats = _stats.value
+        val touchCfg = TouchSettingsPreferences.config.value
         val huTouchMaxX = packet.huWidth.takeIf { it > 0 }?.toFloat()
             ?: CarLifeTouchDecoder.DEFAULT_HU_TOUCH_MAX_X
         val huTouchMaxY = packet.huHeight.takeIf { it > 0 }?.toFloat()
@@ -1874,7 +2004,7 @@ class CockpitProjectionManager(
                     huHeight = huTouchMaxY,
                     screenWidth = screenW,
                     screenHeight = screenH,
-                    applyEdgeGuard = true
+                    applyEdgeGuard = touchCfg.edgeBackGuardEnabled
                 )
                 val orientLabel = if (mapped.isLandscape) "Landscape" else "Portrait"
 
@@ -1941,6 +2071,22 @@ class CockpitProjectionManager(
                     huTouchMaxY = huTouchMaxY
                 )
 
+                // Suppress sub-deadzone coordinate micro-jitter on ACTION_MOVE
+                if (packet.androidAction == MotionEvent.ACTION_MOVE && !lastShizukuMoveX.isNaN()) {
+                    val dx = scaledX - lastShizukuMoveX
+                    val dy = scaledY - lastShizukuMoveY
+                    if (dx * dx + dy * dy < touchCfg.moveDeadzonePxSq) {
+                        return@withContext true
+                    }
+                }
+                if (packet.androidAction == MotionEvent.ACTION_DOWN || packet.androidAction == MotionEvent.ACTION_MOVE) {
+                    lastShizukuMoveX = scaledX
+                    lastShizukuMoveY = scaledY
+                } else if (packet.androidAction == MotionEvent.ACTION_UP || packet.androidAction == MotionEvent.ACTION_CANCEL) {
+                    lastShizukuMoveX = Float.NaN
+                    lastShizukuMoveY = Float.NaN
+                }
+
                 val nowUptime = SystemClock.uptimeMillis()
                 val downTime = when (packet.androidAction) {
                     MotionEvent.ACTION_DOWN -> {
@@ -1969,7 +2115,8 @@ class CockpitProjectionManager(
                     displayId = vDisplayId
                 )
                 if (shizukuDispatched && packet.synthesizeClickUp) {
-                    val upTime = maxOf(downTime + 16L, SystemClock.uptimeMillis())
+                    val clickDur = touchCfg.tapDurationMs.coerceIn(16L, 120L)
+                    val upTime = maxOf(downTime + clickDur, SystemClock.uptimeMillis())
                     CarLifeShizukuManager.injectTouch(
                         action = MotionEvent.ACTION_UP,
                         x = scaledX,
@@ -2015,6 +2162,22 @@ class CockpitProjectionManager(
                 huTouchMaxY = huTouchMaxY
             )
 
+            // Suppress sub-deadzone coordinate micro-jitter on ACTION_MOVE
+            if (packet.androidAction == MotionEvent.ACTION_MOVE && !lastCockpitMoveX.isNaN()) {
+                val dx = scaledX - lastCockpitMoveX
+                val dy = scaledY - lastCockpitMoveY
+                if (dx * dx + dy * dy < touchCfg.moveDeadzonePxSq) {
+                    return@withContext true
+                }
+            }
+            if (packet.androidAction == MotionEvent.ACTION_DOWN || packet.androidAction == MotionEvent.ACTION_MOVE) {
+                lastCockpitMoveX = scaledX
+                lastCockpitMoveY = scaledY
+            } else if (packet.androidAction == MotionEvent.ACTION_UP || packet.androidAction == MotionEvent.ACTION_CANCEL) {
+                lastCockpitMoveX = Float.NaN
+                lastCockpitMoveY = Float.NaN
+            }
+
             var viewDispatched = false
             if (decorView != null) {
                 val nowUptime = SystemClock.uptimeMillis()
@@ -2046,7 +2209,8 @@ class CockpitProjectionManager(
                 )
 
                 if (packet.synthesizeClickUp) {
-                    val upTime = maxOf(downTime + 16L, SystemClock.uptimeMillis())
+                    val clickDur = touchCfg.tapDurationMs.coerceIn(16L, 120L)
+                    val upTime = maxOf(downTime + clickDur, SystemClock.uptimeMillis())
                     dispatchSynthesizedMotionEvent(
                         decorView = decorView,
                         downTime = downTime,
@@ -2254,7 +2418,13 @@ class CockpitProjectionManager(
     }
 
     private suspend fun stopProjectionLocked(updateStatus: Boolean = true) {
+        unregisterDisplayListenerIfNeeded()
         stopVideoSourceLocked(stopMediaProjection = true, updateStatus = updateStatus)
+    }
+
+    fun shutdown() {
+        unregisterDisplayListenerIfNeeded()
+        runCatching { encoderDrainDispatcher.close() }
     }
 
     private fun configureLowLatencyAvcEncoder(
@@ -2285,6 +2455,22 @@ class CockpitProjectionManager(
 
         val candidates = buildList {
             if (supportsBaseline && supportsBaselineLevel3 && supportsVbr) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    add(
+                        "AVCProfileBaseline+Level3+VBR+LowLatency+SamsungQP" to buildPreferredAvcMediaFormat(
+                            width = width,
+                            height = height,
+                            frameRate = frameRate,
+                            bitRate = bitRate,
+                            includeBaselineProfile = true,
+                            targetLevel = MediaCodecInfo.CodecProfileLevel.AVCLevel3,
+                            includeVbr = true,
+                            includeVendorTimingKeys = true,
+                            includeSamsungQpMax = true,
+                            includeLowLatency = true
+                        )
+                    )
+                }
                 add(
                     "AVCProfileBaseline+Level3+VBR+SamsungQP" to buildPreferredAvcMediaFormat(
                         width = width,
@@ -2408,6 +2594,13 @@ class CockpitProjectionManager(
                 }
                 codec.configure(candidate, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
                 lastConfiguredEncoderProfile = label
+                lastConfiguredLowLatency = label.contains("LowLatency", ignoreCase = true)
+                _stats.update {
+                    it.copy(
+                        activeEncoderProfile = label,
+                        isLowLatencyEncoderActive = lastConfiguredLowLatency
+                    )
+                }
                 Log.i(TAG, "Configured H.264 encoder in $label ($width×$height @ ${frameRate}fps, ${bitRate / 1000}kbps)")
                 return codec
             } catch (e: Exception) {
@@ -2469,16 +2662,14 @@ class CockpitProjectionManager(
         initialBitRate: Int
     ) {
         val bufferInfo = MediaCodec.BufferInfo()
-        var currentDynamicBitrate = initialBitRate
         var pendingSliceFrames = 0L
         var pendingSliceBytes = 0L
         var fpsWindowStartMs = SystemClock.elapsedRealtime()
         var fpsWindowFrames = 0
         var fpsWindowIdrs = 0
-        var lastOrientationCheckMs = 0L
-        var lastKnownScreenSize: Pair<Int, Int>? = null
+        var lastScreenOffKeepAliveIdrMs = 0L
 
-        fun maybePublishFpsAndOrientation(nowMs: Long) {
+        fun maybePublishFps(nowMs: Long) {
             val elapsedFpsMs = nowMs - fpsWindowStartMs
             if (elapsedFpsMs >= 1000L) {
                 val measuredFps = (fpsWindowFrames * 1000f) / elapsedFpsMs.coerceAtLeast(1L)
@@ -2490,33 +2681,9 @@ class CockpitProjectionManager(
                     it.copy(
                         actualFps = measuredFps,
                         idrPerSec = measuredIdrRate,
-                        activeEncoderProfile = lastConfiguredEncoderProfile
+                        activeEncoderProfile = lastConfiguredEncoderProfile,
+                        isLowLatencyEncoderActive = lastConfiguredLowLatency
                     )
-                }
-            }
-            if (appMode == AppMode.MIRRORING && (nowMs - lastOrientationCheckMs) >= 300L) {
-                lastOrientationCheckMs = nowMs
-                val currentSize = CarLifeAccessibilityService.instance?.getPhysicalScreenSize()
-                    ?: CarLifeAccessibilityService.computePhysicalScreenSize(appContext)
-                val prev = lastKnownScreenSize
-                if (prev != currentSize) {
-                    lastKnownScreenSize = currentSize
-                    _stats.update {
-                        it.copy(
-                            phoneScreenWidth = currentSize.first,
-                            phoneScreenHeight = currentSize.second,
-                            isPhoneLandscape = currentSize.first > currentSize.second
-                        )
-                    }
-                    if (prev != null && isVideoChannelReadyForStreaming) {
-                        // Orientation changed (Portrait <-> Landscape): request one crisp IDR sync frame
-                        runCatching {
-                            val syncParams = Bundle().apply {
-                                putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
-                            }
-                            codec.setParameters(syncParams)
-                        }
-                    }
                 }
             }
         }
@@ -2525,7 +2692,7 @@ class CockpitProjectionManager(
             while (isActive && isEncoding.get()) {
                 val outIndex = codec.dequeueOutputBuffer(bufferInfo, DEQUEUE_TIMEOUT_US)
                 val loopNowMs = SystemClock.elapsedRealtime()
-                maybePublishFpsAndOrientation(loopNowMs)
+                maybePublishFps(loopNowMs)
                 when {
                     outIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> {
                         val nowElapsed = loopNowMs
@@ -2538,16 +2705,19 @@ class CockpitProjectionManager(
                             lastCodecFrameElapsedMs = nowElapsed
                             val keepAliveTs = SystemClock.uptimeMillis() and 0x7FFF_FFFFL
                             onVideoIdleHeartbeat(keepAliveTs)
-                            if (awaitingFirstIdrAfterGateOpen.get()) {
-                                runCatching {
-                                    val syncParams = Bundle().apply {
-                                        putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
-                                    }
-                                    codec.setParameters(syncParams)
+                            if (isPhoneScreenOffFlag && (nowElapsed - lastScreenOffKeepAliveIdrMs) >= 2_000L) {
+                                // While phone display is off, push a cached IDR every 2s so the HU stays locked on CarLife
+                                val cachedIdr = lastKeyFrameAnnexB
+                                if (cachedIdr != null) {
+                                    lastScreenOffKeepAliveIdrMs = nowElapsed
+                                    emitCombinedSpsPpsAndIdr(idrBytes = cachedIdr, timestampMs = keepAliveTs)
                                 }
                             }
+                            if (awaitingFirstIdrAfterGateOpen.get()) {
+                                requestEncoderSyncFrameOnly()
+                            }
                         }
-                        delay(2L)
+                        yield()
                     }
 
                     outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
@@ -2589,29 +2759,16 @@ class CockpitProjectionManager(
                                 continue
                             }
 
-                            // Inspect NAL types without splitting outbound frames so we keep cachedSpsPps up to date
-                            // and detect IDR frames even on encoders that omit BUFFER_FLAG_KEY_FRAME.
-                            val scannedNals = CarLifeFrameCodec.splitAnnexBNalUnits(rawNal)
-                            var containsIdrNal = isKeyFrameFlag
-                            var sawConfigInFrame = false
-                            for (nal in scannedNals) {
-                                val nalType = if (nal.size > 4) (nal[4].toInt() and 0x1F) else 0
-                                when (nalType) {
-                                    7 -> {
-                                        cachedSpsAnnexB = nal
-                                        sawConfigInFrame = true
-                                    }
-                                    8 -> {
-                                        cachedPpsAnnexB = nal
-                                        sawConfigInFrame = true
-                                    }
-                                    5 -> {
-                                        containsIdrNal = true
+                            // Zero-allocation leading NAL header scan (only splits on rare inline SPS/PPS or non-Annex-B buffers)
+                            val leading = CarLifeFrameCodec.inspectLeadingNalHeader(rawNal)
+                            var containsIdrNal = isKeyFrameFlag || leading.hasIdr
+                            if (leading.hasSps || leading.hasPps || !leading.hasAnnexBStartCode) {
+                                cacheConfigNalUnits(rawNal)
+                                if (!containsIdrNal && !leading.hasAnnexBStartCode) {
+                                    containsIdrNal = CarLifeFrameCodec.splitAnnexBNalUnits(rawNal).any { nal ->
+                                        nal.size > 4 && (nal[4].toInt() and 0x1F) == 5
                                     }
                                 }
-                            }
-                            if (sawConfigInFrame) {
-                                rebuildCachedSpsPps()
                             }
 
                             if (containsIdrNal) {
@@ -2649,7 +2806,6 @@ class CockpitProjectionManager(
                                     }
                                 }
                                 // Send ONE combined packet: cachedSpsPps + idrBytes (unless already prepended)
-                                // Keep steady configured VBR bitrate (2 000 000 bps default) for crisp 1280×720 clarity.
                                 emitCombinedSpsPpsAndIdr(
                                     idrBytes = rawNal,
                                     timestampMs = timestampMs
@@ -2676,12 +2832,7 @@ class CockpitProjectionManager(
                                 }
                             } else {
                                 // Waiting for initial IDR after gate open: request sync frame and skip stale P-slice
-                                runCatching {
-                                    val b = Bundle().apply {
-                                        putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
-                                    }
-                                    codec.setParameters(b)
-                                }
+                                requestEncoderSyncFrameOnly()
                             }
                         }
                         codec.releaseOutputBuffer(outIndex, false)
@@ -2724,6 +2875,7 @@ class CockpitProjectionManager(
         private const val TAG = "CockpitProjectionMgr"
         private const val VIRTUAL_DISPLAY_NAME = "CarLife_AppMirroring_Display"
         private const val DEQUEUE_TIMEOUT_US = 8_000L
+        private const val CONGESTION_IDR_COOLDOWN_MS = 400L
         private const val WINDOW_TYPE_PRIVATE_PRESENTATION = 2030
         private const val WINDOW_TYPE_PRESENTATION = 2037
         const val DEFAULT_WIDTH = 1280
@@ -2740,7 +2892,8 @@ class CockpitProjectionManager(
          * `1280×720`, VBR (`BITRATE_MODE_VBR = 1`), `AVCProfileBaseline (1)`, `AVCLevel3 (0x100)`,
          * `KEY_FRAME_RATE = 30`, `KEY_MAX_FPS_TO_ENCODER = 30f`, `KEY_CAPTURE_RATE = 30`,
          * `KEY_I_FRAME_INTERVAL = 1`, `KEY_REPEAT_PREVIOUS_FRAME_AFTER = 100_000L`,
-         * `KEY_PRIORITY = 0` (realtime), and Samsung `video-qp-p-max = 36`.
+         * `KEY_PRIORITY = 0` (realtime), optional `KEY_LOW_LATENCY = 1` (API 30+),
+         * and Samsung `video-qp-p-max = 36`.
          */
         internal fun buildPreferredAvcMediaFormat(
             width: Int = DEFAULT_WIDTH,
@@ -2752,7 +2905,8 @@ class CockpitProjectionManager(
             includeVbr: Boolean = true,
             includeVendorTimingKeys: Boolean = true,
             includeSamsungQpMax: Boolean = true,
-            includeFpsLimitKeys: Boolean = true
+            includeFpsLimitKeys: Boolean = true,
+            includeLowLatency: Boolean = false
         ): MediaFormat = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
             setInteger(
                 MediaFormat.KEY_COLOR_FORMAT,
@@ -2789,6 +2943,9 @@ class CockpitProjectionManager(
                 }
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
+                }
+                if (includeLowLatency && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
                 }
                 setLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 100_000L)
                 if (includeSamsungQpMax) {

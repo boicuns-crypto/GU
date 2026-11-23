@@ -117,10 +117,19 @@ class UsbAccessoryTransport(
     private var writerThread: Thread? = null
 
     @Volatile
-    private var outgoingQueue: CarLifeUsbWriteQueue = CarLifeUsbWriteQueue(maxVideoFrames = MAX_QUEUED_VIDEO_FRAMES)
+    var onVideoCongestionDrop: (() -> Unit)? = null
+
+    @Volatile
+    private var outgoingQueue: CarLifeUsbWriteQueue = CarLifeUsbWriteQueue(
+        maxVideoFrames = MAX_QUEUED_VIDEO_FRAMES,
+        onVideoCongestionDrop = { onVideoCongestionDrop?.invoke() }
+    )
 
     val droppedVideoPFrames: Long
         get() = outgoingQueue.droppedVideoPFrames.get()
+
+    val videoQueueDepth: Int
+        get() = outgoingQueue.videoSize
 
     private val _state = MutableStateFlow<UsbTransportState>(UsbTransportState.Disconnected)
     val state: StateFlow<UsbTransportState> = _state.asStateFlow()
@@ -236,7 +245,10 @@ class UsbAccessoryTransport(
         outChannel = fos.channel
         activeAccessory = accessory
 
-        val writeQueue = CarLifeUsbWriteQueue(maxVideoFrames = MAX_QUEUED_VIDEO_FRAMES)
+        val writeQueue = CarLifeUsbWriteQueue(
+            maxVideoFrames = MAX_QUEUED_VIDEO_FRAMES,
+            onVideoCongestionDrop = { onVideoCongestionDrop?.invoke() }
+        )
         outgoingQueue = writeQueue
         writerRunning.set(true)
 
@@ -286,17 +298,50 @@ class UsbAccessoryTransport(
 
     /**
      * Writes any CarLife frame to `/dev/usb_accessory` (`FileOutputStream`) in strict
-     * **16,384-byte (16 KB)** chunks on the dedicated high-priority [writerThread] so the Linux kernel
-     * `f_accessory` driver never drops or truncates >16KB H.264 IDR keyframes.
+     * **16,384-byte (16 KB)** chunks on the dedicated high-priority [writerThread] using a
+     * reusable scratch buffer (zero per-frame heap copies) so the Linux kernel `f_accessory`
+     * driver never drops or truncates >16KB H.264 IDR keyframes and ART GC stays quiet.
      */
     @Throws(IOException::class)
-    private fun writeFrameChunked16K(usbOutputStream: FileOutputStream, frame: CarLifeFrame) {
-        val fullPacket = CarLifeFrameCodec.encodeFrame(frame)
-        var offset = 0
-        while (offset < fullPacket.size) {
-            val chunk = minOf(MAX_AOA_WRITE_SIZE, fullPacket.size - offset)
-            usbOutputStream.write(fullPacket, offset, chunk)
-            offset += chunk
+    private fun writeFrameChunked16K(
+        usbOutputStream: FileOutputStream,
+        frame: CarLifeFrame,
+        chunkScratch: ByteArray
+    ) {
+        val header = frame.header
+        val payload = frame.payload
+        val headerSize = header.headerSizeBytes
+        val rawChannelId = header.rawChannelId
+        val payloadLen = payload.size
+
+        // Big-Endian outer header: [rawChannelId (4B)][payloadLen (4B)][optional timestamp (4B)]
+        chunkScratch[0] = (rawChannelId ushr 24).toByte()
+        chunkScratch[1] = (rawChannelId ushr 16).toByte()
+        chunkScratch[2] = (rawChannelId ushr 8).toByte()
+        chunkScratch[3] = rawChannelId.toByte()
+        chunkScratch[4] = (payloadLen ushr 24).toByte()
+        chunkScratch[5] = (payloadLen ushr 16).toByte()
+        chunkScratch[6] = (payloadLen ushr 8).toByte()
+        chunkScratch[7] = payloadLen.toByte()
+        if (header.includeOuterTimestamp) {
+            val ts = (header.timestamp and 0x7FFF_FFFFL).toInt()
+            chunkScratch[8] = (ts ushr 24).toByte()
+            chunkScratch[9] = (ts ushr 16).toByte()
+            chunkScratch[10] = (ts ushr 8).toByte()
+            chunkScratch[11] = ts.toByte()
+        }
+
+        val firstPayloadChunk = minOf(payloadLen, MAX_AOA_WRITE_SIZE - headerSize)
+        if (firstPayloadChunk > 0) {
+            System.arraycopy(payload, 0, chunkScratch, headerSize, firstPayloadChunk)
+        }
+        usbOutputStream.write(chunkScratch, 0, headerSize + firstPayloadChunk)
+
+        var payloadOffset = firstPayloadChunk
+        while (payloadOffset < payloadLen) {
+            val chunk = minOf(MAX_AOA_WRITE_SIZE, payloadLen - payloadOffset)
+            usbOutputStream.write(payload, payloadOffset, chunk)
+            payloadOffset += chunk
         }
     }
 
@@ -472,11 +517,12 @@ class UsbAccessoryTransport(
         fos: FileOutputStream,
         queue: CarLifeUsbWriteQueue
     ) {
+        val chunkScratch = ByteArray(MAX_AOA_WRITE_SIZE)
         try {
             while (writerRunning.get() && !Thread.currentThread().isInterrupted) {
                 val frame = queue.take()
                 if (!writerRunning.get()) break
-                writeFrameChunked16K(fos, frame)
+                writeFrameChunked16K(fos, frame, chunkScratch)
                 _txFrames.incrementAndGet()
                 _txBytes.addAndGet(frame.totalFrameBytes.toLong())
             }
@@ -610,17 +656,21 @@ class UsbAccessoryTransport(
  *    P-frames are evicted cleanly so head-unit latency never accumulates.
  */
 internal class CarLifeUsbWriteQueue(
-    val maxVideoFrames: Int = UsbAccessoryTransport.MAX_QUEUED_VIDEO_FRAMES
+    val maxVideoFrames: Int = UsbAccessoryTransport.MAX_QUEUED_VIDEO_FRAMES,
+    private val onVideoCongestionDrop: (() -> Unit)? = null,
+    private val gopSafeRecoveryEnabled: Boolean = (onVideoCongestionDrop != null)
 ) {
     private data class QueuedVideoFrame(
         val frame: CarLifeFrame,
-        val isKeyFrame: Boolean
+        val isKeyFrame: Boolean,
+        val isHeartbeat: Boolean = false
     )
 
     private val priorityQueue = LinkedBlockingQueue<CarLifeFrame>(UsbAccessoryTransport.WRITER_QUEUE_CAPACITY)
     private val videoQueue = LinkedBlockingQueue<QueuedVideoFrame>()
     private val lock = ReentrantLock()
     private val notEmpty = lock.newCondition()
+    private var awaitingRecoveryKeyFrame: Boolean = false
 
     val droppedVideoPFrames = AtomicLong(0L)
 
@@ -630,7 +680,11 @@ internal class CarLifeUsbWriteQueue(
     val videoSize: Int
         get() = videoQueue.size
 
+    val isAwaitingRecoveryKeyFrame: Boolean
+        get() = lock.withLock { awaitingRecoveryKeyFrame }
+
     fun enqueue(frame: CarLifeFrame, isKeyFrameHint: Boolean? = null): Boolean {
+        var triggerCongestionCallback = false
         lock.withLock {
             if (frame.channel != CarLifeChannel.VIDEO) {
                 if (!priorityQueue.offer(frame)) {
@@ -639,16 +693,61 @@ internal class CarLifeUsbWriteQueue(
                     priorityQueue.offer(frame)
                 }
             } else {
-                val isKeyOrConfig = isKeyFrameHint ?: isVideoKeyFrameOrHeartbeat(frame)
-                while (videoQueue.size >= maxVideoFrames) {
-                    val dropped = evictOldestStaleVideoFrameLocked()
-                    if (!dropped) break
+                val isHeartbeat = isVideoHeartbeat(frame)
+                val isKeyOrConfig = if (isHeartbeat) {
+                    true
+                } else {
+                    isKeyFrameHint ?: isVideoKeyFrameOrHeartbeat(frame)
                 }
-                videoQueue.offer(QueuedVideoFrame(frame = frame, isKeyFrame = isKeyOrConfig))
+
+                if (isHeartbeat) {
+                    if (videoQueue.size < maxVideoFrames) {
+                        videoQueue.offer(QueuedVideoFrame(frame = frame, isKeyFrame = true, isHeartbeat = true))
+                    }
+                } else if (isKeyOrConfig) {
+                    // Fresh IDR keyframe heals any broken GOP and evicts stale buffered video frames on congestion/recovery
+                    val wasRecovering = awaitingRecoveryKeyFrame
+                    awaitingRecoveryKeyFrame = false
+                    if (wasRecovering || (gopSafeRecoveryEnabled && videoQueue.size >= maxVideoFrames)) {
+                        evictAllStaleNonHeartbeatFramesLocked()
+                    } else {
+                        while (videoQueue.size >= maxVideoFrames) {
+                            val dropped = evictOldestStaleVideoFrameLocked()
+                            if (!dropped) break
+                        }
+                    }
+                    videoQueue.offer(QueuedVideoFrame(frame = frame, isKeyFrame = true, isHeartbeat = false))
+                } else {
+                    // Regular dependent P-frame
+                    if (gopSafeRecoveryEnabled && awaitingRecoveryKeyFrame) {
+                        // Do NOT feed broken-GOP P-frames to the Head Unit H.264 decoder while waiting for a recovery IDR
+                        droppedVideoPFrames.incrementAndGet()
+                        return true
+                    }
+                    if (videoQueue.size >= maxVideoFrames) {
+                        while (videoQueue.size >= maxVideoFrames) {
+                            val dropped = evictOldestStaleVideoFrameLocked()
+                            if (!dropped) break
+                        }
+                        if (gopSafeRecoveryEnabled) {
+                            // Congestion detected with active IDR callback: enter GOP recovery mode and request crisp IDR
+                            awaitingRecoveryKeyFrame = true
+                            droppedVideoPFrames.incrementAndGet()
+                            triggerCongestionCallback = true
+                        } else {
+                            videoQueue.offer(QueuedVideoFrame(frame = frame, isKeyFrame = false, isHeartbeat = false))
+                        }
+                    } else {
+                        videoQueue.offer(QueuedVideoFrame(frame = frame, isKeyFrame = false, isHeartbeat = false))
+                    }
+                }
             }
             notEmpty.signal()
-            return true
         }
+        if (triggerCongestionCallback) {
+            onVideoCongestionDrop?.invoke()
+        }
+        return true
     }
 
     @Throws(InterruptedException::class)
@@ -673,6 +772,20 @@ internal class CarLifeUsbWriteQueue(
         lock.withLock {
             priorityQueue.clear()
             videoQueue.clear()
+            awaitingRecoveryKeyFrame = false
+        }
+    }
+
+    private fun evictAllStaleNonHeartbeatFramesLocked() {
+        val iterator = videoQueue.iterator()
+        while (iterator.hasNext()) {
+            val candidate = iterator.next()
+            if (!candidate.isHeartbeat) {
+                iterator.remove()
+                if (!candidate.isKeyFrame) {
+                    droppedVideoPFrames.incrementAndGet()
+                }
+            }
         }
     }
 
@@ -696,6 +809,19 @@ internal class CarLifeUsbWriteQueue(
     }
 
     companion object {
+        fun isVideoHeartbeat(frame: CarLifeFrame): Boolean {
+            if (frame.channel != CarLifeChannel.VIDEO) return false
+            val payload = frame.payload
+            if (payload.isEmpty()) return true
+            val isAoA20B = !frame.header.includeOuterTimestamp && payload.size >= 12
+            if (!isAoA20B) return false
+            val serviceType = ((payload[8].toInt() and 0xFF) shl 24) or
+                ((payload[9].toInt() and 0xFF) shl 16) or
+                ((payload[10].toInt() and 0xFF) shl 8) or
+                (payload[11].toInt() and 0xFF)
+            return serviceType == com.example.protocol.carlife.CarLifeMsgType.MSG_VIDEO_HEARTBEAT
+        }
+
         fun isVideoKeyFrameOrHeartbeat(frame: CarLifeFrame): Boolean {
             if (frame.channel != CarLifeChannel.VIDEO) return false
             val payload = frame.payload
