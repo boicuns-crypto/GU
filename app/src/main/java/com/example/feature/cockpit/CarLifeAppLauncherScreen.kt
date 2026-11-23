@@ -62,6 +62,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -76,6 +77,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.zIndex
 import com.example.core.input.CarLifeAccessibilityService
 import com.example.core.shizuku.CarLifeShizukuManager
 import com.example.ui.theme.CockpitIcons
@@ -134,12 +136,51 @@ enum class AppLaunchMode(
 }
 
 /**
+ * Right-pane content mode in Standard Cockpit (`Presentation`, `x = 250..1280`).
+ */
+enum class CockpitRightPane {
+    APP_GRID,
+    EMBEDDED_MAP
+}
+
+/**
+ * Reactive controller tracking whether the right pane of Standard Cockpit displays
+ * the 4×3 App Grid or the persistent embedded Yandex Maps WebView.
+ */
+object CockpitUiStateController {
+    private val _activeRightPane = MutableStateFlow(CockpitRightPane.APP_GRID)
+    val activeRightPane: StateFlow<CockpitRightPane> = _activeRightPane.asStateFlow()
+
+    fun showGrid() {
+        _activeRightPane.value = CockpitRightPane.APP_GRID
+    }
+
+    fun showMap() {
+        _activeRightPane.value = CockpitRightPane.EMBEDDED_MAP
+    }
+
+    fun toggleMap() {
+        _activeRightPane.value = if (_activeRightPane.value == CockpitRightPane.EMBEDDED_MAP) {
+            CockpitRightPane.APP_GRID
+        } else {
+            CockpitRightPane.EMBEDDED_MAP
+        }
+    }
+}
+
+/**
  * Repository that queries all installed `CATEGORY_LAUNCHER` applications on the smartphone
  * and launches any selected application onto the target CarLife `VirtualDisplay` (`displayId`)
  * or directly onto the default display without `ActivityOptions` on fallback / Screen Mirroring.
  */
 object CarLifeLauncherRepository {
     private const val TAG = "CarLifeLauncherRepo"
+
+    val PREFERRED_NAV_PACKAGES = listOf(
+        "ru.yandex.yandexnavi",
+        "ru.dublgis.dgismobile",
+        "ru.yandex.yandexmaps"
+    )
 
     private val priorityPackages = listOf(
         "ru.yandex.yandexnavi",
@@ -176,6 +217,49 @@ object CarLifeLauncherRepository {
     fun setAppLaunchMode(mode: AppLaunchMode) {
         _appLaunchMode.value = mode
         _lastLaunchStatus.value = "Режим запуска: ${mode.title}"
+    }
+
+    /**
+     * Resolves the highest-priority installed navigation app (Яндекс Навигатор -> 2ГИС -> Яндекс Карты)
+     * and launches / brings it to front on [targetDisplayId] via Shizuku.
+     *
+     * @return `true` if a native navigation app was found and launched via Shizuku, `false` otherwise.
+     */
+    fun launchPreferredNavigatorOnShizuku(
+        context: Context,
+        targetDisplayId: Int
+    ): Boolean {
+        if (targetDisplayId == Display.DEFAULT_DISPLAY) return false
+        val pm = (context.applicationContext ?: context).packageManager
+        val cached = _installedApps.value
+
+        for (pkg in PREFERRED_NAV_PACKAGES) {
+            val fromCache = cached.firstOrNull { it.packageName == pkg }
+            val resolvedActivity = fromCache?.activityName
+                ?: runCatching { pm.getLaunchIntentForPackage(pkg)?.component?.className }.getOrNull()
+            val isInstalled = fromCache != null ||
+                resolvedActivity != null ||
+                runCatching { pm.getPackageInfo(pkg, 0); true }.getOrDefault(false)
+
+            if (isInstalled) {
+                val launched = CarLifeShizukuManager.launchAppOnDisplay(
+                    packageName = pkg,
+                    activityName = resolvedActivity.orEmpty(),
+                    displayId = targetDisplayId
+                )
+                if (launched) {
+                    val label = fromCache?.label ?: when (pkg) {
+                        "ru.yandex.yandexnavi" -> "Яндекс Навигатор"
+                        "ru.dublgis.dgismobile" -> "2ГИС"
+                        else -> "Яндекс Карты"
+                    }
+                    _lastLaunchStatus.value = "Shizuku Карта: $label ($pkg) -> VD #$targetDisplayId"
+                    onShizukuAppLaunchedOnVirtualDisplay?.invoke(targetDisplayId)
+                    return true
+                }
+            }
+        }
+        return false
     }
 
     fun markLauncherActiveOnDisplay(
@@ -453,34 +537,46 @@ object CarLifeLauncherRepository {
 }
 
 /**
- * Full-screen Volkswagen MIB3 / Digital Cockpit Launcher rendered onto the Head Unit `VirtualDisplay`
+ * Unified Volkswagen MIB3 / Digital Cockpit Launcher rendered onto the Head Unit `VirtualDisplay`
  * (and previewable on smartphone). Automatically adapts to Light (`VW Silver Day`) and Dark (`VW MIB3 Night`).
  *
  * Layout:
- * - **Left Panel**: Large `36.sp` SemiBold tabular clock, compact `JETTA VS7` badge + `LIVE` dot,
- *   strict rectangular «Домой» / «Назад» buttons (`1.dp` border), and compact current track widget
- *   with a `primary` VW accent stripe.
- * - **Right Panel**: Header `Jetta VS7 • Приложения` underlined by a thin VW Blue accent line,
- *   followed by a clean `4×3` grid of uniform `14.dp` app tiles with icons and clear unclipped labels.
+ * - **Left Panel (`250.dp` == `250 px` at `160 dpi`)**: [VwCockpitLeftPanel] with tabular clock,
+ *   `JETTA VS7` badge, Day/Night button, «Домой» / «Назад» / «Карта» keys, and VW Music Player (`⏮ ⏯ ⏭`).
+ * - **Right Panel (`x = 250..1280`)**:
+ *   - Standard Cockpit: instant switching between `4×3` App Grid and persistent embedded Yandex Maps
+ *     WebView (`https://yandex.ru/maps/?l=trf`) WITHOUT destroying/recreating the WebView.
+ *   - Shizuku Cockpit: `4×3` App Grid launching Yandex Navigator / 2GIS onto `VirtualDisplay`,
+ *     while the identical `250 px` Left Panel stays pinned over the left edge via `ShizukuLeftPanelOverlay`.
  */
 @Composable
 fun CarLifeAppLauncherScreen(
     virtualDisplayId: Int,
-    mediaState: CockpitMediaState,
+    mediaState: MediaState,
     onPlayPause: () -> Unit,
     onNextTrack: () -> Unit,
     onPreviousTrack: () -> Unit,
     onRequestNotificationAccess: () -> Unit,
     onHomePressed: () -> Unit,
     onBackPressed: () -> Unit,
+    isShizukuMode: Boolean = false,
+    onMapPressed: (() -> Unit)? = null,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val apps by CarLifeLauncherRepository.installedApps.collectAsState()
-    val a11yEnabled by CarLifeAccessibilityService.isServiceEnabled.collectAsState()
+    val activeRightPane by CockpitUiStateController.activeRightPane.collectAsState()
+    val mapController = remember { EmbeddedYandexMapsController() }
 
     var selectedFilter by remember { mutableIntStateOf(0) } // 0 = All, 1 = Priority/Nav & Media
+    var hasEverOpenedEmbeddedMap by remember { mutableStateOf(false) }
+
+    LaunchedEffect(activeRightPane) {
+        if (activeRightPane == CockpitRightPane.EMBEDDED_MAP) {
+            hasEverOpenedEmbeddedMap = true
+        }
+    }
 
     LaunchedEffect(Unit) {
         CarLifeLauncherRepository.loadInstalledApps(context)
@@ -493,271 +589,184 @@ fun CarLifeAppLauncherScreen(
         }
     }
 
+    val isEmbeddedMapVisible = activeRightPane == CockpitRightPane.EMBEDDED_MAP
+
+    val handleHomeAction = {
+        selectedFilter = 0
+        CockpitUiStateController.showGrid()
+        onHomePressed()
+    }
+
+    val handleBackAction = {
+        if (isEmbeddedMapVisible) {
+            if (!mapController.goBack()) {
+                CockpitUiStateController.showGrid()
+            }
+        } else {
+            onBackPressed()
+        }
+    }
+
+    val handleMapAction = {
+        if (onMapPressed != null) {
+            onMapPressed()
+        } else if (isShizukuMode && virtualDisplayId != Display.DEFAULT_DISPLAY) {
+            val launchedNative = CarLifeLauncherRepository.launchPreferredNavigatorOnShizuku(
+                context = context,
+                targetDisplayId = virtualDisplayId
+            )
+            if (!launchedNative) {
+                hasEverOpenedEmbeddedMap = true
+                CockpitUiStateController.toggleMap()
+            }
+        } else {
+            hasEverOpenedEmbeddedMap = true
+            CockpitUiStateController.toggleMap()
+        }
+    }
+
     Surface(
         modifier = modifier.fillMaxSize(),
         color = MaterialTheme.colorScheme.background
     ) {
         BoxWithConstraints(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(12.dp)
+            modifier = Modifier.fillMaxSize()
         ) {
-            val isWideScreen = maxWidth >= 460.dp
-            val sideDockWidth = if (maxWidth < 640.dp) 210.dp else 256.dp
+            val isWideScreen = maxWidth >= 560.dp
 
             if (isWideScreen) {
                 Row(
-                    modifier = Modifier.fillMaxSize(),
-                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    modifier = Modifier.fillMaxSize()
                 ) {
-                    // Left Panel: VW Digital Cockpit Clock + JETTA VS7/LIVE + Home/Back + Media Widget
-                    CarLifeSideDockBar(
+                    // Exact 250 px (250.dp at 160 dpi) Permanent VW Left Panel (x = 0..250)
+                    VwCockpitLeftPanel(
                         virtualDisplayId = virtualDisplayId,
-                        a11yEnabled = a11yEnabled,
                         mediaState = mediaState,
-                        onHomeClick = {
-                            selectedFilter = 0
-                            onHomePressed()
-                        },
-                        onBackClick = onBackPressed,
+                        isMapActive = isEmbeddedMapVisible,
+                        onHomeClick = handleHomeAction,
+                        onBackClick = handleBackAction,
+                        onMapClick = handleMapAction,
                         onPlayPause = onPlayPause,
                         onNextTrack = onNextTrack,
                         onPreviousTrack = onPreviousTrack,
                         onRequestNotificationAccess = onRequestNotificationAccess,
+                        isFloatingOverlay = false,
                         modifier = Modifier
-                            .width(sideDockWidth)
+                            .padding(start = 0.dp, top = 0.dp, bottom = 0.dp)
+                            .width(VW_LEFT_PANEL_WIDTH_PX.dp)
                             .fillMaxHeight()
                     )
 
-                    // Right Panel: Jetta VS7 • Приложения + 4x3 App Grid
-                    InstalledAppsGridPanel(
-                        apps = filteredApps,
-                        totalAppCount = apps.size,
-                        selectedFilter = selectedFilter,
-                        isWideScreen = true,
-                        onSelectFilter = { selectedFilter = it },
-                        onRefreshApps = {
-                            scope.launch {
-                                CarLifeLauncherRepository.loadInstalledApps(context)
-                            }
-                        },
-                        onLaunchApp = { app ->
-                            CarLifeLauncherRepository.launchAppOnVirtualDisplay(
-                                context = context,
-                                app = app,
-                                targetDisplayId = virtualDisplayId
-                            )
-                        },
+                    // Right Area (x = 250..1280): Persistent WebView + 4×3 App Grid
+                    Box(
                         modifier = Modifier
                             .weight(1f)
                             .fillMaxHeight()
-                    )
+                            .padding(start = 10.dp, top = 10.dp, end = 10.dp, bottom = 10.dp)
+                    ) {
+                        if (hasEverOpenedEmbeddedMap || isEmbeddedMapVisible) {
+                            EmbeddedYandexMapsPane(
+                                isVisible = isEmbeddedMapVisible,
+                                controller = mapController,
+                                onCloseToGrid = { CockpitUiStateController.showGrid() },
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .zIndex(if (isEmbeddedMapVisible) 2f else 0f)
+                                    .alpha(if (isEmbeddedMapVisible) 1f else 0f)
+                            )
+                        }
+
+                        if (!isEmbeddedMapVisible) {
+                            InstalledAppsGridPanel(
+                                apps = filteredApps,
+                                totalAppCount = apps.size,
+                                selectedFilter = selectedFilter,
+                                isWideScreen = true,
+                                onSelectFilter = { selectedFilter = it },
+                                onRefreshApps = {
+                                    scope.launch {
+                                        CarLifeLauncherRepository.loadInstalledApps(context)
+                                    }
+                                },
+                                onLaunchApp = { app ->
+                                    CarLifeLauncherRepository.launchAppOnVirtualDisplay(
+                                        context = context,
+                                        app = app,
+                                        targetDisplayId = virtualDisplayId
+                                    )
+                                },
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .zIndex(1f)
+                            )
+                        }
+                    }
                 }
             } else {
-                // Compact vertical layout for narrow portrait preview
+                // Compact vertical layout for narrow portrait smartphone preview
                 Column(
-                    modifier = Modifier.fillMaxSize(),
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(12.dp),
                     verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
                     CompactTopDockBar(
                         virtualDisplayId = virtualDisplayId,
-                        a11yEnabled = a11yEnabled,
                         mediaState = mediaState,
-                        onHomeClick = {
-                            selectedFilter = 0
-                            onHomePressed()
-                        },
-                        onBackClick = onBackPressed,
+                        isMapActive = isEmbeddedMapVisible,
+                        onHomeClick = handleHomeAction,
+                        onBackClick = handleBackAction,
+                        onMapClick = handleMapAction,
                         onPlayPause = onPlayPause,
                         onNextTrack = onNextTrack,
                         onPreviousTrack = onPreviousTrack,
                         onRequestNotificationAccess = onRequestNotificationAccess
                     )
 
-                    InstalledAppsGridPanel(
-                        apps = filteredApps,
-                        totalAppCount = apps.size,
-                        selectedFilter = selectedFilter,
-                        isWideScreen = false,
-                        onSelectFilter = { selectedFilter = it },
-                        onRefreshApps = {
-                            scope.launch {
-                                CarLifeLauncherRepository.loadInstalledApps(context)
-                            }
-                        },
-                        onLaunchApp = { app ->
-                            CarLifeLauncherRepository.launchAppOnVirtualDisplay(
-                                context = context,
-                                app = app,
-                                targetDisplayId = virtualDisplayId
-                            )
-                        },
+                    Box(
                         modifier = Modifier
                             .fillMaxWidth()
                             .weight(1f)
-                    )
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun CarLifeSideDockBar(
-    virtualDisplayId: Int,
-    a11yEnabled: Boolean,
-    mediaState: CockpitMediaState,
-    onHomeClick: () -> Unit,
-    onBackClick: () -> Unit,
-    onPlayPause: () -> Unit,
-    onNextTrack: () -> Unit,
-    onPreviousTrack: () -> Unit,
-    onRequestNotificationAccess: () -> Unit,
-    modifier: Modifier = Modifier
-) {
-    val colorScheme = MaterialTheme.colorScheme
-    val vw = MaterialTheme.vwColors
-
-    var currentTime by remember { mutableStateOf("12:00") }
-    LaunchedEffect(Unit) {
-        val fmt = SimpleDateFormat("HH:mm", Locale.getDefault())
-        while (true) {
-            currentTime = fmt.format(Date())
-            delay(10_000L)
-        }
-    }
-
-    Card(
-        modifier = modifier,
-        shape = RoundedCornerShape(14.dp),
-        colors = CardDefaults.cardColors(containerColor = colorScheme.surface),
-        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
-        border = BorderStroke(1.dp, colorScheme.outline)
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(14.dp),
-            verticalArrangement = Arrangement.SpaceBetween
-        ) {
-            // Top section: Large 36.sp Clock, JETTA VS7 + LIVE badge, and strict Home / Back keys
-            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                // Brand badge + LIVE indicator row
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Surface(
-                        color = colorScheme.surfaceVariant,
-                        shape = RoundedCornerShape(8.dp),
-                        border = BorderStroke(1.dp, colorScheme.outline)
                     ) {
-                        Text(
-                            text = "JETTA VS7",
-                            style = MaterialTheme.typography.labelSmall.copy(
-                                fontWeight = FontWeight.Bold,
-                                letterSpacing = 0.9.sp
-                            ),
-                            color = colorScheme.primary,
-                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
-                        )
-                    }
-
-                    val isLive = virtualDisplayId != Display.DEFAULT_DISPLAY || a11yEnabled
-                    Surface(
-                        color = if (isLive) vw.successContainer else vw.infoContainer,
-                        shape = RoundedCornerShape(50),
-                        border = BorderStroke(
-                            1.dp,
-                            if (isLive) vw.statusActiveDot.copy(alpha = 0.35f) else vw.statusWaitingDot.copy(alpha = 0.35f)
-                        )
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(5.dp)
-                        ) {
-                            Box(
+                        if (hasEverOpenedEmbeddedMap || isEmbeddedMapVisible) {
+                            EmbeddedYandexMapsPane(
+                                isVisible = isEmbeddedMapVisible,
+                                controller = mapController,
+                                onCloseToGrid = { CockpitUiStateController.showGrid() },
                                 modifier = Modifier
-                                    .size(7.dp)
-                                    .clip(CircleShape)
-                                    .background(if (isLive) vw.statusActiveDot else vw.statusWaitingDot)
+                                    .fillMaxSize()
+                                    .zIndex(if (isEmbeddedMapVisible) 2f else 0f)
+                                    .alpha(if (isEmbeddedMapVisible) 1f else 0f)
                             )
-                            Text(
-                                text = if (virtualDisplayId != Display.DEFAULT_DISPLAY) {
-                                    "LIVE • #$virtualDisplayId"
-                                } else {
-                                    "LIVE"
+                        }
+
+                        if (!isEmbeddedMapVisible) {
+                            InstalledAppsGridPanel(
+                                apps = filteredApps,
+                                totalAppCount = apps.size,
+                                selectedFilter = selectedFilter,
+                                isWideScreen = false,
+                                onSelectFilter = { selectedFilter = it },
+                                onRefreshApps = {
+                                    scope.launch {
+                                        CarLifeLauncherRepository.loadInstalledApps(context)
+                                    }
                                 },
-                                style = MaterialTheme.typography.labelSmall.tabular().copy(
-                                    fontWeight = FontWeight.SemiBold,
-                                    letterSpacing = 0.5.sp
-                                ),
-                                color = if (isLive) vw.onSuccessContainer else vw.onInfoContainer
+                                onLaunchApp = { app ->
+                                    CarLifeLauncherRepository.launchAppOnVirtualDisplay(
+                                        context = context,
+                                        app = app,
+                                        targetDisplayId = virtualDisplayId
+                                    )
+                                },
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .zIndex(1f)
                             )
                         }
                     }
                 }
-
-                // Crisp 36.sp tabular digital clock
-                Text(
-                    text = currentTime,
-                    style = MaterialTheme.typography.displaySmall.copy(
-                        fontSize = 36.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        fontFeatureSettings = "tnum"
-                    ),
-                    color = colorScheme.onSurface
-                )
-
-                // Thin VW Blue accent divider
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(2.dp)
-                        .background(
-                            Brush.horizontalGradient(
-                                colors = listOf(
-                                    vw.accentBlue,
-                                    vw.accentBlue.copy(alpha = 0.12f)
-                                )
-                            )
-                        )
-                )
-
-                // Strict rectangular «Домой» & «Назад» buttons with 1.dp border
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    DockNavigationButton(
-                        label = "Домой",
-                        icon = CockpitIcons.Home,
-                        accent = colorScheme.primary,
-                        testTag = "dock_home_button",
-                        onClick = onHomeClick,
-                        modifier = Modifier.weight(1f)
-                    )
-                    DockNavigationButton(
-                        label = "Назад",
-                        icon = CockpitIcons.ArrowBack,
-                        accent = colorScheme.onSurface,
-                        testTag = "dock_back_button",
-                        onClick = onBackClick,
-                        modifier = Modifier.weight(1f)
-                    )
-                }
             }
-
-            // Bottom-left Compact Media Player Widget with primary accent stripe
-            DockCompactMediaPlayer(
-                mediaState = mediaState,
-                onPlayPause = onPlayPause,
-                onNextTrack = onNextTrack,
-                onPreviousTrack = onPreviousTrack,
-                onRequestNotificationAccess = onRequestNotificationAccess
-            )
         }
     }
 }
@@ -765,15 +774,17 @@ private fun CarLifeSideDockBar(
 @Composable
 private fun CompactTopDockBar(
     virtualDisplayId: Int,
-    a11yEnabled: Boolean,
-    mediaState: CockpitMediaState,
+    mediaState: MediaState,
+    isMapActive: Boolean,
     onHomeClick: () -> Unit,
     onBackClick: () -> Unit,
+    onMapClick: () -> Unit,
     onPlayPause: () -> Unit,
     onNextTrack: () -> Unit,
     onPreviousTrack: () -> Unit,
     onRequestNotificationAccess: () -> Unit
 ) {
+    val context = LocalContext.current
     val colorScheme = MaterialTheme.colorScheme
     val vw = MaterialTheme.vwColors
 
@@ -821,7 +832,11 @@ private fun CompactTopDockBar(
                         border = BorderStroke(1.dp, colorScheme.outline)
                     ) {
                         Text(
-                            text = "JETTA VS7",
+                            text = if (virtualDisplayId != Display.DEFAULT_DISPLAY) {
+                                "JETTA VS7 • VD #$virtualDisplayId"
+                            } else {
+                                "JETTA VS7"
+                            },
                             style = MaterialTheme.typography.labelSmall.copy(
                                 fontWeight = FontWeight.Bold,
                                 letterSpacing = 0.7.sp
@@ -832,38 +847,24 @@ private fun CompactTopDockBar(
                     }
                 }
 
-                val isLive = virtualDisplayId != Display.DEFAULT_DISPLAY || a11yEnabled
-                Surface(
-                    color = if (isLive) vw.successContainer else vw.infoContainer,
-                    shape = RoundedCornerShape(50),
-                    border = BorderStroke(
-                        1.dp,
-                        if (isLive) vw.statusActiveDot.copy(alpha = 0.35f) else vw.statusWaitingDot.copy(alpha = 0.35f)
-                    )
+                IconButton(
+                    onClick = {
+                        val nextMode = if (vw.isDark) com.example.ui.theme.ThemeMode.LIGHT else com.example.ui.theme.ThemeMode.DARK
+                        com.example.ui.theme.ThemePreferences.setThemeMode(nextMode, context)
+                    },
+                    modifier = Modifier
+                        .size(48.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(colorScheme.surfaceVariant)
+                        .border(1.dp, colorScheme.outline, RoundedCornerShape(10.dp))
+                        .testTag("compact_theme_toggle_button")
                 ) {
-                    Row(
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(5.dp)
-                    ) {
-                        Box(
-                            modifier = Modifier
-                                .size(6.dp)
-                                .clip(CircleShape)
-                                .background(if (isLive) vw.statusActiveDot else vw.statusWaitingDot)
-                        )
-                        Text(
-                            text = if (virtualDisplayId != Display.DEFAULT_DISPLAY) {
-                                "VD #$virtualDisplayId"
-                            } else if (a11yEnabled) {
-                                "LIVE"
-                            } else {
-                                "ОЖИДАНИЕ"
-                            },
-                            style = MaterialTheme.typography.labelSmall.tabular(),
-                            color = if (isLive) vw.onSuccessContainer else vw.onInfoContainer
-                        )
-                    }
+                    Icon(
+                        imageVector = if (vw.isDark) CockpitIcons.LightMode else CockpitIcons.DarkMode,
+                        contentDescription = "Сменить тему День/Ночь",
+                        tint = colorScheme.primary,
+                        modifier = Modifier.size(20.dp)
+                    )
                 }
             }
 
@@ -872,262 +873,40 @@ private fun CompactTopDockBar(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                DockNavigationButton(
+                VwDockNavKey(
                     label = "Домой",
                     icon = CockpitIcons.Home,
-                    accent = colorScheme.primary,
+                    active = !isMapActive,
                     testTag = "dock_home_button",
                     onClick = onHomeClick,
                     modifier = Modifier.weight(1f)
                 )
-                DockNavigationButton(
+                VwDockNavKey(
                     label = "Назад",
                     icon = CockpitIcons.ArrowBack,
-                    accent = colorScheme.onSurface,
+                    active = false,
                     testTag = "dock_back_button",
                     onClick = onBackClick,
                     modifier = Modifier.weight(1f)
                 )
+                VwDockNavKey(
+                    label = "Карта",
+                    icon = CockpitIcons.Map,
+                    active = isMapActive,
+                    testTag = "dock_map_button",
+                    onClick = onMapClick,
+                    modifier = Modifier.weight(1f)
+                )
             }
 
-            DockCompactMediaPlayer(
+            VwCompactMediaPlayerWidget(
                 mediaState = mediaState,
                 onPlayPause = onPlayPause,
                 onNextTrack = onNextTrack,
                 onPreviousTrack = onPreviousTrack,
-                onRequestNotificationAccess = onRequestNotificationAccess
+                onRequestNotificationAccess = onRequestNotificationAccess,
+                showGrantAccessCta = !mediaState.hasNotificationAccess
             )
-        }
-    }
-}
-
-@Composable
-private fun DockNavigationButton(
-    label: String,
-    icon: androidx.compose.ui.graphics.vector.ImageVector,
-    accent: Color,
-    testTag: String,
-    onClick: () -> Unit,
-    modifier: Modifier = Modifier
-) {
-    val colorScheme = MaterialTheme.colorScheme
-    Surface(
-        modifier = modifier
-            .height(48.dp)
-            .clip(RoundedCornerShape(10.dp))
-            .clickable(onClick = onClick)
-            .testTag(testTag),
-        color = colorScheme.surfaceVariant,
-        shape = RoundedCornerShape(10.dp),
-        border = BorderStroke(1.dp, colorScheme.outline)
-    ) {
-        Row(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(horizontal = 8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.Center
-        ) {
-            Icon(
-                imageVector = icon,
-                contentDescription = label,
-                tint = accent,
-                modifier = Modifier.size(18.dp)
-            )
-            Spacer(modifier = Modifier.width(6.dp))
-            Text(
-                text = label,
-                style = MaterialTheme.typography.labelLarge.copy(
-                    fontFamily = FontFamily.SansSerif,
-                    fontWeight = FontWeight.Medium
-                ),
-                color = colorScheme.onSurface,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
-        }
-    }
-}
-
-@Composable
-private fun DockCompactMediaPlayer(
-    mediaState: CockpitMediaState,
-    onPlayPause: () -> Unit,
-    onNextTrack: () -> Unit,
-    onPreviousTrack: () -> Unit,
-    onRequestNotificationAccess: () -> Unit
-) {
-    val colorScheme = MaterialTheme.colorScheme
-    val vw = MaterialTheme.vwColors
-
-    Surface(
-        modifier = Modifier.fillMaxWidth(),
-        color = colorScheme.surfaceVariant,
-        shape = RoundedCornerShape(12.dp),
-        border = BorderStroke(1.dp, colorScheme.outline)
-    ) {
-        Column(modifier = Modifier.fillMaxWidth()) {
-            // Signature VW MIB3 primary accent stripe at top of track widget
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(3.dp)
-                    .background(colorScheme.primary)
-            )
-
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(10.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    // Album Art Thumbnail
-                    Box(
-                        modifier = Modifier
-                            .size(40.dp)
-                            .clip(RoundedCornerShape(8.dp))
-                            .background(colorScheme.surface)
-                            .border(1.dp, colorScheme.outline, RoundedCornerShape(8.dp)),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        val bmp = mediaState.albumArtBitmap
-                        if (bmp != null) {
-                            Image(
-                                bitmap = bmp.asImageBitmap(),
-                                contentDescription = "Обложка трека",
-                                modifier = Modifier.fillMaxSize(),
-                                contentScale = ContentScale.Crop
-                            )
-                        } else {
-                            Icon(
-                                imageVector = CockpitIcons.Album,
-                                contentDescription = "Медиаплеер",
-                                tint = colorScheme.primary,
-                                modifier = Modifier.size(20.dp)
-                            )
-                        }
-                    }
-
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = mediaState.playerAppTitle,
-                            style = MaterialTheme.typography.labelSmall,
-                            color = vw.accentBlue,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                        Text(
-                            text = mediaState.trackTitle,
-                            style = MaterialTheme.typography.titleSmall.copy(
-                                fontFamily = FontFamily.SansSerif,
-                                fontWeight = FontWeight.SemiBold
-                            ),
-                            color = colorScheme.onSurface,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                        Text(
-                            text = mediaState.artistName,
-                            style = MaterialTheme.typography.labelSmall,
-                            color = colorScheme.onSurfaceVariant,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
-                        )
-                    }
-                }
-
-                if (!mediaState.hasNotificationAccess) {
-                    Surface(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(8.dp))
-                            .clickable(onClick = onRequestNotificationAccess)
-                            .testTag("grant_media_notif_btn"),
-                        color = vw.warningContainer,
-                        shape = RoundedCornerShape(8.dp)
-                    ) {
-                        Text(
-                            text = "Доступ к уведомлениям плеера",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = vw.onWarningContainer,
-                            textAlign = TextAlign.Center,
-                            modifier = Modifier.padding(vertical = 5.dp, horizontal = 6.dp)
-                        )
-                    }
-                }
-
-                LinearProgressIndicator(
-                    progress = { mediaState.progressFraction },
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(3.dp)
-                        .clip(RoundedCornerShape(2.dp)),
-                    color = colorScheme.primary,
-                    trackColor = colorScheme.outline
-                )
-
-                // Media transport buttons (>= 48.dp touch targets)
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceEvenly,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    IconButton(
-                        onClick = onPreviousTrack,
-                        modifier = Modifier
-                            .size(48.dp)
-                            .clip(CircleShape)
-                            .background(colorScheme.surface)
-                            .border(1.dp, colorScheme.outline, CircleShape)
-                            .testTag("media_prev_button")
-                    ) {
-                        Icon(
-                            imageVector = CockpitIcons.SkipPrevious,
-                            contentDescription = "Предыдущий трек",
-                            tint = colorScheme.onSurface,
-                            modifier = Modifier.size(20.dp)
-                        )
-                    }
-
-                    IconButton(
-                        onClick = onPlayPause,
-                        modifier = Modifier
-                            .size(48.dp)
-                            .clip(CircleShape)
-                            .background(colorScheme.primary)
-                            .testTag("media_play_pause_button")
-                    ) {
-                        Icon(
-                            imageVector = if (mediaState.isPlaying) CockpitIcons.Pause else Icons.Default.PlayArrow,
-                            contentDescription = "Воспроизвести или пауза",
-                            tint = colorScheme.onPrimary,
-                            modifier = Modifier.size(24.dp)
-                        )
-                    }
-
-                    IconButton(
-                        onClick = onNextTrack,
-                        modifier = Modifier
-                            .size(48.dp)
-                            .clip(CircleShape)
-                            .background(colorScheme.surface)
-                            .border(1.dp, colorScheme.outline, CircleShape)
-                            .testTag("media_next_button")
-                    ) {
-                        Icon(
-                            imageVector = CockpitIcons.SkipNext,
-                            contentDescription = "Следующий трек",
-                            tint = colorScheme.onSurface,
-                            modifier = Modifier.size(20.dp)
-                        )
-                    }
-                }
-            }
         }
     }
 }

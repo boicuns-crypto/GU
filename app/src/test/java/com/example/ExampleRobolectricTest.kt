@@ -29,6 +29,7 @@ import com.example.core.projection.ScreenKeepAlivePreferences
 import com.example.core.projection.VideoSourceMode
 import com.example.core.shizuku.CarLifeShizukuManager
 import com.example.core.shizuku.ICarLifeShizukuService
+import com.example.core.shizuku.CarLifeShizukuService
 import com.example.core.usb.BridgeForegroundService
 import com.example.core.usb.BridgeTelemetryBus
 import com.example.core.usb.CarLifeUsbWriteQueue
@@ -36,7 +37,13 @@ import com.example.protocol.carlife.CarLifeFrameCodec
 import androidx.compose.ui.graphics.Color
 import com.example.feature.cockpit.AppLaunchMode
 import com.example.feature.cockpit.CarLifeLauncherRepository
+import com.example.feature.cockpit.CockpitRightPane
+import com.example.feature.cockpit.CockpitUiStateController
+import com.example.feature.cockpit.EmbeddedYandexMapsController
 import com.example.feature.cockpit.InstalledAppInfo
+import com.example.feature.cockpit.MediaPlayerController
+import com.example.feature.cockpit.MediaState
+import com.example.feature.cockpit.VW_LEFT_PANEL_WIDTH_PX
 import com.example.ui.theme.ThemeMode
 import com.example.ui.theme.ThemePreferences
 import com.example.ui.theme.VwDarkColorScheme
@@ -1103,6 +1110,210 @@ class ExampleRobolectricTest {
     // 3. Verify LowLatency candidate key on API 30+ (SDK 36)
     val lowLatencyFmt = CockpitProjectionManager.buildPreferredAvcMediaFormat(includeLowLatency = true)
     assertEquals(1, lowLatencyFmt.getInteger(MediaFormat.KEY_LOW_LATENCY))
+  }
+
+  @Test
+  fun `MediaPlayerController publishes MediaState and resolves friendly player names`() {
+    try {
+      MediaPlayerController.resetForTesting()
+      assertEquals("Яндекс Музыка", MediaPlayerController.friendlyPlayerName("ru.yandex.music"))
+      assertEquals("Spotify", MediaPlayerController.friendlyPlayerName("com.spotify.music"))
+      assertEquals("Poweramp", MediaPlayerController.friendlyPlayerName("com.maxmpz.audioplayer"))
+      assertEquals("VK Музыка", MediaPlayerController.friendlyPlayerName("com.vkontakte.android"))
+
+      MediaPlayerController.onNotificationListenerStateChanged(true)
+      assertTrue(MediaPlayerController.mediaState.value.hasNotificationAccess)
+
+      val cover = Bitmap.createBitmap(16, 16, Bitmap.Config.ARGB_8888)
+      MediaPlayerController.setStateForTesting(
+        MediaState(
+          title = "Nightcall",
+          artist = "Kavinsky",
+          albumArt = cover,
+          isPlaying = true,
+          packageName = "ru.yandex.music",
+          hasNotificationAccess = true,
+          playerAppTitle = "Яндекс Музыка"
+        )
+      )
+      val snap = MediaPlayerController.mediaState.value
+      assertTrue(snap.hasActiveSession)
+      assertTrue(snap.isPlaying)
+      assertEquals("Nightcall", snap.title)
+      assertEquals("Kavinsky", snap.artist)
+      assertEquals(cover, snap.albumArt)
+
+      MediaPlayerController.onNotificationListenerStateChanged(false)
+      assertFalse(MediaPlayerController.mediaState.value.hasNotificationAccess)
+    } finally {
+      MediaPlayerController.resetForTesting()
+    }
+  }
+
+  @Test
+  fun `CockpitUiStateController toggles embedded Yandex Maps and validates trusted origins`() {
+    try {
+      CockpitUiStateController.showGrid()
+      assertEquals(CockpitRightPane.APP_GRID, CockpitUiStateController.activeRightPane.value)
+
+      CockpitUiStateController.toggleMap()
+      assertEquals(CockpitRightPane.EMBEDDED_MAP, CockpitUiStateController.activeRightPane.value)
+
+      CockpitUiStateController.toggleMap()
+      assertEquals(CockpitRightPane.APP_GRID, CockpitUiStateController.activeRightPane.value)
+
+      CockpitUiStateController.showMap()
+      assertEquals(CockpitRightPane.EMBEDDED_MAP, CockpitUiStateController.activeRightPane.value)
+
+      assertTrue(EmbeddedYandexMapsController.isTrustedYandexOrigin("https://yandex.ru/maps/?l=trf"))
+      assertTrue(EmbeddedYandexMapsController.isTrustedYandexOrigin("https://maps.yandex.ru/"))
+      assertFalse(EmbeddedYandexMapsController.isTrustedYandexOrigin("https://evil.example.com/"))
+      assertFalse(EmbeddedYandexMapsController.isTrustedYandexOrigin(null))
+    } finally {
+      CockpitUiStateController.showGrid()
+    }
+  }
+
+  @Test
+  fun `CarLifeShizukuService builds Freeform and fullscreen launch commands and parses taskId`() {
+    val freeform = CarLifeShizukuService.buildStartCommand(
+      packageName = "ru.yandex.yandexnavi",
+      activityName = "ru.yandex.yandexnavi.core.NavigatorActivity",
+      displayId = 9,
+      useFreeform = true
+    )
+    assertEquals(
+      listOf(
+        "am", "start", "--display", "9",
+        "--windowingMode", "5",
+        "-n", "ru.yandex.yandexnavi/ru.yandex.yandexnavi.core.NavigatorActivity"
+      ),
+      freeform.toList()
+    )
+
+    val fullscreen = CarLifeShizukuService.buildStartCommand(
+      packageName = "ru.dublgis.dgismobile",
+      activityName = "",
+      displayId = 9,
+      useFreeform = false
+    )
+    assertEquals(
+      listOf(
+        "am", "start", "--display", "9",
+        "-a", "android.intent.action.MAIN",
+        "-c", "android.intent.category.LAUNCHER",
+        "ru.dublgis.dgismobile"
+      ),
+      fullscreen.toList()
+    )
+
+    val sampleStackDump = """
+      RootTask id=1 bounds=[0,0][1080,2400] displayId=0 userId=0
+        taskId=42: com.example/com.example.MainActivity bounds=[0,0][1080,2400]
+      RootTask id=2 bounds=[250,0][1280,720] displayId=9 userId=0
+        taskId=108: ru.yandex.yandexnavi/ru.yandex.yandexnavi.core.NavigatorActivity bounds=[250,0][1280,720]
+    """.trimIndent()
+    assertEquals(
+      108,
+      CarLifeShizukuService.extractTaskIdForPackage(sampleStackDump, "ru.yandex.yandexnavi", 9)
+    )
+    assertEquals(
+      null,
+      CarLifeShizukuService.extractTaskIdForPackage(sampleStackDump, "ru.yandex.yandexnavi", 0)
+    )
+  }
+
+  @Test
+  fun `Shizuku smart touch routing separates left VW panel from right navigator area`() {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val injectedTouches = mutableListOf<Triple<Int, Float, Float>>()
+    val leftPanelEvents = mutableListOf<Triple<Int, Float, Float>>()
+
+    val fakeLeftPanelView = object : android.view.View(context) {
+      override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+        leftPanelEvents += Triple(event.actionMasked, event.x, event.y)
+        return true
+      }
+    }
+
+    val fakeShizuku = object : ICarLifeShizukuService.Stub() {
+      override fun launchAppOnDisplay(packageName: String?, activityName: String?, displayId: Int) = Unit
+
+      override fun injectTouch(
+        action: Int,
+        x: Float,
+        y: Float,
+        downTime: Long,
+        eventTime: Long,
+        displayId: Int
+      ) {
+        injectedTouches += Triple(action, x, y)
+      }
+
+      override fun sendKeyEvent(keyCode: Int, displayId: Int) = Unit
+      override fun destroy() = Unit
+    }
+
+    val manager = CockpitProjectionManager(
+      context = context,
+      onEncodedVideoNal = { _, _, _ -> }
+    )
+    try {
+      CarLifeShizukuManager.setServiceForTesting(fakeShizuku)
+      manager.appMode = AppMode.SHIZUKU_COCKPIT
+      manager.shizukuLeftPanelViewForTesting = fakeLeftPanelView
+
+      kotlinx.coroutines.runBlocking {
+        // Touch in left panel (x = 120 < 250) dispatches to Left VW Panel, NOT Shizuku right-pane app
+        manager.injectTouchPacket(
+          CarLifeTouchPacket(
+            androidAction = MotionEvent.ACTION_DOWN,
+            rawX = 120,
+            rawY = 300,
+            huWidth = 1280,
+            huHeight = 720,
+            synthesizeClickUp = false
+          )
+        )
+        manager.injectTouchPacket(
+          CarLifeTouchPacket(
+            androidAction = MotionEvent.ACTION_UP,
+            rawX = 120,
+            rawY = 300,
+            huWidth = 1280,
+            huHeight = 720,
+            synthesizeClickUp = false
+          )
+        )
+        assertEquals(2, leftPanelEvents.size)
+        assertTrue(
+          "Touches inside left 250px VW panel should not be forwarded to Shizuku right-pane app",
+          injectedTouches.isEmpty()
+        )
+
+        // Touch in right navigator area (x = 450 >= 250) routes via Shizuku injectTouch
+        manager.injectTouchPacket(
+          CarLifeTouchPacket(
+            androidAction = MotionEvent.ACTION_DOWN,
+            rawX = VW_LEFT_PANEL_WIDTH_PX + 200,
+            rawY = 360,
+            huWidth = 1280,
+            huHeight = 720,
+            synthesizeClickUp = false
+          )
+        )
+        assertEquals(1, injectedTouches.size)
+        assertEquals(MotionEvent.ACTION_DOWN, injectedTouches[0].first)
+        assertEquals((VW_LEFT_PANEL_WIDTH_PX + 200).toFloat(), injectedTouches[0].second, 1f)
+        assertEquals(360f, injectedTouches[0].third, 1f)
+        assertEquals(2, leftPanelEvents.size)
+
+        manager.stopProjection()
+      }
+    } finally {
+      manager.shizukuLeftPanelViewForTesting = null
+      CarLifeShizukuManager.setServiceForTesting(null)
+    }
   }
 }
 

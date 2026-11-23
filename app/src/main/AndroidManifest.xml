@@ -8,6 +8,9 @@
         android:required="false" />
 
     <!-- Foreground Service permissions for Galaxy S26 Ultra (Android 16 / compileSdk 36) -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
@@ -32,6 +35,9 @@
             <category android:name="android.intent.category.LAUNCHER" />
         </intent>
         <package android:name="moe.shizuku.privileged.api" />
+        <package android:name="ru.yandex.yandexnavi" />
+        <package android:name="ru.dublgis.dgismobile" />
+        <package android:name="ru.yandex.yandexmaps" />
     </queries>
 
     <application
@@ -83,10 +89,10 @@
 
         <!--
             NotificationListenerService granting MediaSessionManager access to active media sessions
-            (Yandex Music, Spotify, Poweramp, YouTube Music) for the Dock Media Widget.
+            (Yandex Music, Spotify, Poweramp, YouTube Music, VK Music) for the VW Left Panel Player.
         -->
         <service
-            android:name=".feature.cockpit.CockpitMediaNotificationListenerService"
+            android:name=".feature.cockpit.CarLifeMediaNotificationService"
             android:exported="true"
             android:label="@string/app_name"
             android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">

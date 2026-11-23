@@ -17,7 +17,9 @@ import kotlin.system.exitProcess
 
 /**
  * Привилегированный Shizuku UserService (AIDL), выполняющийся в процессе Shizuku (shell/root):
- * - Запускает приложения на целевом `VirtualDisplay` через `am start --display <displayId>` в обход `Permission Denial` на Android 16.
+ * - Запускает приложения на целевом `VirtualDisplay` в правой области (`250,0,1280,720`) через
+ *   Freeform (`am start --display <displayId> --windowingMode 5`), с автоматическим откатом на
+ *   полноэкранный запуск `am start --display <displayId>` (левая панель VW 250px лежит поверх).
  * - Инжектит низколатентные касания (`MotionEvent` + `setDisplayId`) через `InputManager.injectInputEvent(..., 0)`.
  * - Передаёт системные клавиши (`KEYCODE_BACK = 4`, `KEYCODE_HOME = 3`) через `input keyevent --display <displayId> <keyCode>`.
  */
@@ -45,33 +47,73 @@ class CarLifeShizukuService : ICarLifeShizukuService.Stub {
 
         commandExecutor.execute {
             runCatching {
-                val primaryCmd = if (act.isNotEmpty()) {
-                    val component = if (act.startsWith(".")) "$pkg$act" else "$pkg/$act"
-                    arrayOf("am", "start", "--display", displayId.toString(), "-n", component)
-                } else {
-                    arrayOf(
-                        "am", "start",
-                        "--display", displayId.toString(),
-                        "-a", "android.intent.action.MAIN",
-                        "-c", "android.intent.category.LAUNCHER",
-                        pkg
+                // 1. Try Freeform launch in right area (x = 250..1280, y = 0..720)
+                val freeformCmd = buildStartCommand(
+                    packageName = pkg,
+                    activityName = act,
+                    displayId = displayId,
+                    useFreeform = true
+                )
+                val freeformResult = execShellCommandDetailed(freeformCmd)
+                if (freeformResult.isSuccess) {
+                    // Best-effort task bounds resize to right pane (250, 0, 1280, 720)
+                    tryResizeTopTaskOnDisplay(
+                        packageName = pkg,
+                        displayId = displayId,
+                        left = RIGHT_PANE_LEFT_PX,
+                        top = 0,
+                        right = RIGHT_PANE_RIGHT_PX,
+                        bottom = RIGHT_PANE_BOTTOM_PX
                     )
+                    return@runCatching
                 }
 
-                val primaryExit = execShellCommand(primaryCmd)
-                if (primaryExit != 0 && act.isNotEmpty()) {
-                    val fallbackCmd = arrayOf(
-                        "am", "start",
-                        "--display", displayId.toString(),
-                        "-a", "android.intent.action.MAIN",
-                        "-c", "android.intent.category.LAUNCHER",
-                        pkg
+                // 2. Fallback: standard fullscreen launch on VirtualDisplay (left 250px VW panel overlays edge)
+                val fullscreenCmd = buildStartCommand(
+                    packageName = pkg,
+                    activityName = act,
+                    displayId = displayId,
+                    useFreeform = false
+                )
+                val primaryResult = execShellCommandDetailed(fullscreenCmd)
+                if (!primaryResult.isSuccess && act.isNotEmpty()) {
+                    val genericLauncherCmd = buildStartCommand(
+                        packageName = pkg,
+                        activityName = "",
+                        displayId = displayId,
+                        useFreeform = false
                     )
-                    execShellCommand(fallbackCmd)
+                    execShellCommandDetailed(genericLauncherCmd)
                 }
             }.onFailure { e ->
                 Log.w(TAG, "launchAppOnDisplay failed for $pkg on display $displayId: ${e.message}")
             }
+        }
+    }
+
+    private fun tryResizeTopTaskOnDisplay(
+        packageName: String,
+        displayId: Int,
+        left: Int,
+        top: Int,
+        right: Int,
+        bottom: Int
+    ) {
+        runCatching {
+            val dump = execShellCommandDetailed(arrayOf("am", "stack", "list"))
+            val taskId = extractTaskIdForPackage(dump.stdout, packageName, displayId) ?: return
+            execShellCommandDetailed(
+                arrayOf(
+                    "am",
+                    "task",
+                    "resize",
+                    taskId.toString(),
+                    left.toString(),
+                    top.toString(),
+                    right.toString(),
+                    bottom.toString()
+                )
+            )
         }
     }
 
@@ -114,7 +156,7 @@ class CarLifeShizukuService : ICarLifeShizukuService.Stub {
         if (keyCode <= 0 || displayId < Display.DEFAULT_DISPLAY) return
         commandExecutor.execute {
             runCatching {
-                execShellCommand(
+                execShellCommandDetailed(
                     arrayOf(
                         "input",
                         "keyevent",
@@ -134,12 +176,24 @@ class CarLifeShizukuService : ICarLifeShizukuService.Stub {
         exitProcess(0)
     }
 
-    private fun execShellCommand(command: Array<String>): Int {
+    private data class ShellResult(
+        val exitCode: Int,
+        val stdout: String,
+        val stderr: String
+    ) {
+        val isSuccess: Boolean
+            get() = exitCode == 0 &&
+                !stderr.contains("Error", ignoreCase = true) &&
+                !stderr.contains("Exception", ignoreCase = true) &&
+                !stdout.contains("Error type", ignoreCase = true)
+    }
+
+    private fun execShellCommandDetailed(command: Array<String>): ShellResult {
         val process = Runtime.getRuntime().exec(command)
         return try {
-            runCatching { process.inputStream.bufferedReader().use { it.readText() } }
-            runCatching { process.errorStream.bufferedReader().use { it.readText() } }
-            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+            val out = runCatching { process.inputStream.bufferedReader().use { it.readText() } }.getOrDefault("")
+            val err = runCatching { process.errorStream.bufferedReader().use { it.readText() } }.getOrDefault("")
+            val code = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
                 if (process.waitFor(5, TimeUnit.SECONDS)) process.exitValue() else {
                     process.destroyForcibly()
                     -1
@@ -147,6 +201,7 @@ class CarLifeShizukuService : ICarLifeShizukuService.Stub {
             } else {
                 process.waitFor()
             }
+            ShellResult(exitCode = code, stdout = out, stderr = err)
         } finally {
             runCatching { process.destroy() }
         }
@@ -156,6 +211,63 @@ class CarLifeShizukuService : ICarLifeShizukuService.Stub {
     companion object {
         private const val TAG = "CarLifeShizukuSvc"
         private const val INJECT_INPUT_EVENT_MODE_ASYNC = 0
+        const val WINDOWING_MODE_FREEFORM = 5
+        const val RIGHT_PANE_LEFT_PX = 250
+        const val RIGHT_PANE_RIGHT_PX = 1280
+        const val RIGHT_PANE_BOTTOM_PX = 720
+
+        internal fun buildStartCommand(
+            packageName: String,
+            activityName: String,
+            displayId: Int,
+            useFreeform: Boolean
+        ): Array<String> {
+            val args = mutableListOf(
+                "am", "start",
+                "--display", displayId.toString()
+            )
+            if (useFreeform) {
+                args.add("--windowingMode")
+                args.add(WINDOWING_MODE_FREEFORM.toString())
+            }
+            if (activityName.isNotBlank()) {
+                val component = if (activityName.startsWith(".")) {
+                    "$packageName$activityName"
+                } else {
+                    "$packageName/$activityName"
+                }
+                args.add("-n")
+                args.add(component)
+            } else {
+                args.add("-a")
+                args.add("android.intent.action.MAIN")
+                args.add("-c")
+                args.add("android.intent.category.LAUNCHER")
+                args.add(packageName)
+            }
+            return args.toTypedArray()
+        }
+
+        internal fun extractTaskIdForPackage(
+            stackDump: String,
+            packageName: String,
+            displayId: Int
+        ): Int? {
+            if (stackDump.isBlank() || packageName.isBlank()) return null
+            val taskIdRegex = Regex("""taskId=(\d+)""")
+            var inTargetDisplay = false
+            for (line in stackDump.lineSequence()) {
+                if (line.contains("displayId=")) {
+                    inTargetDisplay = line.contains("displayId=$displayId")
+                }
+                if (inTargetDisplay && line.contains(packageName)) {
+                    val match = taskIdRegex.find(line)
+                    val id = match?.groupValues?.getOrNull(1)?.toIntOrNull()
+                    if (id != null) return id
+                }
+            }
+            return null
+        }
 
         private val setDisplayIdMethod: Method? by lazy {
             runCatching {

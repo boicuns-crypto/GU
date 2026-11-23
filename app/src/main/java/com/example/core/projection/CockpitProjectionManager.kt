@@ -73,7 +73,10 @@ import com.example.core.shizuku.CarLifeShizukuManager
 import com.example.feature.cockpit.AppLaunchMode
 import com.example.feature.cockpit.CarLifeAppLauncherScreen
 import com.example.feature.cockpit.CarLifeLauncherRepository
+import com.example.feature.cockpit.CockpitUiStateController
 import com.example.feature.cockpit.MediaControllerRepository
+import com.example.feature.cockpit.MediaPlayerController
+import com.example.feature.cockpit.VW_LEFT_PANEL_WIDTH_PX
 import com.example.protocol.carlife.CarLifeFrameCodec
 import com.example.protocol.carlife.CarLifeTouchDecoder
 import com.example.ui.theme.MyApplicationTheme
@@ -384,6 +387,12 @@ class CockpitProjectionManager(
     private var virtualDisplayIsMirrorOnly: Boolean = false
     private var virtualDisplayFlags: Int = 0
     private var cockpitPresentation: CockpitPresentation? = null
+    private var shizukuLeftPanelOverlay: ShizukuLeftPanelOverlay? = null
+    @Volatile
+    private var isShizukuLauncherGridVisible: Boolean = true
+    private var shizukuTouchDownInLeftPanel: Boolean = false
+    @Volatile
+    internal var shizukuLeftPanelViewForTesting: android.view.View? = null
     private var encoderDrainJob: Job? = null
     private var canvasFeederJob: Job? = null
 
@@ -511,8 +520,57 @@ class CockpitProjectionManager(
         CarLifeLauncherRepository.onShizukuAppLaunchedOnVirtualDisplay = {
             if (appMode == AppMode.SHIZUKU_COCKPIT) {
                 mainHandler.post {
-                    runCatching { cockpitPresentation?.hide() }
+                    onExternalAppShownInShizukuMode()
                 }
+            }
+        }
+    }
+
+    private fun onExternalAppShownInShizukuMode() {
+        isShizukuLauncherGridVisible = false
+        runCatching { cockpitPresentation?.hide() }
+        val display = virtualDisplay?.display ?: return
+        val heightPx = _stats.value.height.coerceAtLeast(DEFAULT_HEIGHT)
+        val overlay = shizukuLeftPanelOverlay ?: ShizukuLeftPanelOverlay(
+            appContext = appContext,
+            onHomeClick = {
+                mainHandler.post { showShizukuLauncherGrid() }
+            },
+            onBackClick = {
+                val vdId = virtualDisplay?.display?.displayId ?: _stats.value.virtualDisplayId
+                CarLifeShizukuManager.sendKeyEventAsync(KeyEvent.KEYCODE_BACK, vdId)
+            },
+            onMapClick = {
+                val vdId = virtualDisplay?.display?.displayId ?: _stats.value.virtualDisplayId
+                openShizukuNavigatorOrFallbackMap(vdId)
+            }
+        ).also { shizukuLeftPanelOverlay = it }
+        overlay.show(
+            display = display,
+            panelWidthPx = VW_LEFT_PANEL_WIDTH_PX,
+            displayHeightPx = heightPx
+        )
+    }
+
+    private fun showShizukuLauncherGrid() {
+        shizukuLeftPanelOverlay?.dismiss()
+        isShizukuLauncherGridVisible = true
+        CockpitUiStateController.showGrid()
+        runCatching { cockpitPresentation?.show() }
+        cockpitPresentation?.window?.decorView?.postInvalidate()
+    }
+
+    private fun openShizukuNavigatorOrFallbackMap(displayId: Int) {
+        val launchedNative = CarLifeLauncherRepository.launchPreferredNavigatorOnShizuku(
+            context = appContext,
+            targetDisplayId = displayId
+        )
+        if (!launchedNative) {
+            mainHandler.post {
+                shizukuLeftPanelOverlay?.dismiss()
+                isShizukuLauncherGridVisible = true
+                CockpitUiStateController.showMap()
+                runCatching { cockpitPresentation?.show() }
             }
         }
     }
@@ -1083,6 +1141,8 @@ class CockpitProjectionManager(
                                 targetHeight = safeHeight
                             )
                             withContext(Dispatchers.Main.immediate) {
+                                shizukuLeftPanelOverlay?.dismiss()
+                                isShizukuLauncherGridVisible = true
                                 cockpitPresentation = presentation
                                 presentation.window?.decorView?.postInvalidate()
                             }
@@ -2091,6 +2151,7 @@ class CockpitProjectionManager(
                 val downTime = when (packet.androidAction) {
                     MotionEvent.ACTION_DOWN -> {
                         lastDownTime.set(nowUptime)
+                        shizukuTouchDownInLeftPanel = scaledX < VW_LEFT_PANEL_WIDTH_PX.toFloat()
                         nowUptime
                     }
                     MotionEvent.ACTION_MOVE,
@@ -2105,8 +2166,70 @@ class CockpitProjectionManager(
                     }
                 }
                 val eventTime = maxOf(downTime, nowUptime)
+                val routeToLeftPanel = shizukuTouchDownInLeftPanel ||
+                    (packet.androidAction == MotionEvent.ACTION_DOWN && scaledX < VW_LEFT_PANEL_WIDTH_PX.toFloat())
+                if (packet.androidAction == MotionEvent.ACTION_UP || packet.androidAction == MotionEvent.ACTION_CANCEL) {
+                    shizukuTouchDownInLeftPanel = false
+                }
 
-                var shizukuDispatched = CarLifeShizukuManager.injectTouch(
+                // Smart touch routing for SHIZUKU_COCKPIT:
+                // 1) x < 250 -> Left VW Panel (Overlay when Navigator/2GIS is open, or Presentation when Launcher Grid is open)
+                // 2) x >= 250 -> Presentation decorView if Launcher Grid is active, otherwise Shizuku injectTouch -> VirtualDisplay
+                val leftPanelTargetView = if (routeToLeftPanel) {
+                    shizukuLeftPanelViewForTesting
+                        ?: shizukuLeftPanelOverlay?.rootView
+                        ?: cockpitPresentation?.window?.decorView
+                } else {
+                    null
+                }
+                val launcherRightTargetView = if (!routeToLeftPanel &&
+                    isShizukuLauncherGridVisible &&
+                    cockpitPresentation?.isShowing == true
+                ) {
+                    cockpitPresentation?.window?.decorView
+                } else {
+                    null
+                }
+
+                val directPanelView = leftPanelTargetView ?: launcherRightTargetView
+                if (directPanelView != null) {
+                    val dispatched = dispatchSynthesizedMotionEvent(
+                        decorView = directPanelView,
+                        downTime = downTime,
+                        eventTime = eventTime,
+                        action = packet.androidAction,
+                        x = scaledX,
+                        y = scaledY
+                    )
+                    if (packet.synthesizeClickUp) {
+                        val clickDur = touchCfg.tapDurationMs.coerceIn(16L, 120L)
+                        val upTime = maxOf(downTime + clickDur, SystemClock.uptimeMillis())
+                        dispatchSynthesizedMotionEvent(
+                            decorView = directPanelView,
+                            downTime = downTime,
+                            eventTime = upTime,
+                            action = MotionEvent.ACTION_UP,
+                            x = scaledX,
+                            y = scaledY
+                        )
+                    }
+                    val zoneLabel = if (routeToLeftPanel) {
+                        "VW Left Panel (${scaledX.toInt()}, ${scaledY.toInt()})"
+                    } else {
+                        "Shizuku Launcher Grid (${scaledX.toInt()}, ${scaledY.toInt()})"
+                    }
+                    _stats.update {
+                        it.copy(
+                            injectedTouches = it.injectedTouches + 1L,
+                            lastTouchPoint = scaledX to scaledY,
+                            activeCockpitWidget = zoneLabel,
+                            statusMessage = zoneLabel
+                        )
+                    }
+                    return@withContext dispatched
+                }
+
+                val shizukuDispatched = CarLifeShizukuManager.injectTouch(
                     action = packet.androidAction,
                     x = scaledX,
                     y = scaledY,
@@ -2293,7 +2416,10 @@ class CockpitProjectionManager(
                 KeyEvent.KEYCODE_MEDIA_PREVIOUS -> MediaControllerRepository.skipPrevious()
                 KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> MediaControllerRepository.togglePlayPause()
                 KeyEvent.KEYCODE_HOME -> {
-                    if (appMode == AppMode.COCKPIT || appMode == AppMode.SHIZUKU_COCKPIT) {
+                    if (appMode == AppMode.SHIZUKU_COCKPIT) {
+                        showShizukuLauncherGrid()
+                    } else if (appMode == AppMode.COCKPIT) {
+                        CockpitUiStateController.showGrid()
                         runCatching { cockpitPresentation?.show() }
                     }
                 }
@@ -2362,12 +2488,19 @@ class CockpitProjectionManager(
     }
 
     private fun dismissPresentationSafely() {
-        val existing = cockpitPresentation ?: return
+        val existingOverlay = shizukuLeftPanelOverlay
+        shizukuLeftPanelOverlay = null
+        isShizukuLauncherGridVisible = true
+        val existing = cockpitPresentation
         cockpitPresentation = null
         if (Looper.myLooper() == Looper.getMainLooper()) {
-            runCatching { existing.dismiss() }
+            runCatching { existingOverlay?.dismiss() }
+            runCatching { existing?.dismiss() }
         } else {
-            mainHandler.post { runCatching { existing.dismiss() } }
+            mainHandler.post {
+                runCatching { existingOverlay?.dismiss() }
+                runCatching { existing?.dismiss() }
+            }
         }
     }
 
@@ -3071,7 +3204,8 @@ private fun ProjectedCarLifeLauncherContainer(
     onBringLauncherToFront: () -> Unit
 ) {
     val stats by statsFlow.collectAsState()
-    val media by MediaControllerRepository.mediaState.collectAsState()
+    val media by MediaPlayerController.mediaState.collectAsState()
+    val context = androidx.compose.ui.platform.LocalContext.current
 
     val infiniteTransition = rememberInfiniteTransition(label = "h264_surface_keepalive")
     val pulsePhase by infiniteTransition.animateFloat(
@@ -3088,11 +3222,13 @@ private fun ProjectedCarLifeLauncherContainer(
         CarLifeAppLauncherScreen(
             virtualDisplayId = virtualDisplayId,
             mediaState = media,
-            onPlayPause = { MediaControllerRepository.togglePlayPause() },
-            onNextTrack = { MediaControllerRepository.skipNext() },
-            onPreviousTrack = { MediaControllerRepository.skipPrevious() },
+            onPlayPause = { MediaPlayerController.playPause() },
+            onNextTrack = { MediaPlayerController.next() },
+            onPreviousTrack = { MediaPlayerController.previous() },
             onRequestNotificationAccess = {},
+            isShizukuMode = stats.appMode == AppMode.SHIZUKU_COCKPIT,
             onHomePressed = {
+                CockpitUiStateController.showGrid()
                 if (stats.appMode == AppMode.SHIZUKU_COCKPIT) {
                     CarLifeShizukuManager.sendKeyEventAsync(KeyEvent.KEYCODE_HOME, virtualDisplayId)
                 }
@@ -3104,7 +3240,21 @@ private fun ProjectedCarLifeLauncherContainer(
                         CarLifeShizukuManager.sendKeyEventAsync(KeyEvent.KEYCODE_BACK, virtualDisplayId)
                     AppMode.MIRRORING ->
                         CarLifeAccessibilityService.instance?.performBackAction()
-                    AppMode.COCKPIT -> Unit
+                    AppMode.COCKPIT ->
+                        CockpitUiStateController.showGrid()
+                }
+            },
+            onMapPressed = {
+                if (stats.appMode == AppMode.SHIZUKU_COCKPIT) {
+                    val launchedNative = CarLifeLauncherRepository.launchPreferredNavigatorOnShizuku(
+                        context = context,
+                        targetDisplayId = virtualDisplayId
+                    )
+                    if (!launchedNative) {
+                        CockpitUiStateController.toggleMap()
+                    }
+                } else {
+                    CockpitUiStateController.toggleMap()
                 }
             }
         )
