@@ -15,8 +15,21 @@ val JetBrainsMonoFamily = FontFamily(
     Font(R.font.jetbrains_mono, FontWeight.Bold)
 )
 
-// Clean SansSerif typography for all headers, buttons, and app labels
+/**
+ * Applies tabular numerals (`tnum`) so live counters, clocks, FPS, bitrates, and packet sizes
+ * align crisply without horizontal jitter in VW Digital Cockpit displays.
+ */
+fun TextStyle.tabular(): TextStyle = copy(fontFeatureSettings = "tnum")
+
+// Clean geometric SansSerif typography for VW MIB3 / Digital Cockpit
 val Typography = Typography(
+    displaySmall = TextStyle(
+        fontFamily = FontFamily.SansSerif,
+        fontWeight = FontWeight.SemiBold,
+        fontSize = 36.sp,
+        lineHeight = 40.sp,
+        fontFeatureSettings = "tnum"
+    ),
     headlineLarge = TextStyle(
         fontFamily = FontFamily.SansSerif,
         fontWeight = FontWeight.SemiBold,

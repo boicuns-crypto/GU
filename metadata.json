@@ -1,5 +1,5 @@
 {
-  "name": "CarLife Bridge",
+  "name": "Jetta VS7",
   "description": "Baidu CarLife USB AOA protocol bridge and custom automotive head unit transport engine for Samsung Galaxy S26 Ultra.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]

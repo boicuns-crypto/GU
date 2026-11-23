@@ -41,11 +41,13 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.asAndroidBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
@@ -72,9 +74,8 @@ import com.example.feature.cockpit.CarLifeLauncherRepository
 import com.example.feature.cockpit.MediaControllerRepository
 import com.example.protocol.carlife.CarLifeFrameCodec
 import com.example.protocol.carlife.CarLifeTouchDecoder
-import com.example.ui.theme.AmberSignal
-import com.example.ui.theme.ElectricCyan
 import com.example.ui.theme.MyApplicationTheme
+import com.example.ui.theme.ThemePreferences
 import java.io.ByteArrayOutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -2874,7 +2875,8 @@ class CockpitPresentation(
             setViewTreeViewModelStoreOwner(lifecycleOwner)
             setViewTreeSavedStateRegistryOwner(lifecycleOwner)
             setContent {
-                MyApplicationTheme {
+                val activeThemeMode by ThemePreferences.themeMode.collectAsState()
+                MyApplicationTheme(themeMode = activeThemeMode) {
                     ProjectedCarLifeLauncherContainer(
                         virtualDisplayId = targetDisplayId,
                         statsFlow = statsFlow,
@@ -2950,9 +2952,10 @@ private fun ProjectedCarLifeLauncherContainer(
             }
         )
 
+        val primaryAccent = MaterialTheme.colorScheme.primary
         Canvas(modifier = Modifier.fillMaxSize()) {
             drawCircle(
-                color = ElectricCyan.copy(alpha = pulsePhase * 0.25f),
+                color = primaryAccent.copy(alpha = pulsePhase * 0.25f),
                 radius = 3.dp.toPx(),
                 center = Offset(size.width - 8.dp.toPx(), 8.dp.toPx())
             )
@@ -2965,15 +2968,20 @@ private fun ProjectedCarLifeLauncherContainer(
                     normY.coerceIn(0f, size.height)
                 )
                 drawCircle(
-                    color = AmberSignal.copy(alpha = 0.35f),
-                    radius = 28.dp.toPx(),
+                    color = primaryAccent.copy(alpha = 0.28f),
+                    radius = 24.dp.toPx(),
                     center = center
                 )
                 drawCircle(
-                    color = ElectricCyan,
-                    radius = 16.dp.toPx(),
+                    color = Color.White,
+                    radius = 24.dp.toPx(),
                     center = center,
-                    style = Stroke(width = 3.dp.toPx(), cap = StrokeCap.Round)
+                    style = Stroke(width = 2.dp.toPx(), cap = StrokeCap.Round)
+                )
+                drawCircle(
+                    color = Color.White.copy(alpha = 0.9f),
+                    radius = 4.dp.toPx(),
+                    center = center
                 )
             }
         }

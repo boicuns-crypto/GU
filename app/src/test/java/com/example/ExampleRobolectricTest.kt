@@ -27,9 +27,14 @@ import com.example.core.shizuku.CarLifeShizukuManager
 import com.example.core.shizuku.ICarLifeShizukuService
 import com.example.core.usb.BridgeForegroundService
 import com.example.core.usb.BridgeTelemetryBus
+import androidx.compose.ui.graphics.Color
 import com.example.feature.cockpit.AppLaunchMode
 import com.example.feature.cockpit.CarLifeLauncherRepository
 import com.example.feature.cockpit.InstalledAppInfo
+import com.example.ui.theme.ThemeMode
+import com.example.ui.theme.ThemePreferences
+import com.example.ui.theme.VwDarkColorScheme
+import com.example.ui.theme.VwLightColorScheme
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
@@ -49,7 +54,7 @@ class ExampleRobolectricTest {
   fun `read string from context`() {
     val context = ApplicationProvider.getApplicationContext<Context>()
     val appName = context.getString(R.string.app_name)
-    assertEquals("CarLife Bridge", appName)
+    assertEquals("Jetta VS7", appName)
   }
 
   @Test
@@ -197,7 +202,7 @@ class ExampleRobolectricTest {
     val testApp = InstalledAppInfo(
       packageName = baseContext.packageName,
       activityName = MainActivity::class.java.name,
-      label = "CarLife Bridge",
+      label = "Jetta VS7",
       iconBitmap = null
     )
 
@@ -866,6 +871,64 @@ class ExampleRobolectricTest {
       )
       assertEquals(AppMode.MIRRORING, manager.appMode)
       manager.stopProjection()
+    }
+  }
+
+  @Test
+  fun `vw mib3 theme palettes match exact dark and light specification tokens`() {
+    // VW MIB3 Night (Dark)
+    assertEquals(Color(0xFF0B0F17), VwDarkColorScheme.background)
+    assertEquals(Color(0xFF151C28), VwDarkColorScheme.surface)
+    assertEquals(Color(0xFF1D2636), VwDarkColorScheme.surfaceVariant)
+    assertEquals(Color(0xFF273347), VwDarkColorScheme.outline)
+    assertEquals(Color(0xFF00A3FF), VwDarkColorScheme.primary)
+    assertEquals(Color(0xFF041322), VwDarkColorScheme.onPrimary)
+    assertEquals(Color(0xFFE53935), VwDarkColorScheme.error)
+    assertEquals(Color(0xFFF2F6FA), VwDarkColorScheme.onBackground)
+    assertEquals(Color(0xFFF2F6FA), VwDarkColorScheme.onSurface)
+    assertEquals(Color(0xFF8C9BB0), VwDarkColorScheme.onSurfaceVariant)
+
+    // VW Silver Day (Light)
+    assertEquals(Color(0xFFF1F4F8), VwLightColorScheme.background)
+    assertEquals(Color(0xFFFFFFFF), VwLightColorScheme.surface)
+    assertEquals(Color(0xFFE5ECF4), VwLightColorScheme.surfaceVariant)
+    assertEquals(Color(0xFFCFD9E6), VwLightColorScheme.outline)
+    assertEquals(Color(0xFF001E50), VwLightColorScheme.primary)
+    assertEquals(Color(0xFF0066CC), VwLightColorScheme.secondary)
+    assertEquals(Color(0xFFFFFFFF), VwLightColorScheme.onPrimary)
+    assertEquals(Color(0xFFD32F2F), VwLightColorScheme.error)
+    assertEquals(Color(0xFF0D1522), VwLightColorScheme.onBackground)
+    assertEquals(Color(0xFF0D1522), VwLightColorScheme.onSurface)
+    assertEquals(Color(0xFF56657A), VwLightColorScheme.onSurfaceVariant)
+  }
+
+  @Test
+  fun `theme mode persists in SharedPreferences and restores across service and activity launches`() {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    try {
+      ThemePreferences.clear(context)
+      assertEquals(ThemeMode.SYSTEM, ThemePreferences.loadThemeMode(context))
+      assertEquals(ThemeMode.SYSTEM, ThemePreferences.themeMode.value)
+
+      // Save LIGHT and verify BridgeForegroundService restores LIGHT on start
+      ThemePreferences.setThemeMode(ThemeMode.LIGHT, context)
+      assertEquals(ThemeMode.LIGHT, ThemePreferences.loadThemeMode(context))
+      ThemePreferences.setThemeMode(ThemeMode.DARK, context = null) // mutate in-memory only
+      val svcController = Robolectric.buildService(BridgeForegroundService::class.java).create()
+      assertEquals(ThemeMode.LIGHT, ThemePreferences.themeMode.value)
+      svcController.destroy()
+
+      // Launch MainActivity cleanly in LIGHT, DARK, and SYSTEM modes
+      for (mode in listOf(ThemeMode.LIGHT, ThemeMode.DARK, ThemeMode.SYSTEM)) {
+        ThemePreferences.setThemeMode(mode, context)
+        val activityController = Robolectric.buildActivity(MainActivity::class.java).setup()
+        val activity = activityController.get()
+        assertFalse(activity.isFinishing)
+        assertEquals(mode, ThemePreferences.themeMode.value)
+        activityController.pause().resume().destroy()
+      }
+    } finally {
+      ThemePreferences.clear(context)
     }
   }
 }

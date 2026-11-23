@@ -1,5 +1,5 @@
 <resources>
-    <string name="app_name">CarLife Bridge</string>
+    <string name="app_name">Jetta VS7</string>
     <string name="notif_channel_name">CarLife USB AOA Bridge</string>
     <string name="notif_channel_desc">Maintains high-speed USB Open Accessory connection with the vehicle Head Unit</string>
     <string name="notif_title_active">CarLife AOA Bridge Active</string>

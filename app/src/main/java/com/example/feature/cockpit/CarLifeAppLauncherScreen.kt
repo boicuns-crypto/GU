@@ -79,17 +79,8 @@ import androidx.compose.ui.unit.sp
 import com.example.core.input.CarLifeAccessibilityService
 import com.example.core.shizuku.CarLifeShizukuManager
 import com.example.ui.theme.CockpitIcons
-import com.example.ui.theme.ElectricCyan
-import com.example.ui.theme.ObsidianBackground
-import com.example.ui.theme.ObsidianBorder
-import com.example.ui.theme.ObsidianSurface
-import com.example.ui.theme.ObsidianSurfaceHigh
-import com.example.ui.theme.SuccessBadgeBg
-import com.example.ui.theme.SuccessBadgeFg
-import com.example.ui.theme.TextPrimary
-import com.example.ui.theme.TextSecondary
-import com.example.ui.theme.WarningBadgeBg
-import com.example.ui.theme.WarningBadgeFg
+import com.example.ui.theme.tabular
+import com.example.ui.theme.vwColors
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -462,13 +453,15 @@ object CarLifeLauncherRepository {
 }
 
 /**
- * Full-screen CarLife App Mirroring Launcher rendered onto the `VirtualDisplay` (and previewable on phone).
+ * Full-screen Volkswagen MIB3 / Digital Cockpit Launcher rendered onto the Head Unit `VirtualDisplay`
+ * (and previewable on smartphone). Automatically adapts to Light (`VW Silver Day`) and Dark (`VW MIB3 Night`).
  *
  * Layout:
- * - **Left Column (240.dp)**: Clock, «Домой» and «Назад» buttons, and compact Media Player widget
- *   (`padding = 12.dp`) so transport controls fit completely without vertical clipping.
- * - **Right Column**: `LazyVerticalGrid(columns = GridCells.Adaptive(minSize = 96.dp))` with `100.dp` tile
- *   height, `48.dp` icon, and `12.sp` single-line app label.
+ * - **Left Panel**: Large `36.sp` SemiBold tabular clock, compact `JETTA VS7` badge + `LIVE` dot,
+ *   strict rectangular «Домой» / «Назад» buttons (`1.dp` border), and compact current track widget
+ *   with a `primary` VW accent stripe.
+ * - **Right Panel**: Header `Jetta VS7 • Приложения` underlined by a thin VW Blue accent line,
+ *   followed by a clean `4×3` grid of uniform `14.dp` app tiles with icons and clear unclipped labels.
  */
 @Composable
 fun CarLifeAppLauncherScreen(
@@ -502,22 +495,22 @@ fun CarLifeAppLauncherScreen(
 
     Surface(
         modifier = modifier.fillMaxSize(),
-        color = ObsidianBackground
+        color = MaterialTheme.colorScheme.background
     ) {
         BoxWithConstraints(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(10.dp)
+                .padding(12.dp)
         ) {
             val isWideScreen = maxWidth >= 460.dp
-            val sideDockWidth = if (maxWidth < 640.dp) 196.dp else 240.dp
+            val sideDockWidth = if (maxWidth < 640.dp) 210.dp else 256.dp
 
             if (isWideScreen) {
                 Row(
                     modifier = Modifier.fillMaxSize(),
-                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
-                    // Left Column: Clock + Home/Back + Media Player
+                    // Left Panel: VW Digital Cockpit Clock + JETTA VS7/LIVE + Home/Back + Media Widget
                     CarLifeSideDockBar(
                         virtualDisplayId = virtualDisplayId,
                         a11yEnabled = a11yEnabled,
@@ -536,11 +529,12 @@ fun CarLifeAppLauncherScreen(
                             .fillMaxHeight()
                     )
 
-                    // Right Column: Installed Apps Grid
+                    // Right Panel: Jetta VS7 • Приложения + 4x3 App Grid
                     InstalledAppsGridPanel(
                         apps = filteredApps,
                         totalAppCount = apps.size,
                         selectedFilter = selectedFilter,
+                        isWideScreen = true,
                         onSelectFilter = { selectedFilter = it },
                         onRefreshApps = {
                             scope.launch {
@@ -584,6 +578,7 @@ fun CarLifeAppLauncherScreen(
                         apps = filteredApps,
                         totalAppCount = apps.size,
                         selectedFilter = selectedFilter,
+                        isWideScreen = false,
                         onSelectFilter = { selectedFilter = it },
                         onRefreshApps = {
                             scope.launch {
@@ -620,6 +615,9 @@ private fun CarLifeSideDockBar(
     onRequestNotificationAccess: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val colorScheme = MaterialTheme.colorScheme
+    val vw = MaterialTheme.vwColors
+
     var currentTime by remember { mutableStateOf("12:00") }
     LaunchedEffect(Unit) {
         val fmt = SimpleDateFormat("HH:mm", Locale.getDefault())
@@ -631,39 +629,49 @@ private fun CarLifeSideDockBar(
 
     Card(
         modifier = modifier,
-        shape = RoundedCornerShape(16.dp),
-        colors = CardDefaults.cardColors(containerColor = ObsidianSurface),
-        border = BorderStroke(1.dp, ObsidianBorder)
+        shape = RoundedCornerShape(14.dp),
+        colors = CardDefaults.cardColors(containerColor = colorScheme.surface),
+        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
+        border = BorderStroke(1.dp, colorScheme.outline)
     ) {
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(12.dp),
+                .padding(14.dp),
             verticalArrangement = Arrangement.SpaceBetween
         ) {
-            // Top section: Clock, Status Badge, and Home / Back buttons
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            // Top section: Large 36.sp Clock, JETTA VS7 + LIVE badge, and strict Home / Back keys
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                // Brand badge + LIVE indicator row
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text(
-                        text = currentTime,
-                        style = MaterialTheme.typography.headlineMedium.copy(
-                            fontFamily = FontFamily.SansSerif,
-                            fontWeight = FontWeight.SemiBold
-                        ),
-                        color = TextPrimary
-                    )
                     Surface(
-                        color = if (virtualDisplayId != Display.DEFAULT_DISPLAY) {
-                            SuccessBadgeBg
-                        } else {
-                            ObsidianSurfaceHigh
-                        },
+                        color = colorScheme.surfaceVariant,
                         shape = RoundedCornerShape(8.dp),
-                        border = BorderStroke(1.dp, ObsidianBorder)
+                        border = BorderStroke(1.dp, colorScheme.outline)
+                    ) {
+                        Text(
+                            text = "JETTA VS7",
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                fontWeight = FontWeight.Bold,
+                                letterSpacing = 0.9.sp
+                            ),
+                            color = colorScheme.primary,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                        )
+                    }
+
+                    val isLive = virtualDisplayId != Display.DEFAULT_DISPLAY || a11yEnabled
+                    Surface(
+                        color = if (isLive) vw.successContainer else vw.infoContainer,
+                        shape = RoundedCornerShape(50),
+                        border = BorderStroke(
+                            1.dp,
+                            if (isLive) vw.statusActiveDot.copy(alpha = 0.35f) else vw.statusWaitingDot.copy(alpha = 0.35f)
+                        )
                     ) {
                         Row(
                             modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
@@ -672,28 +680,53 @@ private fun CarLifeSideDockBar(
                         ) {
                             Box(
                                 modifier = Modifier
-                                    .size(6.dp)
+                                    .size(7.dp)
                                     .clip(CircleShape)
-                                    .background(if (a11yEnabled) SuccessBadgeFg else WarningBadgeFg)
+                                    .background(if (isLive) vw.statusActiveDot else vw.statusWaitingDot)
                             )
                             Text(
                                 text = if (virtualDisplayId != Display.DEFAULT_DISPLAY) {
-                                    "VD #$virtualDisplayId"
+                                    "LIVE • #$virtualDisplayId"
                                 } else {
-                                    "КОКПИТ"
+                                    "LIVE"
                                 },
-                                style = MaterialTheme.typography.labelSmall,
-                                color = if (virtualDisplayId != Display.DEFAULT_DISPLAY) {
-                                    SuccessBadgeFg
-                                } else {
-                                    ElectricCyan
-                                }
+                                style = MaterialTheme.typography.labelSmall.tabular().copy(
+                                    fontWeight = FontWeight.SemiBold,
+                                    letterSpacing = 0.5.sp
+                                ),
+                                color = if (isLive) vw.onSuccessContainer else vw.onInfoContainer
                             )
                         }
                     }
                 }
 
-                // Dock Navigation Buttons: Home & Back
+                // Crisp 36.sp tabular digital clock
+                Text(
+                    text = currentTime,
+                    style = MaterialTheme.typography.displaySmall.copy(
+                        fontSize = 36.sp,
+                        fontWeight = FontWeight.SemiBold,
+                        fontFeatureSettings = "tnum"
+                    ),
+                    color = colorScheme.onSurface
+                )
+
+                // Thin VW Blue accent divider
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(2.dp)
+                        .background(
+                            Brush.horizontalGradient(
+                                colors = listOf(
+                                    vw.accentBlue,
+                                    vw.accentBlue.copy(alpha = 0.12f)
+                                )
+                            )
+                        )
+                )
+
+                // Strict rectangular «Домой» & «Назад» buttons with 1.dp border
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -701,7 +734,7 @@ private fun CarLifeSideDockBar(
                     DockNavigationButton(
                         label = "Домой",
                         icon = CockpitIcons.Home,
-                        accent = ElectricCyan,
+                        accent = colorScheme.primary,
                         testTag = "dock_home_button",
                         onClick = onHomeClick,
                         modifier = Modifier.weight(1f)
@@ -709,7 +742,7 @@ private fun CarLifeSideDockBar(
                     DockNavigationButton(
                         label = "Назад",
                         icon = CockpitIcons.ArrowBack,
-                        accent = TextPrimary,
+                        accent = colorScheme.onSurface,
                         testTag = "dock_back_button",
                         onClick = onBackClick,
                         modifier = Modifier.weight(1f)
@@ -717,7 +750,7 @@ private fun CarLifeSideDockBar(
                 }
             }
 
-            // Bottom Compact Media Player Widget
+            // Bottom-left Compact Media Player Widget with primary accent stripe
             DockCompactMediaPlayer(
                 mediaState = mediaState,
                 onPlayPause = onPlayPause,
@@ -741,11 +774,24 @@ private fun CompactTopDockBar(
     onPreviousTrack: () -> Unit,
     onRequestNotificationAccess: () -> Unit
 ) {
+    val colorScheme = MaterialTheme.colorScheme
+    val vw = MaterialTheme.vwColors
+
+    var currentTime by remember { mutableStateOf("12:00") }
+    LaunchedEffect(Unit) {
+        val fmt = SimpleDateFormat("HH:mm", Locale.getDefault())
+        while (true) {
+            currentTime = fmt.format(Date())
+            delay(10_000L)
+        }
+    }
+
     Card(
         modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(16.dp),
-        colors = CardDefaults.cardColors(containerColor = ObsidianSurface),
-        border = BorderStroke(1.dp, ObsidianBorder)
+        shape = RoundedCornerShape(14.dp),
+        colors = CardDefaults.cardColors(containerColor = colorScheme.surface),
+        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
+        border = BorderStroke(1.dp, colorScheme.outline)
     ) {
         Column(
             modifier = Modifier
@@ -755,13 +801,81 @@ private fun CompactTopDockBar(
         ) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = currentTime,
+                        style = MaterialTheme.typography.headlineMedium.tabular().copy(
+                            fontWeight = FontWeight.SemiBold
+                        ),
+                        color = colorScheme.onSurface
+                    )
+                    Surface(
+                        color = colorScheme.surfaceVariant,
+                        shape = RoundedCornerShape(6.dp),
+                        border = BorderStroke(1.dp, colorScheme.outline)
+                    ) {
+                        Text(
+                            text = "JETTA VS7",
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                fontWeight = FontWeight.Bold,
+                                letterSpacing = 0.7.sp
+                            ),
+                            color = colorScheme.primary,
+                            modifier = Modifier.padding(horizontal = 7.dp, vertical = 3.dp)
+                        )
+                    }
+                }
+
+                val isLive = virtualDisplayId != Display.DEFAULT_DISPLAY || a11yEnabled
+                Surface(
+                    color = if (isLive) vw.successContainer else vw.infoContainer,
+                    shape = RoundedCornerShape(50),
+                    border = BorderStroke(
+                        1.dp,
+                        if (isLive) vw.statusActiveDot.copy(alpha = 0.35f) else vw.statusWaitingDot.copy(alpha = 0.35f)
+                    )
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(5.dp)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(6.dp)
+                                .clip(CircleShape)
+                                .background(if (isLive) vw.statusActiveDot else vw.statusWaitingDot)
+                        )
+                        Text(
+                            text = if (virtualDisplayId != Display.DEFAULT_DISPLAY) {
+                                "VD #$virtualDisplayId"
+                            } else if (a11yEnabled) {
+                                "LIVE"
+                            } else {
+                                "ОЖИДАНИЕ"
+                            },
+                            style = MaterialTheme.typography.labelSmall.tabular(),
+                            color = if (isLive) vw.onSuccessContainer else vw.onInfoContainer
+                        )
+                    }
+                }
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 DockNavigationButton(
                     label = "Домой",
                     icon = CockpitIcons.Home,
-                    accent = ElectricCyan,
+                    accent = colorScheme.primary,
                     testTag = "dock_home_button",
                     onClick = onHomeClick,
                     modifier = Modifier.weight(1f)
@@ -769,28 +883,11 @@ private fun CompactTopDockBar(
                 DockNavigationButton(
                     label = "Назад",
                     icon = CockpitIcons.ArrowBack,
-                    accent = TextPrimary,
+                    accent = colorScheme.onSurface,
                     testTag = "dock_back_button",
                     onClick = onBackClick,
                     modifier = Modifier.weight(1f)
                 )
-                Surface(
-                    color = if (a11yEnabled) SuccessBadgeBg else WarningBadgeBg,
-                    shape = RoundedCornerShape(10.dp)
-                ) {
-                    Text(
-                        text = if (virtualDisplayId != Display.DEFAULT_DISPLAY) {
-                            "VD #$virtualDisplayId"
-                        } else if (a11yEnabled) {
-                            "Touch ON"
-                        } else {
-                            "Touch OFF"
-                        },
-                        style = MaterialTheme.typography.labelSmall,
-                        color = if (a11yEnabled) SuccessBadgeFg else WarningBadgeFg,
-                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp)
-                    )
-                }
             }
 
             DockCompactMediaPlayer(
@@ -813,15 +910,16 @@ private fun DockNavigationButton(
     onClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val colorScheme = MaterialTheme.colorScheme
     Surface(
         modifier = modifier
             .height(48.dp)
-            .clip(RoundedCornerShape(12.dp))
+            .clip(RoundedCornerShape(10.dp))
             .clickable(onClick = onClick)
             .testTag(testTag),
-        color = ObsidianSurfaceHigh,
-        shape = RoundedCornerShape(12.dp),
-        border = BorderStroke(1.dp, ObsidianBorder)
+        color = colorScheme.surfaceVariant,
+        shape = RoundedCornerShape(10.dp),
+        border = BorderStroke(1.dp, colorScheme.outline)
     ) {
         Row(
             modifier = Modifier
@@ -843,7 +941,7 @@ private fun DockNavigationButton(
                     fontFamily = FontFamily.SansSerif,
                     fontWeight = FontWeight.Medium
                 ),
-                color = TextPrimary,
+                color = colorScheme.onSurface,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
             )
@@ -859,164 +957,175 @@ private fun DockCompactMediaPlayer(
     onPreviousTrack: () -> Unit,
     onRequestNotificationAccess: () -> Unit
 ) {
+    val colorScheme = MaterialTheme.colorScheme
+    val vw = MaterialTheme.vwColors
+
     Surface(
         modifier = Modifier.fillMaxWidth(),
-        color = ObsidianSurfaceHigh,
-        shape = RoundedCornerShape(14.dp),
-        border = BorderStroke(1.dp, ObsidianBorder)
+        color = colorScheme.surfaceVariant,
+        shape = RoundedCornerShape(12.dp),
+        border = BorderStroke(1.dp, colorScheme.outline)
     ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(10.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp)
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalAlignment = Alignment.CenterVertically
+        Column(modifier = Modifier.fillMaxWidth()) {
+            // Signature VW MIB3 primary accent stripe at top of track widget
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(3.dp)
+                    .background(colorScheme.primary)
+            )
+
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(10.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                // Album Art Thumbnail
-                Box(
-                    modifier = Modifier
-                        .size(40.dp)
-                        .clip(RoundedCornerShape(8.dp))
-                        .background(
-                            Brush.linearGradient(
-                                colors = listOf(Color(0xFF1E2636), Color(0xFF0B0E14))
-                            )
-                        )
-                        .border(1.dp, ObsidianBorder, RoundedCornerShape(8.dp)),
-                    contentAlignment = Alignment.Center
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    val bmp = mediaState.albumArtBitmap
-                    if (bmp != null) {
-                        Image(
-                            bitmap = bmp.asImageBitmap(),
-                            contentDescription = "Album Art",
-                            modifier = Modifier.fillMaxSize(),
-                            contentScale = ContentScale.Crop
+                    // Album Art Thumbnail
+                    Box(
+                        modifier = Modifier
+                            .size(40.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(colorScheme.surface)
+                            .border(1.dp, colorScheme.outline, RoundedCornerShape(8.dp)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        val bmp = mediaState.albumArtBitmap
+                        if (bmp != null) {
+                            Image(
+                                bitmap = bmp.asImageBitmap(),
+                                contentDescription = "Обложка трека",
+                                modifier = Modifier.fillMaxSize(),
+                                contentScale = ContentScale.Crop
+                            )
+                        } else {
+                            Icon(
+                                imageVector = CockpitIcons.Album,
+                                contentDescription = "Медиаплеер",
+                                tint = colorScheme.primary,
+                                modifier = Modifier.size(20.dp)
+                            )
+                        }
+                    }
+
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = mediaState.playerAppTitle,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = vw.accentBlue,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
                         )
-                    } else {
-                        Icon(
-                            imageVector = CockpitIcons.Album,
-                            contentDescription = "Media",
-                            tint = ElectricCyan,
-                            modifier = Modifier.size(20.dp)
+                        Text(
+                            text = mediaState.trackTitle,
+                            style = MaterialTheme.typography.titleSmall.copy(
+                                fontFamily = FontFamily.SansSerif,
+                                fontWeight = FontWeight.SemiBold
+                            ),
+                            color = colorScheme.onSurface,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Text(
+                            text = mediaState.artistName,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
                         )
                     }
                 }
 
-                Column(modifier = Modifier.weight(1f)) {
-                    Text(
-                        text = mediaState.playerAppTitle,
-                        style = MaterialTheme.typography.labelSmall,
-                        color = ElectricCyan,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                    Text(
-                        text = mediaState.trackTitle,
-                        style = MaterialTheme.typography.titleSmall.copy(
-                            fontFamily = FontFamily.SansSerif,
-                            fontWeight = FontWeight.SemiBold
-                        ),
-                        color = TextPrimary,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                    Text(
-                        text = mediaState.artistName,
-                        style = MaterialTheme.typography.labelSmall,
-                        color = TextSecondary,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
+                if (!mediaState.hasNotificationAccess) {
+                    Surface(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(8.dp))
+                            .clickable(onClick = onRequestNotificationAccess)
+                            .testTag("grant_media_notif_btn"),
+                        color = vw.warningContainer,
+                        shape = RoundedCornerShape(8.dp)
+                    ) {
+                        Text(
+                            text = "Доступ к уведомлениям плеера",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = vw.onWarningContainer,
+                            textAlign = TextAlign.Center,
+                            modifier = Modifier.padding(vertical = 5.dp, horizontal = 6.dp)
+                        )
+                    }
                 }
-            }
 
-            if (!mediaState.hasNotificationAccess) {
-                Surface(
+                LinearProgressIndicator(
+                    progress = { mediaState.progressFraction },
                     modifier = Modifier
                         .fillMaxWidth()
-                        .clip(RoundedCornerShape(8.dp))
-                        .clickable(onClick = onRequestNotificationAccess)
-                        .testTag("grant_media_notif_btn"),
-                    color = WarningBadgeBg,
-                    shape = RoundedCornerShape(8.dp)
-                ) {
-                    Text(
-                        text = "Доступ к уведомлениям плеера",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = WarningBadgeFg,
-                        textAlign = TextAlign.Center,
-                        modifier = Modifier.padding(vertical = 5.dp, horizontal = 6.dp)
-                    )
-                }
-            }
+                        .height(3.dp)
+                        .clip(RoundedCornerShape(2.dp)),
+                    color = colorScheme.primary,
+                    trackColor = colorScheme.outline
+                )
 
-            LinearProgressIndicator(
-                progress = { mediaState.progressFraction },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(3.dp)
-                    .clip(RoundedCornerShape(2.dp)),
-                color = ElectricCyan,
-                trackColor = ObsidianBackground
-            )
-
-            // Media transport buttons sized so they never clip at the bottom of the dock
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceEvenly,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                IconButton(
-                    onClick = onPreviousTrack,
-                    modifier = Modifier
-                        .size(48.dp)
-                        .clip(CircleShape)
-                        .background(ObsidianSurface)
-                        .testTag("media_prev_button")
+                // Media transport buttons (>= 48.dp touch targets)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceEvenly,
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Icon(
-                        imageVector = CockpitIcons.SkipPrevious,
-                        contentDescription = "Previous Track",
-                        tint = TextPrimary,
-                        modifier = Modifier.size(20.dp)
-                    )
-                }
+                    IconButton(
+                        onClick = onPreviousTrack,
+                        modifier = Modifier
+                            .size(48.dp)
+                            .clip(CircleShape)
+                            .background(colorScheme.surface)
+                            .border(1.dp, colorScheme.outline, CircleShape)
+                            .testTag("media_prev_button")
+                    ) {
+                        Icon(
+                            imageVector = CockpitIcons.SkipPrevious,
+                            contentDescription = "Предыдущий трек",
+                            tint = colorScheme.onSurface,
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
 
-                IconButton(
-                    onClick = onPlayPause,
-                    modifier = Modifier
-                        .size(48.dp)
-                        .clip(CircleShape)
-                        .background(ElectricCyan)
-                        .testTag("media_play_pause_button")
-                ) {
-                    Icon(
-                        imageVector = if (mediaState.isPlaying) CockpitIcons.Pause else Icons.Default.PlayArrow,
-                        contentDescription = "Play or Pause",
-                        tint = Color(0xFF001D24),
-                        modifier = Modifier.size(24.dp)
-                    )
-                }
+                    IconButton(
+                        onClick = onPlayPause,
+                        modifier = Modifier
+                            .size(48.dp)
+                            .clip(CircleShape)
+                            .background(colorScheme.primary)
+                            .testTag("media_play_pause_button")
+                    ) {
+                        Icon(
+                            imageVector = if (mediaState.isPlaying) CockpitIcons.Pause else Icons.Default.PlayArrow,
+                            contentDescription = "Воспроизвести или пауза",
+                            tint = colorScheme.onPrimary,
+                            modifier = Modifier.size(24.dp)
+                        )
+                    }
 
-                IconButton(
-                    onClick = onNextTrack,
-                    modifier = Modifier
-                        .size(48.dp)
-                        .clip(CircleShape)
-                        .background(ObsidianSurface)
-                        .testTag("media_next_button")
-                ) {
-                    Icon(
-                        imageVector = CockpitIcons.SkipNext,
-                        contentDescription = "Next Track",
-                        tint = TextPrimary,
-                        modifier = Modifier.size(20.dp)
-                    )
+                    IconButton(
+                        onClick = onNextTrack,
+                        modifier = Modifier
+                            .size(48.dp)
+                            .clip(CircleShape)
+                            .background(colorScheme.surface)
+                            .border(1.dp, colorScheme.outline, CircleShape)
+                            .testTag("media_next_button")
+                    ) {
+                        Icon(
+                            imageVector = CockpitIcons.SkipNext,
+                            contentDescription = "Следующий трек",
+                            tint = colorScheme.onSurface,
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
                 }
             }
         }
@@ -1028,60 +1137,93 @@ private fun InstalledAppsGridPanel(
     apps: List<InstalledAppInfo>,
     totalAppCount: Int,
     selectedFilter: Int,
+    isWideScreen: Boolean,
     onSelectFilter: (Int) -> Unit,
     onRefreshApps: () -> Unit,
     onLaunchApp: (InstalledAppInfo) -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val colorScheme = MaterialTheme.colorScheme
+    val vw = MaterialTheme.vwColors
+
     Card(
         modifier = modifier,
-        shape = RoundedCornerShape(16.dp),
-        colors = CardDefaults.cardColors(containerColor = ObsidianSurface),
-        border = BorderStroke(1.dp, ObsidianBorder)
+        shape = RoundedCornerShape(14.dp),
+        colors = CardDefaults.cardColors(containerColor = colorScheme.surface),
+        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
+        border = BorderStroke(1.dp, colorScheme.outline)
     ) {
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(12.dp),
+                .padding(14.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            // Header bar with filter chips and refresh
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
+            // VW MIB3 Header: «Jetta VS7 • Приложения» + filter chips + refresh
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Row(
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    FilterTabChip(
-                        label = "Все ($totalAppCount)",
-                        selected = selectedFilter == 0,
-                        testTag = "filter_all_apps_chip",
-                        onClick = { onSelectFilter(0) }
+                    Text(
+                        text = "Jetta VS7 • Приложения",
+                        style = MaterialTheme.typography.titleMedium.copy(
+                            fontWeight = FontWeight.SemiBold
+                        ),
+                        color = colorScheme.onSurface,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f)
                     )
-                    FilterTabChip(
-                        label = "Навигация и Медиа",
-                        selected = selectedFilter == 1,
-                        testTag = "filter_auto_apps_chip",
-                        onClick = { onSelectFilter(1) }
-                    )
+
+                    Row(
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        FilterTabChip(
+                            label = "Все ($totalAppCount)",
+                            selected = selectedFilter == 0,
+                            testTag = "filter_all_apps_chip",
+                            onClick = { onSelectFilter(0) }
+                        )
+                        FilterTabChip(
+                            label = "Авто",
+                            selected = selectedFilter == 1,
+                            testTag = "filter_auto_apps_chip",
+                            onClick = { onSelectFilter(1) }
+                        )
+                        IconButton(
+                            onClick = onRefreshApps,
+                            modifier = Modifier
+                                .size(48.dp)
+                                .testTag("refresh_apps_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Refresh,
+                                contentDescription = "Обновить список приложений",
+                                tint = vw.accentBlue,
+                                modifier = Modifier.size(20.dp)
+                            )
+                        }
+                    }
                 }
 
-                IconButton(
-                    onClick = onRefreshApps,
+                // Signature thin VW Blue accent line below header
+                Box(
                     modifier = Modifier
-                        .size(40.dp)
-                        .testTag("refresh_apps_button")
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.Refresh,
-                        contentDescription = "Обновить список приложений",
-                        tint = ElectricCyan,
-                        modifier = Modifier.size(20.dp)
-                    )
-                }
+                        .fillMaxWidth()
+                        .height(2.dp)
+                        .background(
+                            Brush.horizontalGradient(
+                                colors = listOf(
+                                    vw.accentBlue,
+                                    vw.accentBlue.copy(alpha = 0.45f),
+                                    colorScheme.outline.copy(alpha = 0.25f)
+                                )
+                            )
+                        )
+                )
             }
 
             if (apps.isEmpty()) {
@@ -1097,27 +1239,28 @@ private fun InstalledAppsGridPanel(
                     ) {
                         Icon(
                             imageVector = CockpitIcons.AppsGrid,
-                            contentDescription = "Loading apps",
-                            tint = ElectricCyan,
+                            contentDescription = "Загрузка приложений",
+                            tint = vw.accentBlue,
                             modifier = Modifier.size(32.dp)
                         )
                         Text(
                             text = "Загрузка приложений смартфона...",
                             style = MaterialTheme.typography.bodyMedium,
-                            color = TextSecondary
+                            color = colorScheme.onSurfaceVariant
                         )
                     }
                 }
             } else {
+                // Clean 4x3 grid on Head Unit landscape (3 columns on narrow portrait preview)
                 LazyVerticalGrid(
-                    columns = GridCells.Adaptive(minSize = 96.dp),
+                    columns = GridCells.Fixed(if (isWideScreen) 4 else 3),
                     modifier = Modifier
                         .fillMaxWidth()
                         .weight(1f)
                         .testTag("installed_apps_grid"),
                     contentPadding = PaddingValues(2.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
                     items(
                         items = apps,
@@ -1141,23 +1284,24 @@ private fun FilterTabChip(
     testTag: String,
     onClick: () -> Unit
 ) {
+    val colorScheme = MaterialTheme.colorScheme
     Surface(
         modifier = Modifier
             .clip(RoundedCornerShape(10.dp))
             .clickable(onClick = onClick)
             .testTag(testTag),
-        color = if (selected) ElectricCyan.copy(alpha = 0.18f) else ObsidianSurfaceHigh,
+        color = if (selected) colorScheme.primary else colorScheme.surfaceVariant,
         shape = RoundedCornerShape(10.dp),
-        border = BorderStroke(1.dp, if (selected) ElectricCyan else ObsidianBorder)
+        border = BorderStroke(1.dp, if (selected) colorScheme.primary else colorScheme.outline)
     ) {
         Text(
             text = label,
-            style = MaterialTheme.typography.labelMedium.copy(
+            style = MaterialTheme.typography.labelMedium.tabular().copy(
                 fontFamily = FontFamily.SansSerif,
                 fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium
             ),
-            color = if (selected) ElectricCyan else TextSecondary,
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
+            color = if (selected) colorScheme.onPrimary else colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp)
         )
     }
 }
@@ -1167,24 +1311,27 @@ private fun AppLauncherTile(
     app: InstalledAppInfo,
     onClick: () -> Unit
 ) {
+    val colorScheme = MaterialTheme.colorScheme
+    val vw = MaterialTheme.vwColors
+
     Surface(
         modifier = Modifier
             .fillMaxWidth()
-            .height(100.dp)
-            .clip(RoundedCornerShape(16.dp))
+            .height(106.dp)
+            .clip(RoundedCornerShape(14.dp))
             .clickable(onClick = onClick)
             .testTag("app_tile_${app.packageName}"),
-        color = ObsidianSurfaceHigh,
-        shape = RoundedCornerShape(16.dp),
+        color = colorScheme.surface,
+        shape = RoundedCornerShape(14.dp),
         border = BorderStroke(
             width = 1.dp,
-            color = ObsidianBorder
+            color = colorScheme.outline
         )
     ) {
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(horizontal = 6.dp, vertical = 8.dp),
+                .padding(horizontal = 8.dp, vertical = 10.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center
         ) {
@@ -1193,23 +1340,23 @@ private fun AppLauncherTile(
                     bitmap = app.iconBitmap,
                     contentDescription = app.label,
                     modifier = Modifier
-                        .size(48.dp)
-                        .clip(RoundedCornerShape(12.dp)),
+                        .size(44.dp)
+                        .clip(RoundedCornerShape(10.dp)),
                     contentScale = ContentScale.Fit
                 )
             } else {
                 Box(
                     modifier = Modifier
-                        .size(48.dp)
-                        .clip(RoundedCornerShape(12.dp))
-                        .background(ObsidianSurface),
+                        .size(44.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(colorScheme.surfaceVariant),
                     contentAlignment = Alignment.Center
                 ) {
                     Icon(
                         imageVector = CockpitIcons.AppsGrid,
                         contentDescription = app.label,
-                        tint = ElectricCyan,
-                        modifier = Modifier.size(26.dp)
+                        tint = vw.accentBlue,
+                        modifier = Modifier.size(24.dp)
                     )
                 }
             }
@@ -1224,8 +1371,8 @@ private fun AppLauncherTile(
                     fontSize = 12.sp,
                     lineHeight = 14.sp
                 ),
-                color = TextPrimary,
-                maxLines = 1,
+                color = colorScheme.onSurface,
+                maxLines = 2,
                 overflow = TextOverflow.Ellipsis,
                 textAlign = TextAlign.Center,
                 modifier = Modifier.fillMaxWidth()

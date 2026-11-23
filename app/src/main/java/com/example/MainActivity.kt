@@ -23,6 +23,8 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -86,6 +88,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -97,6 +100,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalConfiguration
@@ -113,6 +117,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
+import androidx.core.view.WindowCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -145,25 +150,14 @@ import com.example.protocol.carlife.CarLifeTouchDecoder
 import com.example.protocol.carlife.CarlifeProtocolVersionProto
 import com.example.protocol.carlife.CarlifeVideoEncoderInfoProto
 import com.example.protocol.carlife.HandshakeTestProfile
-import com.example.ui.theme.AmberSignal
 import com.example.ui.theme.CockpitIcons
-import com.example.ui.theme.CoralAlert
-import com.example.ui.theme.CyberBlue
-import com.example.ui.theme.ElectricCyan
 import com.example.ui.theme.JetBrainsMonoFamily
 import com.example.ui.theme.MyApplicationTheme
-import com.example.ui.theme.ObsidianBackground
-import com.example.ui.theme.ObsidianBorder
-import com.example.ui.theme.ObsidianSurface
-import com.example.ui.theme.ObsidianSurfaceHigh
-import com.example.ui.theme.SuccessBadgeBg
-import com.example.ui.theme.SuccessBadgeFg
-import com.example.ui.theme.TelemetryEmerald
-import com.example.ui.theme.TextMuted
-import com.example.ui.theme.TextPrimary
-import com.example.ui.theme.TextSecondary
-import com.example.ui.theme.WarningBadgeBg
-import com.example.ui.theme.WarningBadgeFg
+import com.example.ui.theme.ThemeMode
+import com.example.ui.theme.ThemePreferences
+import com.example.ui.theme.resolveIsDarkTheme
+import com.example.ui.theme.tabular
+import com.example.ui.theme.vwColors
 import java.io.PipedInputStream
 import com.example.core.audio.CarLifeAudioCaptureManager
 import java.io.PipedOutputStream
@@ -183,6 +177,7 @@ class MainActivity : ComponentActivity() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         enableEdgeToEdge()
 
+        ThemePreferences.init(this)
         BridgeTelemetryBus.restoreSavedAppMode(this)
 
         recordAudioPermissionLauncher = registerForActivityResult(
@@ -229,7 +224,14 @@ class MainActivity : ComponentActivity() {
         handleUsbAccessoryIntent(intent)
 
         setContent {
-            MyApplicationTheme {
+            val activeThemeMode by ThemePreferences.themeMode.collectAsState()
+            val isDarkTheme = resolveIsDarkTheme(activeThemeMode)
+            SideEffect {
+                val insetsController = WindowCompat.getInsetsController(window, window.decorView)
+                insetsController.isAppearanceLightStatusBars = !isDarkTheme
+                insetsController.isAppearanceLightNavigationBars = !isDarkTheme
+            }
+            MyApplicationTheme(themeMode = activeThemeMode) {
                 CarLifeBridgeApp(
                     onRequestMediaProjection = {
                         requestScreenCapturePermission()
@@ -517,93 +519,64 @@ fun CarLifeBridgeApp(
         }
     }
 
-    val navBarColors = NavigationBarItemDefaults.colors(
-        selectedIconColor = ElectricCyan,
-        selectedTextColor = ElectricCyan,
-        indicatorColor = ElectricCyan.copy(alpha = 0.16f),
-        unselectedIconColor = TextSecondary,
-        unselectedTextColor = TextSecondary
-    )
-
-    val navRailColors = NavigationRailItemDefaults.colors(
-        selectedIconColor = ElectricCyan,
-        selectedTextColor = ElectricCyan,
-        indicatorColor = ElectricCyan.copy(alpha = 0.16f),
-        unselectedIconColor = TextSecondary,
-        unselectedTextColor = TextSecondary
-    )
+    val colorScheme = MaterialTheme.colorScheme
+    val vw = MaterialTheme.vwColors
 
     Scaffold(
         modifier = Modifier.fillMaxSize(),
-        containerColor = ObsidianBackground,
+        containerColor = colorScheme.background,
         contentWindowInsets = WindowInsets.safeDrawing,
         bottomBar = {
             if (!isLandscape) {
-                NavigationBar(
-                    modifier = Modifier
-                        .windowInsetsPadding(WindowInsets.navigationBars)
-                        .height(64.dp),
-                    containerColor = ObsidianSurface,
-                    tonalElevation = 0.dp,
-                    windowInsets = WindowInsets(0, 0, 0, 0)
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    color = colorScheme.surface,
+                    shadowElevation = 0.dp
                 ) {
-                    NavigationBarItem(
-                        selected = selectedTab == 0,
-                        onClick = { selectedTab = 0 },
-                        colors = navBarColors,
-                        modifier = Modifier.testTag("nav_app_launcher"),
-                        icon = {
-                            Icon(
-                                imageVector = CockpitIcons.AppsGrid,
-                                contentDescription = "Лаунчер ГУ",
-                                modifier = Modifier.size(20.dp)
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .windowInsetsPadding(WindowInsets.navigationBars)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(1.dp)
+                                .background(colorScheme.outline)
+                        )
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(64.dp)
+                                .padding(horizontal = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            VwBottomNavItem(
+                                label = "Лаунчер",
+                                icon = CockpitIcons.AppsGrid,
+                                selected = selectedTab == 0,
+                                testTag = "nav_app_launcher",
+                                onClick = { selectedTab = 0 },
+                                modifier = Modifier.weight(1f)
                             )
-                        },
-                        label = {
-                            Text(
-                                text = "Лаунчер ГУ",
-                                style = MaterialTheme.typography.labelSmall
+                            VwBottomNavItem(
+                                label = "Подключение",
+                                icon = Icons.Default.CheckCircle,
+                                selected = selectedTab == 1,
+                                testTag = "nav_setup_checklist",
+                                onClick = { selectedTab = 1 },
+                                modifier = Modifier.weight(1f)
                             )
-                        }
-                    )
-                    NavigationBarItem(
-                        selected = selectedTab == 1,
-                        onClick = { selectedTab = 1 },
-                        colors = navBarColors,
-                        modifier = Modifier.testTag("nav_setup_checklist"),
-                        icon = {
-                            Icon(
-                                imageVector = Icons.Default.CheckCircle,
-                                contentDescription = "Подключение",
-                                modifier = Modifier.size(20.dp)
-                            )
-                        },
-                        label = {
-                            Text(
-                                text = "Подключение",
-                                style = MaterialTheme.typography.labelSmall
-                            )
-                        }
-                    )
-                    NavigationBarItem(
-                        selected = selectedTab == 2,
-                        onClick = { selectedTab = 2 },
-                        colors = navBarColors,
-                        modifier = Modifier.testTag("nav_settings"),
-                        icon = {
-                            Icon(
-                                imageVector = Icons.Default.Settings,
-                                contentDescription = "Настройки",
-                                modifier = Modifier.size(20.dp)
-                            )
-                        },
-                        label = {
-                            Text(
-                                text = "Настройки",
-                                style = MaterialTheme.typography.labelSmall
+                            VwBottomNavItem(
+                                label = "Настройки",
+                                icon = Icons.Default.Settings,
+                                selected = selectedTab == 2,
+                                testTag = "nav_settings",
+                                onClick = { selectedTab = 2 },
+                                modifier = Modifier.weight(1f)
                             )
                         }
-                    )
+                    }
                 }
             }
         }
@@ -614,78 +587,53 @@ fun CarLifeBridgeApp(
                 .padding(innerPadding)
         ) {
             if (isLandscape) {
-                NavigationRail(
+                Surface(
                     modifier = Modifier
-                        .width(72.dp)
-                        .fillMaxHeight()
-                        .border(1.dp, ObsidianBorder),
-                    containerColor = ObsidianSurface,
-                    windowInsets = WindowInsets(0, 0, 0, 0)
+                        .width(76.dp)
+                        .fillMaxHeight(),
+                    color = colorScheme.surface,
+                    shadowElevation = 0.dp
                 ) {
-                    Spacer(modifier = Modifier.weight(1f))
-                    NavigationRailItem(
-                        selected = selectedTab == 0,
-                        onClick = { selectedTab = 0 },
-                        colors = navRailColors,
-                        modifier = Modifier.testTag("nav_app_launcher"),
-                        icon = {
-                            Icon(
-                                imageVector = CockpitIcons.AppsGrid,
-                                contentDescription = "Лаунчер ГУ",
-                                modifier = Modifier.size(20.dp)
+                    Row(modifier = Modifier.fillMaxSize()) {
+                        Column(
+                            modifier = Modifier
+                                .weight(1f)
+                                .fillMaxHeight()
+                                .padding(vertical = 12.dp, horizontal = 4.dp),
+                            verticalArrangement = Arrangement.Center,
+                            horizontalAlignment = Alignment.CenterHorizontally
+                        ) {
+                            VwRailNavItem(
+                                label = "Лаунчер",
+                                icon = CockpitIcons.AppsGrid,
+                                selected = selectedTab == 0,
+                                testTag = "nav_app_launcher",
+                                onClick = { selectedTab = 0 }
                             )
-                        },
-                        label = {
-                            Text(
-                                text = "Лаунчер",
-                                style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
-                                maxLines = 1
+                            Spacer(modifier = Modifier.height(10.dp))
+                            VwRailNavItem(
+                                label = "Подключ.",
+                                icon = Icons.Default.CheckCircle,
+                                selected = selectedTab == 1,
+                                testTag = "nav_setup_checklist",
+                                onClick = { selectedTab = 1 }
                             )
-                        }
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    NavigationRailItem(
-                        selected = selectedTab == 1,
-                        onClick = { selectedTab = 1 },
-                        colors = navRailColors,
-                        modifier = Modifier.testTag("nav_setup_checklist"),
-                        icon = {
-                            Icon(
-                                imageVector = Icons.Default.CheckCircle,
-                                contentDescription = "Подключение",
-                                modifier = Modifier.size(20.dp)
-                            )
-                        },
-                        label = {
-                            Text(
-                                text = "Чек-лист",
-                                style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
-                                maxLines = 1
+                            Spacer(modifier = Modifier.height(10.dp))
+                            VwRailNavItem(
+                                label = "Настройки",
+                                icon = Icons.Default.Settings,
+                                selected = selectedTab == 2,
+                                testTag = "nav_settings",
+                                onClick = { selectedTab = 2 }
                             )
                         }
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    NavigationRailItem(
-                        selected = selectedTab == 2,
-                        onClick = { selectedTab = 2 },
-                        colors = navRailColors,
-                        modifier = Modifier.testTag("nav_settings"),
-                        icon = {
-                            Icon(
-                                imageVector = Icons.Default.Settings,
-                                contentDescription = "Настройки",
-                                modifier = Modifier.size(20.dp)
-                            )
-                        },
-                        label = {
-                            Text(
-                                text = "Настройки",
-                                style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp),
-                                maxLines = 1
-                            )
-                        }
-                    )
-                    Spacer(modifier = Modifier.weight(1f))
+                        Box(
+                            modifier = Modifier
+                                .width(1.dp)
+                                .fillMaxHeight()
+                                .background(colorScheme.outline)
+                        )
+                    }
                 }
             }
 
@@ -880,6 +828,177 @@ private fun openAppDetailsSettings(context: Context) {
 }
 
 @Composable
+private fun VwBottomNavItem(
+    label: String,
+    icon: ImageVector,
+    selected: Boolean,
+    testTag: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val colorScheme = MaterialTheme.colorScheme
+    val contentColor by animateColorAsState(
+        targetValue = if (selected) colorScheme.primary else colorScheme.onSurfaceVariant,
+        animationSpec = tween(durationMillis = 180),
+        label = "vw_nav_item_color"
+    )
+    val indicatorColor by animateColorAsState(
+        targetValue = if (selected) colorScheme.primary else Color.Transparent,
+        animationSpec = tween(durationMillis = 180),
+        label = "vw_nav_indicator_color"
+    )
+
+    Column(
+        modifier = modifier
+            .fillMaxHeight()
+            .clip(RoundedCornerShape(10.dp))
+            .clickable(onClick = onClick)
+            .testTag(testTag)
+            .padding(vertical = 6.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = label,
+            tint = contentColor,
+            modifier = Modifier.size(22.dp)
+        )
+        Spacer(modifier = Modifier.height(3.dp))
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelSmall.copy(
+                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium
+            ),
+            color = contentColor,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+        Spacer(modifier = Modifier.height(4.dp))
+        Box(
+            modifier = Modifier
+                .width(28.dp)
+                .height(2.5.dp)
+                .clip(RoundedCornerShape(2.dp))
+                .background(indicatorColor)
+        )
+    }
+}
+
+@Composable
+private fun VwRailNavItem(
+    label: String,
+    icon: ImageVector,
+    selected: Boolean,
+    testTag: String,
+    onClick: () -> Unit
+) {
+    val colorScheme = MaterialTheme.colorScheme
+    val contentColor by animateColorAsState(
+        targetValue = if (selected) colorScheme.primary else colorScheme.onSurfaceVariant,
+        animationSpec = tween(durationMillis = 180),
+        label = "vw_rail_item_color"
+    )
+    val indicatorColor by animateColorAsState(
+        targetValue = if (selected) colorScheme.primary else Color.Transparent,
+        animationSpec = tween(durationMillis = 180),
+        label = "vw_rail_indicator_color"
+    )
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = 54.dp)
+            .clip(RoundedCornerShape(10.dp))
+            .clickable(onClick = onClick)
+            .testTag(testTag)
+            .padding(vertical = 6.dp, horizontal = 4.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = label,
+            tint = contentColor,
+            modifier = Modifier.size(20.dp)
+        )
+        Spacer(modifier = Modifier.height(3.dp))
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelSmall.copy(
+                fontSize = 10.sp,
+                fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium
+            ),
+            color = contentColor,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+        Spacer(modifier = Modifier.height(3.dp))
+        Box(
+            modifier = Modifier
+                .width(24.dp)
+                .height(2.5.dp)
+                .clip(RoundedCornerShape(2.dp))
+                .background(indicatorColor)
+        )
+    }
+}
+
+private enum class VwBadgeTone {
+    ACTIVE,
+    WAITING,
+    WARNING,
+    ERROR,
+    NEUTRAL
+}
+
+@Composable
+private fun VwStatusBadge(
+    label: String,
+    tone: VwBadgeTone,
+    modifier: Modifier = Modifier
+) {
+    val colorScheme = MaterialTheme.colorScheme
+    val vw = MaterialTheme.vwColors
+    val (bg, fg, dot) = when (tone) {
+        VwBadgeTone.ACTIVE -> Triple(vw.successContainer, vw.onSuccessContainer, vw.statusActiveDot)
+        VwBadgeTone.WAITING -> Triple(vw.infoContainer, vw.onInfoContainer, vw.statusWaitingDot)
+        VwBadgeTone.WARNING -> Triple(vw.warningContainer, vw.onWarningContainer, vw.statusWarningDot)
+        VwBadgeTone.ERROR -> Triple(vw.errorContainerSoft, vw.onErrorContainerSoft, vw.statusErrorDot)
+        VwBadgeTone.NEUTRAL -> Triple(colorScheme.surfaceVariant, colorScheme.onSurfaceVariant, colorScheme.onSurfaceVariant)
+    }
+
+    Surface(
+        modifier = modifier,
+        color = bg,
+        shape = RoundedCornerShape(50),
+        border = BorderStroke(1.dp, dot.copy(alpha = 0.28f))
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(7.dp)
+                    .clip(CircleShape)
+                    .background(dot)
+            )
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelSmall.tabular().copy(
+                    fontWeight = FontWeight.SemiBold
+                ),
+                color = fg,
+                softWrap = false,
+                maxLines = 1
+            )
+        }
+    }
+}
+
+@Composable
 private fun OnboardingChecklistScreen(
     status: SetupChecklistStatus,
     runtimeState: BridgeRuntimeState,
@@ -892,6 +1011,9 @@ private fun OnboardingChecklistScreen(
     onScanAndAttachUsb: () -> Unit,
     onOpenLauncherTab: () -> Unit
 ) {
+    val colorScheme = MaterialTheme.colorScheme
+    val vw = MaterialTheme.vwColors
+
     LazyColumn(
         modifier = Modifier
             .fillMaxSize()
@@ -899,64 +1021,66 @@ private fun OnboardingChecklistScreen(
         contentPadding = PaddingValues(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        // Заголовочная карточка без пустого пространства сверху
+        // Заголовочная карточка мастера настройки Jetta VS7
         item {
             Card(
                 modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(16.dp),
-                colors = CardDefaults.cardColors(containerColor = ObsidianSurface),
-                border = BorderStroke(1.dp, ObsidianBorder)
+                shape = RoundedCornerShape(14.dp),
+                colors = CardDefaults.cardColors(containerColor = colorScheme.surface),
+                elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
+                border = BorderStroke(1.dp, colorScheme.outline)
             ) {
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text(
-                            text = "МАСТЕР НАСТРОЙКИ CARLIFE",
-                            style = MaterialTheme.typography.titleMedium.copy(
-                                fontFamily = FontFamily.SansSerif,
-                                fontWeight = FontWeight.SemiBold
-                            ),
-                            color = ElectricCyan
-                        )
-                        Surface(
-                            color = if (status.allPrerequisitesReady) SuccessBadgeBg else WarningBadgeBg,
-                            shape = RoundedCornerShape(8.dp)
-                        ) {
+                        Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = "${status.completedMandatorySteps} / 5 выполнено",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = if (status.allPrerequisitesReady) SuccessBadgeFg else WarningBadgeFg,
-                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                                text = "JETTA VS7 • ПОДКЛЮЧЕНИЕ",
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    fontWeight = FontWeight.Bold,
+                                    letterSpacing = 0.8.sp
+                                ),
+                                color = vw.accentBlue
+                            )
+                            Text(
+                                text = "Мастер настройки CarLife",
+                                style = MaterialTheme.typography.titleMedium,
+                                color = colorScheme.onSurface
                             )
                         }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        VwStatusBadge(
+                            label = "${status.completedMandatorySteps} / 5",
+                            tone = if (status.allPrerequisitesReady) VwBadgeTone.ACTIVE else VwBadgeTone.WAITING
+                        )
                     }
 
                     Text(
                         text = if (status.allPrerequisitesReady) {
-                            "Все 5 разрешений выданы ✅ Видеопоток H.264 (SPS/PPS + IDR) готов к передаче без зависания на 90%."
+                            "Все 5 разрешений выданы. Видеопоток H.264 (SPS/PPS + IDR) готов к передаче без зависания на 90%."
                         } else {
                             "Выполните 5 шагов подготовки перед подключением USB-кабеля к ГУ автомобиля, чтобы CarLife проходил загрузку 90% → 100%."
                         },
                         style = MaterialTheme.typography.bodyMedium,
-                        color = TextSecondary
+                        color = colorScheme.onSurfaceVariant
                     )
 
                     LinearProgressIndicator(
                         progress = { status.completedMandatorySteps / 5f },
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(6.dp)
+                            .height(5.dp)
                             .clip(RoundedCornerShape(3.dp)),
-                        color = ElectricCyan,
-                        trackColor = ObsidianSurfaceHigh
+                        color = colorScheme.primary,
+                        trackColor = colorScheme.surfaceVariant
                     )
                 }
             }
@@ -965,7 +1089,7 @@ private fun OnboardingChecklistScreen(
         // ШАГ 1: Снятие ограничений батареи
         item {
             ChecklistStepCard(
-                title = "Шаг 1. Снятие ограничений батареи (WakeLock & 60fps)",
+                title = "Шаг 1. Снятие ограничений батареи (WakeLock & 30fps)",
                 isCompleted = status.step1BatteryUnrestricted,
                 description = "Отключите оптимизацию батареи, чтобы система One UI не усыпляла видеопоток при выключенном экране телефона.",
                 primaryButtonText = if (status.step1BatteryUnrestricted) {
@@ -1032,9 +1156,10 @@ private fun OnboardingChecklistScreen(
         item {
             Card(
                 modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(16.dp),
-                colors = CardDefaults.cardColors(containerColor = ObsidianSurface),
-                border = BorderStroke(1.dp, ObsidianBorder)
+                shape = RoundedCornerShape(14.dp),
+                colors = CardDefaults.cardColors(containerColor = colorScheme.surface),
+                elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
+                border = BorderStroke(1.dp, colorScheme.outline)
             ) {
                 Column(
                     modifier = Modifier
@@ -1050,7 +1175,7 @@ private fun OnboardingChecklistScreen(
                         Text(
                             text = "Шаг 5. Захват экрана (MediaProjection) — КРИТИЧНО ДЛЯ 90%",
                             style = MaterialTheme.typography.titleMedium,
-                            color = TextPrimary,
+                            color = colorScheme.onSurface,
                             modifier = Modifier.weight(1f)
                         )
                         Spacer(modifier = Modifier.width(8.dp))
@@ -1058,16 +1183,16 @@ private fun OnboardingChecklistScreen(
                     }
 
                     Surface(
-                        color = ObsidianSurfaceHigh,
-                        shape = RoundedCornerShape(12.dp),
-                        border = BorderStroke(1.dp, ObsidianBorder)
+                        color = colorScheme.surfaceVariant,
+                        shape = RoundedCornerShape(10.dp),
+                        border = BorderStroke(1.dp, colorScheme.outline)
                     ) {
                         Text(
                             text = buildAnnotatedString {
                                 append("Нажмите «Начать трансляцию». ")
                                 withStyle(
                                     SpanStyle(
-                                        color = CoralAlert,
+                                        color = colorScheme.error,
                                         fontWeight = FontWeight.SemiBold
                                     )
                                 ) {
@@ -1077,7 +1202,7 @@ private fun OnboardingChecklistScreen(
                                 }
                             },
                             style = MaterialTheme.typography.bodyMedium,
-                            color = TextPrimary,
+                            color = colorScheme.onSurface,
                             modifier = Modifier.padding(12.dp)
                         )
                     }
@@ -1087,11 +1212,11 @@ private fun OnboardingChecklistScreen(
                     val effectiveMpError = mpError ?: runtimeState.projectionStats.lastMediaProjectionError
 
                     Surface(
-                        color = ObsidianBackground,
+                        color = colorScheme.background,
                         shape = RoundedCornerShape(10.dp),
                         border = BorderStroke(
                             1.dp,
-                            if (effectiveMpError != null) CoralAlert.copy(alpha = 0.7f) else ObsidianBorder
+                            if (effectiveMpError != null) colorScheme.error.copy(alpha = 0.7f) else colorScheme.outline
                         )
                     ) {
                         Column(
@@ -1102,14 +1227,14 @@ private fun OnboardingChecklistScreen(
                         ) {
                             Text(
                                 text = "Диагностика MP: ${runtimeState.projectionStats.mediaProjectionState} • $mpDetail",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = if (status.step5MediaProjectionGranted) TelemetryEmerald else AmberSignal
+                                style = MaterialTheme.typography.labelSmall.tabular(),
+                                color = if (status.step5MediaProjectionGranted) vw.onSuccessContainer else vw.onInfoContainer
                             )
                             if (!effectiveMpError.isNullOrBlank()) {
                                 Text(
                                     text = "Ошибка: $effectiveMpError",
                                     style = MaterialTheme.typography.labelSmall,
-                                    color = CoralAlert
+                                    color = colorScheme.error
                                 )
                             }
                         }
@@ -1119,12 +1244,13 @@ private fun OnboardingChecklistScreen(
                         onClick = onRequestMediaProjection,
                         modifier = Modifier
                             .fillMaxWidth()
+                            .heightIn(min = 48.dp)
                             .testTag("step5_mediaprojection_btn"),
                         colors = ButtonDefaults.buttonColors(
-                            containerColor = if (status.step5MediaProjectionGranted) ObsidianSurfaceHigh else ElectricCyan,
-                            contentColor = if (status.step5MediaProjectionGranted) TextPrimary else Color(0xFF001D24)
+                            containerColor = if (status.step5MediaProjectionGranted) colorScheme.surfaceVariant else colorScheme.primary,
+                            contentColor = if (status.step5MediaProjectionGranted) colorScheme.onSurface else colorScheme.onPrimary
                         ),
-                        shape = RoundedCornerShape(12.dp)
+                        shape = RoundedCornerShape(10.dp)
                     ) {
                         Icon(
                             imageVector = CockpitIcons.Videocam,
@@ -1150,9 +1276,10 @@ private fun OnboardingChecklistScreen(
             val step6Active = status.allPrerequisitesReady
             Card(
                 modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(16.dp),
-                colors = CardDefaults.cardColors(containerColor = ObsidianSurface),
-                border = BorderStroke(1.dp, ObsidianBorder)
+                shape = RoundedCornerShape(14.dp),
+                colors = CardDefaults.cardColors(containerColor = colorScheme.surface),
+                elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
+                border = BorderStroke(1.dp, colorScheme.outline)
             ) {
                 Column(
                     modifier = Modifier
@@ -1168,37 +1295,30 @@ private fun OnboardingChecklistScreen(
                         Text(
                             text = "Шаг 6. Подключение USB-кабеля к ГУ автомобиля",
                             style = MaterialTheme.typography.titleMedium,
-                            color = if (step6Active) TextPrimary else TextMuted,
+                            color = if (step6Active) colorScheme.onSurface else vw.textMuted,
                             modifier = Modifier.weight(1f)
                         )
                         Spacer(modifier = Modifier.width(8.dp))
-                        Surface(
-                            color = if (step6Active) SuccessBadgeBg else WarningBadgeBg,
-                            shape = RoundedCornerShape(8.dp)
-                        ) {
-                            Text(
-                                text = when {
-                                    status.isUsbConnected && step6Active -> "Подключено ✅"
-                                    step6Active -> "Выполнено ✅"
-                                    else -> "Настроить"
-                                },
-                                style = MaterialTheme.typography.labelSmall,
-                                color = if (step6Active) SuccessBadgeFg else WarningBadgeFg,
-                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
-                            )
-                        }
+                        VwStatusBadge(
+                            label = when {
+                                status.isUsbConnected && step6Active -> "Подключено"
+                                step6Active -> "Готово"
+                                else -> "Ожидание"
+                            },
+                            tone = if (step6Active) VwBadgeTone.ACTIVE else VwBadgeTone.WAITING
+                        )
                     }
 
                     Text(
                         text = "Подключите телефон кабелем к USB-порту автомобиля и нажмите на всплывающем окне «ОК» (всегда открывать при подключении CarLife).",
                         style = MaterialTheme.typography.bodyMedium,
-                        color = if (step6Active) TextSecondary else TextMuted
+                        color = if (step6Active) colorScheme.onSurfaceVariant else vw.textMuted
                     )
 
                     Text(
                         text = "Статус канала: ${runtimeState.lastProtocolEvent}",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = if (step6Active) ElectricCyan else TextMuted
+                        style = MaterialTheme.typography.labelSmall.tabular(),
+                        color = if (step6Active) vw.accentBlue else vw.textMuted
                     )
 
                     Row(
@@ -1210,12 +1330,13 @@ private fun OnboardingChecklistScreen(
                             enabled = step6Active,
                             modifier = Modifier
                                 .weight(1f)
+                                .heightIn(min = 48.dp)
                                 .testTag("step6_connect_usb_btn"),
                             colors = ButtonDefaults.buttonColors(
-                                containerColor = ElectricCyan,
-                                contentColor = Color(0xFF001D24)
+                                containerColor = colorScheme.primary,
+                                contentColor = colorScheme.onPrimary
                             ),
-                            shape = RoundedCornerShape(12.dp)
+                            shape = RoundedCornerShape(10.dp)
                         ) {
                             Icon(
                                 imageVector = CockpitIcons.Usb,
@@ -1231,11 +1352,13 @@ private fun OnboardingChecklistScreen(
 
                         OutlinedButton(
                             onClick = onOpenLauncherTab,
-                            modifier = Modifier.testTag("step6_open_launcher_btn"),
-                            shape = RoundedCornerShape(12.dp),
-                            border = BorderStroke(1.dp, ObsidianBorder)
+                            modifier = Modifier
+                                .heightIn(min = 48.dp)
+                                .testTag("step6_open_launcher_btn"),
+                            shape = RoundedCornerShape(10.dp),
+                            border = BorderStroke(1.dp, colorScheme.outline)
                         ) {
-                            Text("Лаунчер ГУ", color = ElectricCyan)
+                            Text("Лаунчер", color = colorScheme.primary)
                         }
                     }
                 }
@@ -1255,11 +1378,13 @@ private fun ChecklistStepCard(
     secondaryButtonText: String? = null,
     onSecondaryClick: (() -> Unit)? = null
 ) {
+    val colorScheme = MaterialTheme.colorScheme
     Card(
         modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(16.dp),
-        colors = CardDefaults.cardColors(containerColor = ObsidianSurface),
-        border = BorderStroke(1.dp, ObsidianBorder)
+        shape = RoundedCornerShape(14.dp),
+        colors = CardDefaults.cardColors(containerColor = colorScheme.surface),
+        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
+        border = BorderStroke(1.dp, colorScheme.outline)
     ) {
         Column(
             modifier = Modifier
@@ -1275,7 +1400,7 @@ private fun ChecklistStepCard(
                 Text(
                     text = title,
                     style = MaterialTheme.typography.titleMedium,
-                    color = TextPrimary,
+                    color = colorScheme.onSurface,
                     modifier = Modifier.weight(1f)
                 )
                 Spacer(modifier = Modifier.width(8.dp))
@@ -1285,36 +1410,44 @@ private fun ChecklistStepCard(
             Text(
                 text = description,
                 style = MaterialTheme.typography.bodyMedium,
-                color = TextSecondary
+                color = colorScheme.onSurfaceVariant
             )
 
             if (isCompleted) {
                 Surface(
                     modifier = Modifier
                         .fillMaxWidth()
+                        .heightIn(min = 48.dp)
                         .clip(RoundedCornerShape(10.dp))
                         .clickable(onClick = onPrimaryClick)
                         .testTag(testTag),
-                    color = ObsidianSurfaceHigh,
+                    color = colorScheme.surfaceVariant,
                     shape = RoundedCornerShape(10.dp),
-                    border = BorderStroke(1.dp, ObsidianBorder)
+                    border = BorderStroke(1.dp, colorScheme.outline)
                 ) {
-                    Text(
-                        text = primaryButtonText,
-                        style = MaterialTheme.typography.labelLarge,
-                        color = TextPrimary,
-                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)
-                    )
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 14.dp, vertical = 12.dp),
+                        contentAlignment = Alignment.CenterStart
+                    ) {
+                        Text(
+                            text = primaryButtonText,
+                            style = MaterialTheme.typography.labelLarge,
+                            color = colorScheme.onSurface
+                        )
+                    }
                 }
             } else {
                 Button(
                     onClick = onPrimaryClick,
                     modifier = Modifier
                         .fillMaxWidth()
+                        .heightIn(min = 48.dp)
                         .testTag(testTag),
                     colors = ButtonDefaults.buttonColors(
-                        containerColor = ElectricCyan,
-                        contentColor = Color(0xFF001D24)
+                        containerColor = colorScheme.primary,
+                        contentColor = colorScheme.onPrimary
                     ),
                     shape = RoundedCornerShape(10.dp)
                 ) {
@@ -1329,19 +1462,26 @@ private fun ChecklistStepCard(
                 Surface(
                     modifier = Modifier
                         .fillMaxWidth()
+                        .heightIn(min = 48.dp)
                         .clip(RoundedCornerShape(10.dp))
                         .clickable(onClick = onSecondaryClick)
                         .testTag("${testTag}_secondary"),
-                    color = ObsidianSurfaceHigh,
+                    color = colorScheme.surfaceVariant,
                     shape = RoundedCornerShape(10.dp),
-                    border = BorderStroke(1.dp, ObsidianBorder)
+                    border = BorderStroke(1.dp, colorScheme.outline)
                 ) {
-                    Text(
-                        text = secondaryButtonText,
-                        style = MaterialTheme.typography.labelMedium,
-                        color = TextSecondary,
-                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp)
-                    )
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 14.dp, vertical = 12.dp),
+                        contentAlignment = Alignment.CenterStart
+                    ) {
+                        Text(
+                            text = secondaryButtonText,
+                            style = MaterialTheme.typography.labelMedium,
+                            color = colorScheme.onSurfaceVariant
+                        )
+                    }
                 }
             }
         }
@@ -1350,20 +1490,10 @@ private fun ChecklistStepCard(
 
 @Composable
 private fun StatusBadgePill(isCompleted: Boolean) {
-    Surface(
-        color = if (isCompleted) SuccessBadgeBg else WarningBadgeBg,
-        shape = RoundedCornerShape(8.dp)
-    ) {
-        Text(
-            text = if (isCompleted) "Выполнено ✅" else "Настроить",
-            style = MaterialTheme.typography.labelSmall.copy(
-                fontFamily = FontFamily.SansSerif,
-                fontWeight = FontWeight.SemiBold
-            ),
-            color = if (isCompleted) SuccessBadgeFg else WarningBadgeFg,
-            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
-        )
-    }
+    VwStatusBadge(
+        label = if (isCompleted) "Активно" else "Настроить",
+        tone = if (isCompleted) VwBadgeTone.ACTIVE else VwBadgeTone.WAITING
+    )
 }
 
 /**
@@ -1394,6 +1524,9 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
     onRequestRecordAudioPermission: () -> Unit = {}
 ) {
     val context = LocalContext.current
+    val colorScheme = MaterialTheme.colorScheme
+    val vw = MaterialTheme.vwColors
+    val activeThemeMode by ThemePreferences.themeMode.collectAsState()
     val scope = rememberCoroutineScope()
     val localStateMachine = remember { CarLifeControlStateMachine() }
     var diagnosticsExpanded by rememberSaveable { mutableStateOf(false) }
@@ -1494,9 +1627,123 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
             .fillMaxSize()
             .widthIn(max = 680.dp),
         contentPadding = PaddingValues(16.dp),
-        verticalArrangement = Arrangement.spacedBy(14.dp)
+        verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        // 0. Главный переключатель режима работы: 3 независимых режима
+        // 0.0 Общие настройки — Оформление (Светлая / Тёмная / Авто, синхронно на смартфоне и ГУ)
+        item {
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("theme_mode_card"),
+                shape = RoundedCornerShape(14.dp),
+                colors = CardDefaults.cardColors(containerColor = colorScheme.surface),
+                elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
+                border = BorderStroke(1.dp, colorScheme.outline)
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "Оформление",
+                                style = MaterialTheme.typography.titleMedium,
+                                color = colorScheme.onSurface
+                            )
+                            Text(
+                                text = "VW MIB3 • Применяется на смартфоне и в Кокпите ГУ",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        VwStatusBadge(
+                            label = activeThemeMode.label,
+                            tone = VwBadgeTone.WAITING
+                        )
+                    }
+
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(colorScheme.background)
+                            .border(1.dp, colorScheme.outline, RoundedCornerShape(12.dp))
+                            .padding(3.dp)
+                            .testTag("theme_mode_segmented_control"),
+                        horizontalArrangement = Arrangement.spacedBy(3.dp)
+                    ) {
+                        ThemeMode.entries.forEach { mode ->
+                            val selected = activeThemeMode == mode
+                            val tag = when (mode) {
+                                ThemeMode.SYSTEM -> "theme_mode_system_btn"
+                                ThemeMode.LIGHT -> "theme_mode_light_btn"
+                                ThemeMode.DARK -> "theme_mode_dark_btn"
+                            }
+                            val bgColor by animateColorAsState(
+                                targetValue = if (selected) colorScheme.primary else Color.Transparent,
+                                animationSpec = tween(durationMillis = 180),
+                                label = "theme_seg_bg"
+                            )
+                            val txtColor by animateColorAsState(
+                                targetValue = if (selected) colorScheme.onPrimary else colorScheme.onSurfaceVariant,
+                                animationSpec = tween(durationMillis = 180),
+                                label = "theme_seg_txt"
+                            )
+                            val indicatorColor by animateColorAsState(
+                                targetValue = if (selected) {
+                                    if (vw.isDark) Color.White.copy(alpha = 0.85f) else vw.accentBlue
+                                } else {
+                                    Color.Transparent
+                                },
+                                animationSpec = tween(durationMillis = 180),
+                                label = "theme_seg_line"
+                            )
+                            Column(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .heightIn(min = 48.dp)
+                                    .clip(RoundedCornerShape(9.dp))
+                                    .background(bgColor)
+                                    .clickable {
+                                        ThemePreferences.setThemeMode(mode, context)
+                                    }
+                                    .testTag(tag),
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.Center
+                            ) {
+                                Text(
+                                    text = mode.label,
+                                    style = MaterialTheme.typography.labelLarge.copy(
+                                        fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium
+                                    ),
+                                    color = txtColor,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Spacer(modifier = Modifier.height(3.dp))
+                                Box(
+                                    modifier = Modifier
+                                        .width(24.dp)
+                                        .height(2.dp)
+                                        .clip(RoundedCornerShape(1.dp))
+                                        .background(indicatorColor)
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 0. Главный переключатель режима работы: 3 независимых режима (VW Segmented Control)
         item {
             val activeAppMode = state.appMode
             val shizukuStatus by CarLifeShizukuManager.status.collectAsStateWithLifecycle()
@@ -1545,15 +1792,16 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                 modifier = Modifier
                     .fillMaxWidth()
                     .testTag("app_mode_switcher_card"),
-                shape = RoundedCornerShape(16.dp),
-                colors = CardDefaults.cardColors(containerColor = ObsidianSurface),
-                border = BorderStroke(1.dp, ElectricCyan.copy(alpha = 0.75f))
+                shape = RoundedCornerShape(14.dp),
+                colors = CardDefaults.cardColors(containerColor = colorScheme.surface),
+                elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
+                border = BorderStroke(1.dp, colorScheme.outline)
             ) {
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -1562,175 +1810,192 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = "Режим работы приложения",
+                                text = "Режим работы",
                                 style = MaterialTheme.typography.titleMedium,
-                                color = TextPrimary
+                                color = colorScheme.onSurface
                             )
                             Spacer(modifier = Modifier.height(2.dp))
                             Text(
-                                text = "3 независимых режима: видеопоток + маршрутизация тача (0x0006)",
+                                text = "Видеопоток H.264 и маршрутизация тача (0x0006)",
                                 style = MaterialTheme.typography.labelSmall,
-                                color = TextSecondary
+                                color = colorScheme.onSurfaceVariant
                             )
                         }
                         Spacer(modifier = Modifier.width(8.dp))
-                        Surface(
-                            color = ElectricCyan.copy(alpha = 0.16f),
-                            shape = RoundedCornerShape(8.dp),
-                            border = BorderStroke(1.dp, ElectricCyan.copy(alpha = 0.65f))
-                        ) {
-                            Text(
-                                text = when (activeAppMode) {
-                                    AppMode.COCKPIT -> "КОКПИТ VD"
-                                    AppMode.MIRRORING -> "ЗЕРКАЛО"
-                                    AppMode.SHIZUKU_COCKPIT -> "SHIZUKU VD"
-                                },
-                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
-                                color = ElectricCyan,
-                                softWrap = false,
-                                maxLines = 1,
-                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
-                            )
-                        }
+                        VwStatusBadge(
+                            label = when (activeAppMode) {
+                                AppMode.COCKPIT -> "Кокпит"
+                                AppMode.MIRRORING -> "Зеркало"
+                                AppMode.SHIZUKU_COCKPIT -> "Shizuku"
+                            },
+                            tone = VwBadgeTone.ACTIVE
+                        )
                     }
 
-                    AppMode.entries.forEach { mode ->
-                        val isSelected = activeAppMode == mode
-                        val rowBg = if (isSelected) ElectricCyan.copy(alpha = 0.12f) else ObsidianBackground
-                        val rowBorder = if (isSelected) ElectricCyan else ObsidianBorder
-                        val tag = when (mode) {
-                            AppMode.COCKPIT -> "app_mode_cockpit_btn"
-                            AppMode.MIRRORING -> "app_mode_mirroring_btn"
-                            AppMode.SHIZUKU_COCKPIT -> "app_mode_shizuku_cockpit_btn"
-                        }
-                        Column(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clip(RoundedCornerShape(12.dp))
-                                .background(rowBg)
-                                .border(1.dp, rowBorder, RoundedCornerShape(12.dp))
-                                .testTag(tag)
-                        ) {
-                            Row(
+                    // Единый горизонтальный сегментированный контрол VW MIB3 (Кокпит | Зеркало | Shizuku)
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(colorScheme.background)
+                            .border(1.dp, colorScheme.outline, RoundedCornerShape(12.dp))
+                            .padding(3.dp),
+                        horizontalArrangement = Arrangement.spacedBy(3.dp)
+                    ) {
+                        AppMode.entries.forEach { mode ->
+                            val isSelected = activeAppMode == mode
+                            val tag = when (mode) {
+                                AppMode.COCKPIT -> "app_mode_cockpit_btn"
+                                AppMode.MIRRORING -> "app_mode_mirroring_btn"
+                                AppMode.SHIZUKU_COCKPIT -> "app_mode_shizuku_cockpit_btn"
+                            }
+                            val shortLabel = when (mode) {
+                                AppMode.COCKPIT -> "Кокпит"
+                                AppMode.MIRRORING -> "Зеркало"
+                                AppMode.SHIZUKU_COCKPIT -> "Shizuku"
+                            }
+                            val segmentBg by animateColorAsState(
+                                targetValue = if (isSelected) colorScheme.primary else Color.Transparent,
+                                animationSpec = tween(durationMillis = 180),
+                                label = "mode_seg_bg"
+                            )
+                            val segmentText by animateColorAsState(
+                                targetValue = if (isSelected) colorScheme.onPrimary else colorScheme.onSurfaceVariant,
+                                animationSpec = tween(durationMillis = 180),
+                                label = "mode_seg_text"
+                            )
+                            val bottomLine by animateColorAsState(
+                                targetValue = if (isSelected) {
+                                    if (vw.isDark) Color.White.copy(alpha = 0.85f) else vw.accentBlue
+                                } else {
+                                    Color.Transparent
+                                },
+                                animationSpec = tween(durationMillis = 180),
+                                label = "mode_seg_line"
+                            )
+                            Column(
                                 modifier = Modifier
-                                    .fillMaxWidth()
+                                    .weight(1f)
                                     .heightIn(min = 48.dp)
+                                    .clip(RoundedCornerShape(9.dp))
+                                    .background(segmentBg)
                                     .selectable(
                                         selected = isSelected,
                                         onClick = { selectAppMode(mode) },
                                         role = Role.RadioButton
                                     )
-                                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                                    .testTag(tag),
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.Center
+                            ) {
+                                Text(
+                                    text = shortLabel,
+                                    style = MaterialTheme.typography.labelLarge.copy(
+                                        fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Medium
+                                    ),
+                                    color = segmentText,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Spacer(modifier = Modifier.height(3.dp))
+                                Box(
+                                    modifier = Modifier
+                                        .width(26.dp)
+                                        .height(2.5.dp)
+                                        .clip(RoundedCornerShape(2.dp))
+                                        .background(bottomLine)
+                                )
+                            }
+                        }
+                    }
+
+                    // Описание активного режима
+                    Surface(
+                        color = colorScheme.surfaceVariant,
+                        shape = RoundedCornerShape(10.dp),
+                        border = BorderStroke(1.dp, colorScheme.outline)
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 12.dp, vertical = 10.dp),
+                            verticalArrangement = Arrangement.spacedBy(3.dp)
+                        ) {
+                            Text(
+                                text = activeAppMode.title,
+                                style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.SemiBold),
+                                color = colorScheme.onSurface
+                            )
+                            Text(
+                                text = activeAppMode.subtitle,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+
+                    // Карточка статуса Shizuku (Второй экран)
+                    val shizukuOk = shizukuStatus.isBinderAlive && shizukuStatus.hasPermission
+                    Surface(
+                        color = colorScheme.background,
+                        shape = RoundedCornerShape(10.dp),
+                        border = BorderStroke(1.dp, colorScheme.outline)
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(12.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                RadioButton(
-                                    selected = isSelected,
-                                    onClick = null,
-                                    colors = RadioButtonDefaults.colors(
-                                        selectedColor = ElectricCyan,
-                                        unselectedColor = TextMuted
-                                    )
+                                Text(
+                                    text = "Служба Shizuku (Второй экран)",
+                                    style = MaterialTheme.typography.labelLarge,
+                                    color = colorScheme.onSurface,
+                                    modifier = Modifier.weight(1f)
                                 )
-                                Spacer(modifier = Modifier.width(10.dp))
-                                Column(
-                                    modifier = Modifier.weight(1f),
-                                    verticalArrangement = Arrangement.spacedBy(2.dp)
-                                ) {
-                                    Row(
-                                        modifier = Modifier.fillMaxWidth(),
-                                        horizontalArrangement = Arrangement.SpaceBetween,
-                                        verticalAlignment = Alignment.CenterVertically
-                                    ) {
-                                        Text(
-                                            text = mode.title,
-                                            style = MaterialTheme.typography.labelLarge.copy(
-                                                fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Medium
-                                            ),
-                                            color = if (isSelected) ElectricCyan else TextPrimary,
-                                            modifier = Modifier.weight(1f)
-                                        )
-                                        if (mode == AppMode.SHIZUKU_COCKPIT) {
-                                            Spacer(modifier = Modifier.width(6.dp))
-                                            val shizukuOk = shizukuStatus.isBinderAlive && shizukuStatus.hasPermission
-                                            Surface(
-                                                color = if (shizukuOk) SuccessBadgeBg else WarningBadgeBg,
-                                                shape = RoundedCornerShape(6.dp)
-                                            ) {
-                                                Text(
-                                                    text = shizukuStatus.statusLabel,
-                                                    style = MaterialTheme.typography.labelSmall.copy(
-                                                        fontWeight = FontWeight.SemiBold
-                                                    ),
-                                                    color = if (shizukuOk) SuccessBadgeFg else WarningBadgeFg,
-                                                    softWrap = false,
-                                                    maxLines = 1,
-                                                    modifier = Modifier
-                                                        .padding(horizontal = 8.dp, vertical = 3.dp)
-                                                        .testTag("shizuku_status_badge")
-                                                )
-                                            }
-                                        }
-                                    }
-                                    Text(
-                                        text = mode.subtitle,
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = TextSecondary
-                                    )
-                                }
+                                Spacer(modifier = Modifier.width(8.dp))
+                                VwStatusBadge(
+                                    label = shizukuStatus.statusLabel,
+                                    tone = if (shizukuOk) VwBadgeTone.ACTIVE else VwBadgeTone.WAITING,
+                                    modifier = Modifier.testTag("shizuku_status_badge")
+                                )
                             }
-
-                            if (mode == AppMode.SHIZUKU_COCKPIT) {
-                                Column(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .padding(start = 12.dp, end = 12.dp, bottom = 12.dp),
-                                    verticalArrangement = Arrangement.spacedBy(8.dp)
-                                ) {
-                                    Text(
-                                        text = "Статус Shizuku: ${shizukuStatus.statusLabel} • ${shizukuStatus.detailMessage}",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = if (shizukuStatus.hasPermission && shizukuStatus.isBinderAlive) {
-                                            TelemetryEmerald
-                                        } else {
-                                            AmberSignal
-                                        },
-                                        modifier = Modifier.testTag("shizuku_status_detail")
-                                    )
-                                    FilledTonalButton(
-                                        onClick = {
-                                            CarLifeShizukuManager.requestPermission(context)
-                                        },
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .heightIn(min = 48.dp)
-                                            .testTag("request_shizuku_permission_btn"),
-                                        shape = RoundedCornerShape(10.dp),
-                                        colors = ButtonDefaults.filledTonalButtonColors(
-                                            containerColor = if (shizukuStatus.hasPermission && shizukuStatus.isBinderAlive) {
-                                                SuccessBadgeBg
-                                            } else {
-                                                ElectricCyan.copy(alpha = 0.2f)
-                                            },
-                                            contentColor = if (shizukuStatus.hasPermission && shizukuStatus.isBinderAlive) {
-                                                SuccessBadgeFg
-                                            } else {
-                                                ElectricCyan
-                                            }
-                                        )
-                                    ) {
-                                        Text(
-                                            text = when {
-                                                shizukuStatus.isBinderAlive && shizukuStatus.hasPermission && shizukuStatus.isUserServiceBound ->
-                                                    "Shizuku подключён (Обновить)"
-                                                shizukuStatus.isBinderAlive && shizukuStatus.hasPermission ->
-                                                    "Подключить Shizuku UserService"
-                                                else ->
-                                                    "Запросить права Shizuku"
-                                            },
-                                            fontWeight = FontWeight.SemiBold
-                                        )
-                                    }
-                                }
+                            Text(
+                                text = "Статус Shizuku: ${shizukuStatus.statusLabel} • ${shizukuStatus.detailMessage}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = if (shizukuOk) vw.onSuccessContainer else colorScheme.onSurfaceVariant,
+                                modifier = Modifier.testTag("shizuku_status_detail")
+                            )
+                            FilledTonalButton(
+                                onClick = {
+                                    CarLifeShizukuManager.requestPermission(context)
+                                },
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .heightIn(min = 48.dp)
+                                    .testTag("request_shizuku_permission_btn"),
+                                shape = RoundedCornerShape(10.dp),
+                                colors = ButtonDefaults.filledTonalButtonColors(
+                                    containerColor = if (shizukuOk) vw.successContainer else colorScheme.primaryContainer,
+                                    contentColor = if (shizukuOk) vw.onSuccessContainer else colorScheme.onPrimaryContainer
+                                )
+                            ) {
+                                Text(
+                                    text = when {
+                                        shizukuStatus.isBinderAlive && shizukuStatus.hasPermission && shizukuStatus.isUserServiceBound ->
+                                            "Shizuku подключён (Обновить)"
+                                        shizukuStatus.isBinderAlive && shizukuStatus.hasPermission ->
+                                            "Подключить Shizuku UserService"
+                                        else ->
+                                            "Запросить права Shizuku"
+                                    },
+                                    fontWeight = FontWeight.SemiBold
+                                )
                             }
                         }
                     }
@@ -1743,10 +2008,9 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                     }
                     val effectiveDiagnosticError = mpError ?: projStats.lastMediaProjectionError
                     val diagBorderColor = when {
-                        effectiveDiagnosticError != null -> CoralAlert.copy(alpha = 0.75f)
-                        audioStatsForDiag.isSilenceWarningActive -> AmberSignal.copy(alpha = 0.8f)
-                        projStats.usingMediaProjection || mpIsActive -> TelemetryEmerald.copy(alpha = 0.7f)
-                        else -> AmberSignal.copy(alpha = 0.7f)
+                        effectiveDiagnosticError != null -> colorScheme.error.copy(alpha = 0.7f)
+                        audioStatsForDiag.isSilenceWarningActive -> vw.statusWarningDot.copy(alpha = 0.7f)
+                        else -> colorScheme.outline
                     }
                     val disableSpeakerMuteNow = {
                         BridgeTelemetryBus.setMutePhoneSpeakerDuringUsbAudio(false, context)
@@ -1763,7 +2027,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                         modifier = Modifier
                             .fillMaxWidth()
                             .testTag("mediaprojection_diagnostic_panel"),
-                        color = ObsidianBackground,
+                        color = colorScheme.background,
                         shape = RoundedCornerShape(12.dp),
                         border = BorderStroke(1.dp, diagBorderColor)
                     ) {
@@ -1782,35 +2046,23 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                 Text(
                                     text = "Диагностика Зеркалирования (5 узлов)",
                                     style = MaterialTheme.typography.labelLarge,
-                                    color = TextPrimary,
+                                    color = colorScheme.onSurface,
                                     modifier = Modifier.weight(1f)
                                 )
                                 Spacer(modifier = Modifier.width(8.dp))
-                                val mpChipBg = when {
-                                    effectiveDiagnosticError != null -> WarningBadgeBg
-                                    projStats.usingMediaProjection || mpIsActive -> SuccessBadgeBg
-                                    else -> ObsidianSurfaceHigh
-                                }
-                                val mpChipFg = when {
-                                    effectiveDiagnosticError != null -> CoralAlert
-                                    projStats.usingMediaProjection || mpIsActive -> SuccessBadgeFg
-                                    else -> AmberSignal
-                                }
-                                Surface(color = mpChipBg, shape = RoundedCornerShape(6.dp)) {
-                                    Text(
-                                        text = when {
-                                            projStats.usingMediaProjection || mpIsActive -> "MP LIVE"
-                                            mpHasPending -> "ТОКЕН ГОТОВ"
-                                            effectiveDiagnosticError != null -> "ОШИБКА MP"
-                                            else -> "НЕТ ТОКЕНА"
-                                        },
-                                        style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
-                                        color = mpChipFg,
-                                        softWrap = false,
-                                        maxLines = 1,
-                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
-                                    )
-                                }
+                                VwStatusBadge(
+                                    label = when {
+                                        projStats.usingMediaProjection || mpIsActive -> "MP LIVE"
+                                        mpHasPending -> "ТОКЕН ГОТОВ"
+                                        effectiveDiagnosticError != null -> "ОШИБКА MP"
+                                        else -> "НЕТ ТОКЕНА"
+                                    },
+                                    tone = when {
+                                        effectiveDiagnosticError != null -> VwBadgeTone.ERROR
+                                        projStats.usingMediaProjection || mpIsActive -> VwBadgeTone.ACTIVE
+                                        else -> VwBadgeTone.WAITING
+                                    }
+                                )
                             }
 
                             // Узел 1: Режим и запрет тихого отката
@@ -1903,16 +2155,16 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                 Text(
                                     text = "Причина / ошибка: $effectiveDiagnosticError",
                                     style = MaterialTheme.typography.labelSmall,
-                                    color = CoralAlert,
+                                    color = colorScheme.error,
                                     modifier = Modifier.testTag("mediaprojection_diagnostic_error")
                                 )
                             }
 
                             if (audioStatsForDiag.isSilenceWarningActive && !audioStatsForDiag.silenceWarningMessage.isNullOrBlank()) {
                                 Surface(
-                                    color = WarningBadgeBg,
+                                    color = vw.warningContainer,
                                     shape = RoundedCornerShape(10.dp),
-                                    border = BorderStroke(1.dp, AmberSignal.copy(alpha = 0.7f)),
+                                    border = BorderStroke(1.dp, vw.statusWarningDot.copy(alpha = 0.6f)),
                                     modifier = Modifier
                                         .fillMaxWidth()
                                         .testTag("mute_silence_warning_banner")
@@ -1926,7 +2178,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                         Text(
                                             text = audioStatsForDiag.silenceWarningMessage,
                                             style = MaterialTheme.typography.labelSmall,
-                                            color = WarningBadgeFg
+                                            color = vw.onWarningContainer
                                         )
                                         FilledTonalButton(
                                             onClick = disableSpeakerMuteNow,
@@ -1936,8 +2188,8 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                                 .testTag("disable_mute_silence_warning_btn"),
                                             shape = RoundedCornerShape(8.dp),
                                             colors = ButtonDefaults.filledTonalButtonColors(
-                                                containerColor = AmberSignal.copy(alpha = 0.25f),
-                                                contentColor = WarningBadgeFg
+                                                containerColor = vw.statusWarningDot.copy(alpha = 0.22f),
+                                                contentColor = vw.onWarningContainer
                                             )
                                         ) {
                                             Text(
@@ -1960,8 +2212,8 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                         .testTag("request_mediaprojection_diag_btn"),
                                     shape = RoundedCornerShape(10.dp),
                                     colors = ButtonDefaults.filledTonalButtonColors(
-                                        containerColor = ElectricCyan.copy(alpha = 0.2f),
-                                        contentColor = ElectricCyan
+                                        containerColor = colorScheme.primaryContainer,
+                                        contentColor = colorScheme.onPrimaryContainer
                                     )
                                 ) {
                                     Text(
@@ -1979,8 +2231,8 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                         .heightIn(min = 48.dp)
                                         .testTag("mirroring_open_a11y_btn"),
                                     shape = RoundedCornerShape(10.dp),
-                                    border = BorderStroke(1.dp, AmberSignal.copy(alpha = 0.7f)),
-                                    colors = ButtonDefaults.outlinedButtonColors(contentColor = AmberSignal)
+                                    border = BorderStroke(1.dp, vw.statusWarningDot.copy(alpha = 0.7f)),
+                                    colors = ButtonDefaults.outlinedButtonColors(contentColor = vw.onWarningContainer)
                                 ) {
                                     Text(
                                         text = "Включить службу тача (Спец. возможности)",
@@ -1996,9 +2248,9 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                         modifier = Modifier
                             .fillMaxWidth()
                             .heightIn(min = 48.dp)
-                            .clip(RoundedCornerShape(12.dp))
-                            .background(ObsidianBackground)
-                            .border(1.dp, ObsidianBorder, RoundedCornerShape(12.dp))
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(colorScheme.background)
+                            .border(1.dp, colorScheme.outline, RoundedCornerShape(10.dp))
                             .padding(horizontal = 12.dp, vertical = 8.dp),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
@@ -2012,7 +2264,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                             Text(
                                 text = "Логировать пакеты в UI",
                                 style = MaterialTheme.typography.labelLarge,
-                                color = TextPrimary
+                                color = colorScheme.onSurface
                             )
                             Text(
                                 text = if (state.logPacketsInUi) {
@@ -2021,7 +2273,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                     "Выкл — ноль лишних перерисовок Compose при 30 fps и аудио PCM"
                                 },
                                 style = MaterialTheme.typography.labelSmall,
-                                color = TextSecondary
+                                color = colorScheme.onSurfaceVariant
                             )
                         }
                         Switch(
@@ -2038,10 +2290,10 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                             },
                             modifier = Modifier.testTag("log_packets_ui_switch"),
                             colors = SwitchDefaults.colors(
-                                checkedThumbColor = ObsidianBackground,
-                                checkedTrackColor = ElectricCyan,
-                                uncheckedThumbColor = TextSecondary,
-                                uncheckedTrackColor = ObsidianSurfaceHigh
+                                checkedThumbColor = colorScheme.onPrimary,
+                                checkedTrackColor = colorScheme.primary,
+                                uncheckedThumbColor = colorScheme.onSurfaceVariant,
+                                uncheckedTrackColor = colorScheme.surfaceVariant
                             )
                         )
                     }
@@ -2053,9 +2305,10 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
         item {
             Card(
                 modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(16.dp),
-                colors = CardDefaults.cardColors(containerColor = ObsidianSurface),
-                border = BorderStroke(1.dp, ObsidianBorder)
+                shape = RoundedCornerShape(14.dp),
+                colors = CardDefaults.cardColors(containerColor = colorScheme.surface),
+                elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
+                border = BorderStroke(1.dp, colorScheme.outline)
             ) {
                 Column(
                     modifier = Modifier
@@ -2076,35 +2329,24 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                 VideoSourceMode.CANVAS_TEST_CARD -> "Источник H.264: Тест-карта (Canvas)"
                             },
                             style = MaterialTheme.typography.titleMedium,
-                            color = TextPrimary,
+                            color = colorScheme.onSurface,
                             maxLines = 2,
                             overflow = TextOverflow.Ellipsis,
                             modifier = Modifier.weight(1f)
                         )
                         Spacer(modifier = Modifier.width(8.dp))
-                        Surface(
-                            color = if (state.projectionStats.isRunning) SuccessBadgeBg else ObsidianSurfaceHigh,
-                            shape = RoundedCornerShape(8.dp)
-                        ) {
-                            Text(
-                                text = when {
-                                    state.projectionStats.isRunning && sourceMode == VideoSourceMode.SCREEN_MIRRORING ->
-                                        if (state.projectionStats.usingMediaProjection) "MIRROR ON" else "ЖДЁТ MP"
-                                    state.projectionStats.isRunning && sourceMode == VideoSourceMode.CANVAS_TEST_CARD -> "CANVAS 30FPS"
-                                    state.projectionStats.isRunning -> "VD #${state.projectionStats.virtualDisplayId} АКТИВЕН"
-                                    sourceMode == VideoSourceMode.SCREEN_MIRRORING -> "MIRROR ВЫКЛ"
-                                    sourceMode == VideoSourceMode.CANVAS_TEST_CARD -> "CANVAS ВЫКЛ"
-                                    else -> "VD ВЫКЛ"
-                                },
-                                style = MaterialTheme.typography.labelSmall.copy(
-                                    fontWeight = FontWeight.SemiBold
-                                ),
-                                color = if (state.projectionStats.isRunning) SuccessBadgeFg else TextSecondary,
-                                softWrap = false,
-                                maxLines = 1,
-                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
-                            )
-                        }
+                        VwStatusBadge(
+                            label = when {
+                                state.projectionStats.isRunning && sourceMode == VideoSourceMode.SCREEN_MIRRORING ->
+                                    if (state.projectionStats.usingMediaProjection) "MIRROR ON" else "ЖДЁТ MP"
+                                state.projectionStats.isRunning && sourceMode == VideoSourceMode.CANVAS_TEST_CARD -> "CANVAS 30FPS"
+                                state.projectionStats.isRunning -> "VD #${state.projectionStats.virtualDisplayId}"
+                                sourceMode == VideoSourceMode.SCREEN_MIRRORING -> "MIRROR ВЫКЛ"
+                                sourceMode == VideoSourceMode.CANVAS_TEST_CARD -> "CANVAS ВЫКЛ"
+                                else -> "VD ВЫКЛ"
+                            },
+                            tone = if (state.projectionStats.isRunning) VwBadgeTone.ACTIVE else VwBadgeTone.WAITING
+                        )
                     }
 
                     Row(
@@ -2146,9 +2388,9 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                     }
 
                     Surface(
-                        color = ObsidianBackground,
+                        color = colorScheme.background,
                         shape = RoundedCornerShape(10.dp),
-                        border = BorderStroke(1.dp, ObsidianBorder)
+                        border = BorderStroke(1.dp, colorScheme.outline)
                     ) {
                         val vdStatusLine = if (state.projectionStats.isRunning && !lastLaunchStatus.startsWith("Запущено:")) {
                             when (state.videoSourceMode) {
@@ -2175,12 +2417,12 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                         }
                         Text(
                             text = vdStatusLine,
-                            style = MaterialTheme.typography.labelMedium,
+                            style = MaterialTheme.typography.labelMedium.tabular(),
                             color = when {
                                 state.videoSourceMode == VideoSourceMode.SCREEN_MIRRORING &&
-                                    !state.projectionStats.usingMediaProjection -> AmberSignal
-                                state.projectionStats.isRunning -> TelemetryEmerald
-                                else -> TextSecondary
+                                    !state.projectionStats.usingMediaProjection -> vw.onWarningContainer
+                                state.projectionStats.isRunning -> vw.onSuccessContainer
+                                else -> colorScheme.onSurfaceVariant
                             },
                             maxLines = 2,
                             overflow = TextOverflow.Ellipsis,
@@ -2200,32 +2442,25 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                 CarLifeAudioCaptureManager.hasRecordAudioPermission(context)
             }
             val audioBadgeText = when {
-                audioStats.isCapturing -> "PCM 48КГЦ ON"
-                !hasRecordAudioPerm -> "НЕТ RECORD_AUDIO"
+                audioStats.isCapturing -> "PCM 48КГЦ"
+                !hasRecordAudioPerm -> "НЕТ ПРАВ"
                 !checklistStatus.step5MediaProjectionGranted -> "НЕТ ЭКРАНА"
-                else -> "ГОТОВ 0x0003"
+                else -> "ГОТОВ"
             }
-            val audioBadgeBg = when {
-                audioStats.isCapturing -> SuccessBadgeBg
-                !hasRecordAudioPerm -> WarningBadgeBg
-                else -> ObsidianSurfaceHigh
-            }
-            val audioBadgeFg = when {
-                audioStats.isCapturing -> SuccessBadgeFg
-                !hasRecordAudioPerm -> WarningBadgeFg
-                else -> TextSecondary
+            val audioBadgeTone = when {
+                audioStats.isCapturing -> VwBadgeTone.ACTIVE
+                !hasRecordAudioPerm -> VwBadgeTone.WARNING
+                else -> VwBadgeTone.WAITING
             }
 
             Card(
                 modifier = Modifier
                     .fillMaxWidth()
                     .testTag("usb_audio_0x0003_card"),
-                shape = RoundedCornerShape(16.dp),
-                colors = CardDefaults.cardColors(containerColor = ObsidianSurface),
-                border = BorderStroke(
-                    1.dp,
-                    if (audioStats.isCapturing) TelemetryEmerald.copy(alpha = 0.7f) else ObsidianBorder
-                )
+                shape = RoundedCornerShape(14.dp),
+                colors = CardDefaults.cardColors(containerColor = colorScheme.surface),
+                elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
+                border = BorderStroke(1.dp, colorScheme.outline)
             ) {
                 Column(
                     modifier = Modifier
@@ -2242,41 +2477,32 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                             Text(
                                 text = "Звук по USB AOA (канал 0x0003)",
                                 style = MaterialTheme.typography.titleMedium,
-                                color = TextPrimary
+                                color = colorScheme.onSurface
                             )
                             Spacer(modifier = Modifier.height(2.dp))
                             Text(
                                 text = "48 кГц Stereo 16-bit PCM (4096B) • Звонки HFP на Bluetooth авто",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = TextSecondary
+                                style = MaterialTheme.typography.labelSmall.tabular(),
+                                color = colorScheme.onSurfaceVariant
                             )
                         }
                         Spacer(modifier = Modifier.width(8.dp))
-                        Surface(
-                            color = audioBadgeBg,
-                            shape = RoundedCornerShape(8.dp)
-                        ) {
-                            Text(
-                                text = audioBadgeText,
-                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
-                                color = audioBadgeFg,
-                                softWrap = false,
-                                maxLines = 1,
-                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
-                            )
-                        }
+                        VwStatusBadge(
+                            label = audioBadgeText,
+                            tone = audioBadgeTone
+                        )
                     }
 
                     Text(
                         text = "Системный звук (Я.Музыка, Навигатор, 2ГИС, YouTube) захватывается через AudioPlaybackCapture и передаётся в канал 0x0003 (AOA 20B). Паузы тишины пропускаются.",
                         style = MaterialTheme.typography.bodySmall,
-                        color = TextSecondary
+                        color = colorScheme.onSurfaceVariant
                     )
 
                     Surface(
-                        color = ObsidianBackground,
+                        color = colorScheme.background,
                         shape = RoundedCornerShape(10.dp),
-                        border = BorderStroke(1.dp, ObsidianBorder)
+                        border = BorderStroke(1.dp, colorScheme.outline)
                     ) {
                         Column(
                             modifier = Modifier
@@ -2287,14 +2513,14 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                             Text(
                                 text = audioStats.statusMessage,
                                 style = MaterialTheme.typography.labelMedium,
-                                color = if (audioStats.isCapturing) TelemetryEmerald else TextSecondary,
+                                color = if (audioStats.isCapturing) vw.onSuccessContainer else colorScheme.onSurfaceVariant,
                                 maxLines = 2,
                                 overflow = TextOverflow.Ellipsis
                             )
                             Text(
                                 text = "INIT: ${audioStats.sentInitPackets} • PCM: ${audioStats.sentPcmPackets} пак. (${audioStats.sentPcmBytes / 1024} КБ) • Тишина пропущена: ${audioStats.skippedSilentPackets}",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = TextMuted
+                                style = MaterialTheme.typography.labelSmall.tabular(),
+                                color = vw.textMuted
                             )
                         }
                     }
@@ -2304,9 +2530,9 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                         modifier = Modifier
                             .fillMaxWidth()
                             .heightIn(min = 48.dp)
-                            .clip(RoundedCornerShape(12.dp))
-                            .background(ObsidianBackground)
-                            .border(1.dp, ObsidianBorder, RoundedCornerShape(12.dp))
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(colorScheme.background)
+                            .border(1.dp, colorScheme.outline, RoundedCornerShape(10.dp))
                             .padding(horizontal = 12.dp, vertical = 8.dp),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
@@ -2320,7 +2546,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                             Text(
                                 text = "Глушить динамик телефона при USB-звуке",
                                 style = MaterialTheme.typography.labelLarge,
-                                color = TextPrimary
+                                color = colorScheme.onSurface
                             )
                             Text(
                                 text = if (audioStats.isPhoneSpeakerMutedByBridge) {
@@ -2328,8 +2554,8 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                 } else {
                                     "При старте захвата 0x0003 сохраняет STREAM_MUSIC, ставит 0 и возвращает при остановке/отключении USB"
                                 },
-                                style = MaterialTheme.typography.labelSmall,
-                                color = if (audioStats.isPhoneSpeakerMutedByBridge) TelemetryEmerald else TextSecondary
+                                style = MaterialTheme.typography.labelSmall.tabular(),
+                                color = if (audioStats.isPhoneSpeakerMutedByBridge) vw.onSuccessContainer else colorScheme.onSurfaceVariant
                             )
                         }
                         Switch(
@@ -2346,19 +2572,19 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                             },
                             modifier = Modifier.testTag("mute_speaker_usb_audio_switch"),
                             colors = SwitchDefaults.colors(
-                                checkedThumbColor = ObsidianBackground,
-                                checkedTrackColor = TelemetryEmerald,
-                                uncheckedThumbColor = TextSecondary,
-                                uncheckedTrackColor = ObsidianSurfaceHigh
+                                checkedThumbColor = colorScheme.onPrimary,
+                                checkedTrackColor = vw.statusActiveDot,
+                                uncheckedThumbColor = colorScheme.onSurfaceVariant,
+                                uncheckedTrackColor = colorScheme.surfaceVariant
                             )
                         )
                     }
 
                     if (audioStats.isSilenceWarningActive && !audioStats.silenceWarningMessage.isNullOrBlank()) {
                         Surface(
-                            color = WarningBadgeBg,
+                            color = vw.warningContainer,
                             shape = RoundedCornerShape(10.dp),
-                            border = BorderStroke(1.dp, AmberSignal.copy(alpha = 0.7f)),
+                            border = BorderStroke(1.dp, vw.statusWarningDot.copy(alpha = 0.6f)),
                             modifier = Modifier.fillMaxWidth()
                         ) {
                             Column(
@@ -2370,7 +2596,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                 Text(
                                     text = audioStats.silenceWarningMessage,
                                     style = MaterialTheme.typography.labelSmall,
-                                    color = WarningBadgeFg
+                                    color = vw.onWarningContainer
                                 )
                                 FilledTonalButton(
                                     onClick = {
@@ -2389,8 +2615,8 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                         .testTag("audio_card_disable_mute_btn"),
                                     shape = RoundedCornerShape(8.dp),
                                     colors = ButtonDefaults.filledTonalButtonColors(
-                                        containerColor = AmberSignal.copy(alpha = 0.25f),
-                                        contentColor = WarningBadgeFg
+                                        containerColor = vw.statusWarningDot.copy(alpha = 0.22f),
+                                        contentColor = vw.onWarningContainer
                                     )
                                 ) {
                                     Text(
@@ -2426,8 +2652,8 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                             .heightIn(min = 48.dp)
                             .testTag("audio_0x0003_action_btn"),
                         colors = ButtonDefaults.buttonColors(
-                            containerColor = if (audioStats.isCapturing) ObsidianSurfaceHigh else ElectricCyan,
-                            contentColor = if (audioStats.isCapturing) TextPrimary else Color(0xFF001D24)
+                            containerColor = if (audioStats.isCapturing) colorScheme.error else colorScheme.primary,
+                            contentColor = if (audioStats.isCapturing) colorScheme.onError else colorScheme.onPrimary
                         ),
                         shape = RoundedCornerShape(10.dp)
                     ) {
@@ -2452,12 +2678,10 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                 modifier = Modifier
                     .fillMaxWidth()
                     .testTag("accessibility_touch_service_card"),
-                shape = RoundedCornerShape(16.dp),
-                colors = CardDefaults.cardColors(containerColor = ObsidianSurface),
-                border = BorderStroke(
-                    1.dp,
-                    if (isTouchServiceOn) TelemetryEmerald.copy(alpha = 0.7f) else AmberSignal.copy(alpha = 0.7f)
-                )
+                shape = RoundedCornerShape(14.dp),
+                colors = CardDefaults.cardColors(containerColor = colorScheme.surface),
+                elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
+                border = BorderStroke(1.dp, colorScheme.outline)
             ) {
                 Column(
                     modifier = Modifier
@@ -2474,35 +2698,26 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                             Text(
                                 text = "Служба тача (Спец. возможности)",
                                 style = MaterialTheme.typography.titleMedium,
-                                color = TextPrimary
+                                color = colorScheme.onSurface
                             )
                             Spacer(modifier = Modifier.height(2.dp))
                             Text(
                                 text = "CarLifeAccessibilityService • Тапы, свайпы карт и Назад/Домой (канал 0x0006)",
                                 style = MaterialTheme.typography.labelSmall,
-                                color = TextSecondary
+                                color = colorScheme.onSurfaceVariant
                             )
                         }
                         Spacer(modifier = Modifier.width(8.dp))
-                        Surface(
-                            color = if (isTouchServiceOn) SuccessBadgeBg else WarningBadgeBg,
-                            shape = RoundedCornerShape(8.dp)
-                        ) {
-                            Text(
-                                text = if (isTouchServiceOn) "Вкл" else "Выкл",
-                                style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
-                                color = if (isTouchServiceOn) SuccessBadgeFg else WarningBadgeFg,
-                                softWrap = false,
-                                maxLines = 1,
-                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
-                            )
-                        }
+                        VwStatusBadge(
+                            label = if (isTouchServiceOn) "Вкл" else "Выкл",
+                            tone = if (isTouchServiceOn) VwBadgeTone.ACTIVE else VwBadgeTone.WARNING
+                        )
                     }
 
                     Text(
                         text = "Переводит касания с экрана ГУ (1280×720) в реальные координаты смартфона с учётом ориентации и выполняет тапы (50 мс) и свайпы карт в любых приложениях (2ГИС, Яндекс.Навигатор, YouTube).",
                         style = MaterialTheme.typography.bodySmall,
-                        color = TextSecondary
+                        color = colorScheme.onSurfaceVariant
                     )
 
                     Button(
@@ -2512,8 +2727,8 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                             .heightIn(min = 48.dp)
                             .testTag("enable_accessibility_touch_btn"),
                         colors = ButtonDefaults.buttonColors(
-                            containerColor = if (isTouchServiceOn) ObsidianSurfaceHigh else ElectricCyan,
-                            contentColor = if (isTouchServiceOn) TextPrimary else Color(0xFF001D24)
+                            containerColor = if (isTouchServiceOn) colorScheme.surfaceVariant else colorScheme.primary,
+                            contentColor = if (isTouchServiceOn) colorScheme.onSurface else colorScheme.onPrimary
                         ),
                         shape = RoundedCornerShape(10.dp)
                     ) {
@@ -2557,9 +2772,10 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                 modifier = Modifier
                     .fillMaxWidth()
                     .testTag("video_source_card"),
-                shape = RoundedCornerShape(16.dp),
-                colors = CardDefaults.cardColors(containerColor = ObsidianSurface),
-                border = BorderStroke(1.dp, TelemetryEmerald.copy(alpha = 0.7f))
+                shape = RoundedCornerShape(14.dp),
+                colors = CardDefaults.cardColors(containerColor = colorScheme.surface),
+                elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
+                border = BorderStroke(1.dp, colorScheme.outline)
             ) {
                 Column(
                     modifier = Modifier
@@ -2576,50 +2792,30 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                             Text(
                                 text = "Источник видео",
                                 style = MaterialTheme.typography.titleMedium,
-                                color = TextPrimary
+                                color = colorScheme.onSurface
                             )
                             Spacer(modifier = Modifier.height(2.dp))
                             Text(
                                 text = "Выбор входа для H.264 MediaCodec (1280×720@30fps, 2000 kbps, AOA 20B)",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = TextSecondary
+                                style = MaterialTheme.typography.labelSmall.tabular(),
+                                color = colorScheme.onSurfaceVariant
                             )
                         }
                         Spacer(modifier = Modifier.width(8.dp))
-                        Surface(
-                            color = TelemetryEmerald.copy(alpha = 0.16f),
-                            shape = RoundedCornerShape(8.dp),
-                            border = BorderStroke(1.dp, TelemetryEmerald.copy(alpha = 0.65f))
-                        ) {
-                            Text(
-                                text = when (activeSource) {
-                                    VideoSourceMode.SCREEN_MIRRORING -> "MIRROR"
-                                    VideoSourceMode.VIRTUAL_DISPLAY -> "VD"
-                                    VideoSourceMode.CANVAS_TEST_CARD -> "CANVAS"
-                                },
-                                style = MaterialTheme.typography.labelSmall.copy(
-                                    fontWeight = FontWeight.SemiBold
-                                ),
-                                color = TelemetryEmerald,
-                                softWrap = false,
-                                maxLines = 1,
-                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
-                            )
-                        }
+                        VwStatusBadge(
+                            label = when (activeSource) {
+                                VideoSourceMode.SCREEN_MIRRORING -> "MIRROR"
+                                VideoSourceMode.VIRTUAL_DISPLAY -> "VD"
+                                VideoSourceMode.CANVAS_TEST_CARD -> "CANVAS"
+                            },
+                            tone = VwBadgeTone.ACTIVE
+                        )
                     }
 
                     VideoSourceMode.entries.forEach { mode ->
                         val isSelected = activeSource == mode
-                        val rowBg = if (isSelected) {
-                            TelemetryEmerald.copy(alpha = 0.12f)
-                        } else {
-                            ObsidianBackground
-                        }
-                        val rowBorder = if (isSelected) {
-                            TelemetryEmerald
-                        } else {
-                            ObsidianBorder
-                        }
+                        val rowBg = if (isSelected) colorScheme.primaryContainer.copy(alpha = 0.45f) else colorScheme.background
+                        val rowBorder = if (isSelected) colorScheme.primary else colorScheme.outline
                         val tag = when (mode) {
                             VideoSourceMode.SCREEN_MIRRORING -> "video_source_mirror_btn"
                             VideoSourceMode.VIRTUAL_DISPLAY -> "video_source_vd_btn"
@@ -2629,9 +2825,9 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .heightIn(min = 48.dp)
-                                .clip(RoundedCornerShape(12.dp))
+                                .clip(RoundedCornerShape(10.dp))
                                 .background(rowBg)
-                                .border(1.dp, rowBorder, RoundedCornerShape(12.dp))
+                                .border(1.dp, rowBorder, RoundedCornerShape(10.dp))
                                 .selectable(
                                     selected = isSelected,
                                     onClick = { selectVideoSource(mode) },
@@ -2645,8 +2841,8 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                 selected = isSelected,
                                 onClick = null,
                                 colors = RadioButtonDefaults.colors(
-                                    selectedColor = TelemetryEmerald,
-                                    unselectedColor = TextMuted
+                                    selectedColor = colorScheme.primary,
+                                    unselectedColor = vw.textMuted
                                 )
                             )
                             Spacer(modifier = Modifier.width(10.dp))
@@ -2659,12 +2855,12 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                     style = MaterialTheme.typography.labelLarge.copy(
                                         fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Medium
                                     ),
-                                    color = if (isSelected) TelemetryEmerald else TextPrimary
+                                    color = if (isSelected) colorScheme.primary else colorScheme.onSurface
                                 )
                                 Text(
                                     text = mode.subtitle,
                                     style = MaterialTheme.typography.labelSmall,
-                                    color = TextSecondary
+                                    color = colorScheme.onSurfaceVariant
                                 )
                             }
                         }
@@ -2691,9 +2887,10 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                 modifier = Modifier
                     .fillMaxWidth()
                     .testTag("app_launch_mode_card"),
-                shape = RoundedCornerShape(16.dp),
-                colors = CardDefaults.cardColors(containerColor = ObsidianSurface),
-                border = BorderStroke(1.dp, ElectricCyan.copy(alpha = 0.7f))
+                shape = RoundedCornerShape(14.dp),
+                colors = CardDefaults.cardColors(containerColor = colorScheme.surface),
+                elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
+                border = BorderStroke(1.dp, colorScheme.outline)
             ) {
                 Column(
                     modifier = Modifier
@@ -2710,50 +2907,30 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                             Text(
                                 text = "Режим запуска приложений",
                                 style = MaterialTheme.typography.titleMedium,
-                                color = TextPrimary
+                                color = colorScheme.onSurface
                             )
                             Spacer(modifier = Modifier.height(2.dp))
                             Text(
                                 text = "При SecurityException на VD выполняется мгновенный запасной запуск без ActivityOptions",
                                 style = MaterialTheme.typography.labelSmall,
-                                color = TextSecondary
+                                color = colorScheme.onSurfaceVariant
                             )
                         }
                         Spacer(modifier = Modifier.width(8.dp))
-                        Surface(
-                            color = ElectricCyan.copy(alpha = 0.16f),
-                            shape = RoundedCornerShape(8.dp),
-                            border = BorderStroke(1.dp, ElectricCyan.copy(alpha = 0.65f))
-                        ) {
-                            Text(
-                                text = when (activeLaunchMode) {
-                                    AppLaunchMode.VIRTUAL_DISPLAY_IF_AVAILABLE -> "VD"
-                                    AppLaunchMode.SCREEN_MIRRORING -> "MIRROR"
-                                    AppLaunchMode.SHIZUKU_VIRTUAL_DISPLAY -> "SHIZUKU"
-                                },
-                                style = MaterialTheme.typography.labelSmall.copy(
-                                    fontWeight = FontWeight.SemiBold
-                                ),
-                                color = ElectricCyan,
-                                softWrap = false,
-                                maxLines = 1,
-                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
-                            )
-                        }
+                        VwStatusBadge(
+                            label = when (activeLaunchMode) {
+                                AppLaunchMode.VIRTUAL_DISPLAY_IF_AVAILABLE -> "VD"
+                                AppLaunchMode.SCREEN_MIRRORING -> "MIRROR"
+                                AppLaunchMode.SHIZUKU_VIRTUAL_DISPLAY -> "SHIZUKU"
+                            },
+                            tone = VwBadgeTone.WAITING
+                        )
                     }
 
                     AppLaunchMode.entries.forEach { mode ->
                         val isSelected = activeLaunchMode == mode
-                        val rowBg = if (isSelected) {
-                            ElectricCyan.copy(alpha = 0.12f)
-                        } else {
-                            ObsidianBackground
-                        }
-                        val rowBorder = if (isSelected) {
-                            ElectricCyan
-                        } else {
-                            ObsidianBorder
-                        }
+                        val rowBg = if (isSelected) colorScheme.primaryContainer.copy(alpha = 0.45f) else colorScheme.background
+                        val rowBorder = if (isSelected) colorScheme.primary else colorScheme.outline
                         val tag = when (mode) {
                             AppLaunchMode.VIRTUAL_DISPLAY_IF_AVAILABLE -> "launch_mode_vd_btn"
                             AppLaunchMode.SCREEN_MIRRORING -> "launch_mode_mirror_btn"
@@ -2763,9 +2940,9 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .heightIn(min = 48.dp)
-                                .clip(RoundedCornerShape(12.dp))
+                                .clip(RoundedCornerShape(10.dp))
                                 .background(rowBg)
-                                .border(1.dp, rowBorder, RoundedCornerShape(12.dp))
+                                .border(1.dp, rowBorder, RoundedCornerShape(10.dp))
                                 .selectable(
                                     selected = isSelected,
                                     onClick = { selectAppLaunchMode(mode) },
@@ -2779,8 +2956,8 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                 selected = isSelected,
                                 onClick = null,
                                 colors = RadioButtonDefaults.colors(
-                                    selectedColor = ElectricCyan,
-                                    unselectedColor = TextMuted
+                                    selectedColor = colorScheme.primary,
+                                    unselectedColor = vw.textMuted
                                 )
                             )
                             Spacer(modifier = Modifier.width(10.dp))
@@ -2793,12 +2970,12 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                     style = MaterialTheme.typography.labelLarge.copy(
                                         fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Medium
                                     ),
-                                    color = if (isSelected) ElectricCyan else TextPrimary
+                                    color = if (isSelected) colorScheme.primary else colorScheme.onSurface
                                 )
                                 Text(
                                     text = mode.subtitle,
                                     style = MaterialTheme.typography.labelSmall,
-                                    color = TextSecondary
+                                    color = colorScheme.onSurfaceVariant
                                 )
                             }
                         }
@@ -2825,9 +3002,10 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                 modifier = Modifier
                     .fillMaxWidth()
                     .testTag("handshake_lab_card"),
-                shape = RoundedCornerShape(16.dp),
-                colors = CardDefaults.cardColors(containerColor = ObsidianSurface),
-                border = BorderStroke(1.dp, ElectricCyan.copy(alpha = 0.7f))
+                shape = RoundedCornerShape(14.dp),
+                colors = CardDefaults.cardColors(containerColor = colorScheme.surface),
+                elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
+                border = BorderStroke(1.dp, colorScheme.outline)
             ) {
                 Column(
                     modifier = Modifier
@@ -2844,53 +3022,33 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                             Text(
                                 text = "Тест рукопожатия 0x0001",
                                 style = MaterialTheme.typography.titleMedium,
-                                color = TextPrimary
+                                color = colorScheme.onSurface
                             )
                             Spacer(modifier = Modifier.height(2.dp))
                             Text(
                                 text = "Режим ответа на MSG_CMD_HU_PROTOCOL_VERSION (0x00018001) от ГУ Jetta VS7",
                                 style = MaterialTheme.typography.labelSmall,
-                                color = TextSecondary
+                                color = colorScheme.onSurfaceVariant
                             )
                         }
                         Spacer(modifier = Modifier.width(8.dp))
-                        Surface(
-                            color = ElectricCyan.copy(alpha = 0.16f),
-                            shape = RoundedCornerShape(8.dp),
-                            border = BorderStroke(1.dp, ElectricCyan.copy(alpha = 0.65f))
-                        ) {
-                            Text(
-                                text = "ТЕСТ ${activeProfile.id}/4",
-                                style = MaterialTheme.typography.labelSmall.copy(
-                                    fontWeight = FontWeight.SemiBold
-                                ),
-                                color = ElectricCyan,
-                                softWrap = false,
-                                maxLines = 1,
-                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
-                            )
-                        }
+                        VwStatusBadge(
+                            label = "ТЕСТ ${activeProfile.id}/4",
+                            tone = VwBadgeTone.WAITING
+                        )
                     }
 
                     HandshakeTestProfile.entries.forEach { profile ->
                         val isSelected = activeProfile == profile
-                        val rowBg = if (isSelected) {
-                            ElectricCyan.copy(alpha = 0.12f)
-                        } else {
-                            ObsidianBackground
-                        }
-                        val rowBorder = if (isSelected) {
-                            ElectricCyan
-                        } else {
-                            ObsidianBorder
-                        }
+                        val rowBg = if (isSelected) colorScheme.primaryContainer.copy(alpha = 0.45f) else colorScheme.background
+                        val rowBorder = if (isSelected) colorScheme.primary else colorScheme.outline
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .heightIn(min = 48.dp)
-                                .clip(RoundedCornerShape(12.dp))
+                                .clip(RoundedCornerShape(10.dp))
                                 .background(rowBg)
-                                .border(1.dp, rowBorder, RoundedCornerShape(12.dp))
+                                .border(1.dp, rowBorder, RoundedCornerShape(10.dp))
                                 .selectable(
                                     selected = isSelected,
                                     onClick = { selectHandshakeProfile(profile) },
@@ -2904,8 +3062,8 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                 selected = isSelected,
                                 onClick = null,
                                 colors = RadioButtonDefaults.colors(
-                                    selectedColor = ElectricCyan,
-                                    unselectedColor = TextMuted
+                                    selectedColor = colorScheme.primary,
+                                    unselectedColor = vw.textMuted
                                 )
                             )
                             Spacer(modifier = Modifier.width(10.dp))
@@ -2918,12 +3076,12 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                     style = MaterialTheme.typography.labelLarge.copy(
                                         fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Medium
                                     ),
-                                    color = if (isSelected) ElectricCyan else TextPrimary
+                                    color = if (isSelected) colorScheme.primary else colorScheme.onSurface
                                 )
                                 Text(
                                     text = profile.description,
                                     style = MaterialTheme.typography.labelSmall,
-                                    color = TextSecondary
+                                    color = colorScheme.onSurfaceVariant
                                 )
                             }
                         }
@@ -2932,13 +3090,14 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
             }
         }
 
-        // 2. Настройки H.264 видеопотока (разрешение 800x480 / 1024x600 / 1280x720, битрейт 1.2 Мбит/с CBR 30fps, Direct 12B по умолчанию)
+        // 2. Настройки H.264 видеопотока (разрешение 800x480 / 1024x600 / 1280x720, битрейт 2.0 Мбит/с VBR 30fps, AOA 20B)
         item {
             Card(
                 modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(16.dp),
-                colors = CardDefaults.cardColors(containerColor = ObsidianSurface),
-                border = BorderStroke(1.dp, ObsidianBorder)
+                shape = RoundedCornerShape(14.dp),
+                colors = CardDefaults.cardColors(containerColor = colorScheme.surface),
+                elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
+                border = BorderStroke(1.dp, colorScheme.outline)
             ) {
                 Column(
                     modifier = Modifier
@@ -2954,30 +3113,20 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                         Text(
                             text = "Параметры видеопотока H.264",
                             style = MaterialTheme.typography.titleMedium,
-                            color = TextPrimary,
+                            color = colorScheme.onSurface,
                             modifier = Modifier.weight(1f)
                         )
                         Spacer(modifier = Modifier.width(8.dp))
-                        Surface(
-                            color = ObsidianSurfaceHigh,
-                            shape = RoundedCornerShape(8.dp),
-                            border = BorderStroke(1.dp, ObsidianBorder)
-                        ) {
-                            Text(
-                                text = "Baseline L3 VBR • 30fps • I=1s",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = ElectricCyan,
-                                softWrap = false,
-                                maxLines = 1,
-                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
-                            )
-                        }
+                        VwStatusBadge(
+                            label = "30 FPS • VBR",
+                            tone = VwBadgeTone.WAITING
+                        )
                     }
 
                     Text(
                         text = "Разрешение виртуального дисплея, Presentation и кодека (1280×720 • 160 dpi по умолчанию)",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = TextSecondary
+                        style = MaterialTheme.typography.labelMedium.tabular(),
+                        color = colorScheme.onSurfaceVariant
                     )
 
                     Row(
@@ -3009,8 +3158,8 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
 
                     Text(
                         text = "Битрейт кодека (AVCProfileBaseline L3 VBR, QP≤36, 30fps, I=1s, 2.0 Мбит/с)",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = TextSecondary
+                        style = MaterialTheme.typography.labelMedium.tabular(),
+                        color = colorScheme.onSurfaceVariant
                     )
 
                     Row(
@@ -3043,7 +3192,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                     Text(
                         text = "Формат шапки видеоканала 0x0002 (Режим 1: AOA 20B с 0x00020001 по умолчанию)",
                         style = MaterialTheme.typography.labelMedium,
-                        color = TextSecondary
+                        color = colorScheme.onSurfaceVariant
                     )
 
                     fun applyVideoHeaderMode(useAoA20B: Boolean) {
@@ -3097,9 +3246,10 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                 modifier = Modifier
                     .fillMaxWidth()
                     .testTag("auto_test_card"),
-                shape = RoundedCornerShape(16.dp),
-                colors = CardDefaults.cardColors(containerColor = ObsidianSurface),
-                border = BorderStroke(width = 1.dp, color = TelemetryEmerald)
+                shape = RoundedCornerShape(14.dp),
+                colors = CardDefaults.cardColors(containerColor = colorScheme.surface),
+                elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
+                border = BorderStroke(width = 1.dp, color = colorScheme.outline)
             ) {
                 Column(
                     modifier = Modifier
@@ -3116,43 +3266,31 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                             Text(
                                 text = "Профиль Jetta VS7 (AOA 20B 0x00020001 + Audio Init)",
                                 style = MaterialTheme.typography.titleMedium,
-                                color = TextPrimary
+                                color = colorScheme.onSurface
                             )
                             Spacer(modifier = Modifier.height(2.dp))
                             Text(
                                 text = "После 0x00018001 / 0x00018003 отправляются MATCH_STATUS (0x00010002), полный MD_INFO (0x00010004), Audio-Init (0x0003, 0x0004), INIT_DONE (0x00010008), SCREEN_ON (0x00010018), USERPRESENT (0x0001001A), FOREGROUND (0x0001001B), REQ_FG (0x00010038) и видеопоток 0x0002 (AOA 20B 0x00020001, единый пакет SPS+PPS+IDR, при простое >200 мс — HEARTBEAT 0x00020002).",
                                 style = MaterialTheme.typography.labelSmall,
-                                color = TextSecondary
+                                color = colorScheme.onSurfaceVariant
                             )
                         }
                         Spacer(modifier = Modifier.width(8.dp))
-                        Surface(
-                            color = SuccessBadgeBg,
-                            shape = RoundedCornerShape(8.dp),
-                            border = BorderStroke(1.dp, TelemetryEmerald)
-                        ) {
-                            Text(
-                                text = "JETTA VS7",
-                                style = MaterialTheme.typography.labelSmall.copy(
-                                    fontWeight = FontWeight.SemiBold
-                                ),
-                                color = SuccessBadgeFg,
-                                softWrap = false,
-                                maxLines = 1,
-                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
-                            )
-                        }
+                        VwStatusBadge(
+                            label = "JETTA VS7",
+                            tone = VwBadgeTone.ACTIVE
+                        )
                     }
 
                     Surface(
-                        color = TelemetryEmerald.copy(alpha = 0.12f),
+                        color = vw.successContainer,
                         shape = RoundedCornerShape(10.dp),
-                        border = BorderStroke(1.dp, TelemetryEmerald.copy(alpha = 0.65f))
+                        border = BorderStroke(1.dp, vw.statusActiveDot.copy(alpha = 0.35f))
                     ) {
                         Text(
                             text = autoTest.statusMessage,
-                            style = MaterialTheme.typography.labelMedium,
-                            color = TelemetryEmerald,
+                            style = MaterialTheme.typography.labelMedium.tabular(),
+                            color = vw.onSuccessContainer,
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .padding(horizontal = 12.dp, vertical = 8.dp)
@@ -3167,10 +3305,10 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                             .fillMaxWidth()
                             .heightIn(min = 48.dp)
                             .testTag("start_auto_test_btn"),
-                        shape = RoundedCornerShape(12.dp),
+                        shape = RoundedCornerShape(10.dp),
                         colors = ButtonDefaults.buttonColors(
-                            containerColor = ElectricCyan,
-                            contentColor = Color(0xFF001D24)
+                            containerColor = colorScheme.primary,
+                            contentColor = colorScheme.onPrimary
                         )
                     ) {
                         Icon(
@@ -3181,7 +3319,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                         Spacer(modifier = Modifier.width(8.dp))
                         Text(
                             text = "Стартовать VD (1280×720 • 2.0 Мбит/с • 160 dpi)",
-                            fontWeight = FontWeight.SemiBold,
+                            style = MaterialTheme.typography.labelLarge.tabular().copy(fontWeight = FontWeight.SemiBold),
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
                         )
@@ -3194,9 +3332,10 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
         item {
             Card(
                 modifier = Modifier.fillMaxWidth(),
-                shape = RoundedCornerShape(16.dp),
-                colors = CardDefaults.cardColors(containerColor = ObsidianSurface),
-                border = BorderStroke(1.dp, ObsidianBorder)
+                shape = RoundedCornerShape(14.dp),
+                colors = CardDefaults.cardColors(containerColor = colorScheme.surface),
+                elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
+                border = BorderStroke(1.dp, colorScheme.outline)
             ) {
                 Column(
                     modifier = Modifier
@@ -3207,6 +3346,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
+                            .heightIn(min = 48.dp)
                             .clip(RoundedCornerShape(10.dp))
                             .clickable { diagnosticsExpanded = !diagnosticsExpanded }
                             .padding(vertical = 4.dp)
@@ -3218,12 +3358,12 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                             Text(
                                 text = "Инженерная диагностика (AOA & Protocol Lab)",
                                 style = MaterialTheme.typography.titleMedium,
-                                color = TextPrimary
+                                color = colorScheme.onSurface
                             )
                             Text(
                                 text = "Статистика USB AOA, счетчики каналов 0x0001..0x0006 и генератор тестовых пакетов",
                                 style = MaterialTheme.typography.labelSmall,
-                                color = TextSecondary
+                                color = colorScheme.onSurfaceVariant
                             )
                         }
                         Icon(
@@ -3233,7 +3373,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                 Icons.Default.KeyboardArrowDown
                             },
                             contentDescription = "Развернуть инженерную диагностику",
-                            tint = ElectricCyan
+                            tint = colorScheme.primary
                         )
                     }
 
@@ -3256,9 +3396,9 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
 
                             // Protocol Lab test vectors
                             Surface(
-                                color = ObsidianSurfaceHigh,
-                                shape = RoundedCornerShape(14.dp),
-                                border = BorderStroke(1.dp, ObsidianBorder)
+                                color = colorScheme.surfaceVariant,
+                                shape = RoundedCornerShape(12.dp),
+                                border = BorderStroke(1.dp, colorScheme.outline)
                             ) {
                                 Column(
                                     modifier = Modifier
@@ -3269,7 +3409,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                     Text(
                                         text = "Тестовые векторы протокола Baidu CarLife",
                                         style = MaterialTheme.typography.titleSmall,
-                                        color = ElectricCyan
+                                        color = vw.accentBlue
                                     )
 
                                     Row(
@@ -3280,7 +3420,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                             title = "1. Handshake",
                                             subtitle = "HU v2.0 + Video Init",
                                             icon = CockpitIcons.Memory,
-                                            accent = ElectricCyan,
+                                            accent = vw.accentBlue,
                                             testTag = "test_control_frame_btn",
                                             modifier = Modifier.weight(1f),
                                             onClick = {
@@ -3303,7 +3443,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                             title = "2. Video (0x0002)",
                                             subtitle = "H.264 SPS/PPS + IDR",
                                             icon = CockpitIcons.Videocam,
-                                            accent = TelemetryEmerald,
+                                            accent = vw.statusActiveDot,
                                             testTag = "test_video_frame_btn",
                                             modifier = Modifier.weight(1f),
                                             onClick = {
@@ -3329,7 +3469,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                             title = "3. Touch Scale",
                                             subtitle = "1280x720 -> 1920x1080",
                                             icon = CockpitIcons.TouchApp,
-                                            accent = AmberSignal,
+                                            accent = vw.statusWarningDot,
                                             testTag = "test_touch_frame_btn",
                                             modifier = Modifier.weight(1f),
                                             onClick = {
@@ -3349,7 +3489,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                             title = "4. HardKey",
                                             subtitle = "Steering Wheel NEXT",
                                             icon = CockpitIcons.GraphicEq,
-                                            accent = CyberBlue,
+                                            accent = colorScheme.primary,
                                             testTag = "test_audio_frame_btn",
                                             modifier = Modifier.weight(1f),
                                             onClick = {
@@ -3361,15 +3501,15 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                     }
 
                                     Surface(
-                                        color = ObsidianBackground,
+                                        color = colorScheme.background,
                                         shape = RoundedCornerShape(10.dp),
-                                        border = BorderStroke(1.dp, ObsidianBorder)
+                                        border = BorderStroke(1.dp, colorScheme.outline)
                                     ) {
                                         Text(
                                             text = lastDecodedBreakdown,
-                                            style = MaterialTheme.typography.labelSmall,
+                                            style = MaterialTheme.typography.labelSmall.tabular(),
                                             fontFamily = JetBrainsMonoFamily,
-                                            color = TextPrimary,
+                                            color = colorScheme.onSurface,
                                             modifier = Modifier
                                                 .fillMaxWidth()
                                                 .padding(10.dp)
@@ -3386,7 +3526,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                 Text(
                                     text = "Журнал бинарных пакетов",
                                     style = MaterialTheme.typography.labelLarge,
-                                    color = ElectricCyan,
+                                    color = vw.accentBlue,
                                     modifier = Modifier.weight(1f)
                                 )
                                 IconButton(
@@ -3396,7 +3536,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                     Icon(
                                         imageVector = CockpitIcons.ClearAll,
                                         contentDescription = "Очистить логи",
-                                        tint = TextSecondary
+                                        tint = colorScheme.onSurfaceVariant
                                     )
                                 }
                             }
@@ -3435,9 +3575,9 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                     "Шлюз 0x0002: ЗАКРЫТ (ожидание 0x00018001 / 0x00018007 от ГУ)"
                                 }
                                 Surface(
-                                    color = ObsidianSurfaceHigh,
-                                    shape = RoundedCornerShape(12.dp),
-                                    border = BorderStroke(1.dp, ObsidianBorder)
+                                    color = colorScheme.surfaceVariant,
+                                    shape = RoundedCornerShape(10.dp),
+                                    border = BorderStroke(1.dp, colorScheme.outline)
                                 ) {
                                     Column(
                                         modifier = Modifier
@@ -3448,13 +3588,13 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                         Text(
                                             text = "Статистика видеоканала 0x0002 • $hdrModeLabel",
                                             style = MaterialTheme.typography.labelMedium,
-                                            color = TelemetryEmerald
+                                            color = vw.onSuccessContainer
                                         )
                                         Text(
                                             text = "$gateStatusLabel • Кадров 0x0002: $videoFramesCount • Кодек: ${state.projectionStats.width}×${state.projectionStats.height}@${state.projectionStats.fps}fps (${state.configuredBitrateBps / 1000} kbps) • IDR: ${state.projectionStats.lastIdrBytes}B",
-                                            style = MaterialTheme.typography.labelSmall,
+                                            style = MaterialTheme.typography.labelSmall.tabular(),
                                             fontFamily = JetBrainsMonoFamily,
-                                            color = TextSecondary
+                                            color = colorScheme.onSurfaceVariant
                                         )
                                     }
                                 }
@@ -3493,15 +3633,16 @@ private fun SelectableOptionButton(
     onClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val colorScheme = MaterialTheme.colorScheme
     Surface(
         modifier = modifier
-            .height(44.dp)
+            .height(48.dp)
             .clip(RoundedCornerShape(10.dp))
             .clickable(onClick = onClick)
             .testTag(testTag),
-        color = if (selected) ElectricCyan.copy(alpha = 0.18f) else ObsidianSurfaceHigh,
+        color = if (selected) colorScheme.primary else colorScheme.surfaceVariant,
         shape = RoundedCornerShape(10.dp),
-        border = BorderStroke(1.dp, if (selected) ElectricCyan else ObsidianBorder)
+        border = BorderStroke(1.dp, if (selected) colorScheme.primary else colorScheme.outline)
     ) {
         Box(
             modifier = Modifier
@@ -3511,11 +3652,11 @@ private fun SelectableOptionButton(
         ) {
             Text(
                 text = label,
-                style = MaterialTheme.typography.labelMedium.copy(
+                style = MaterialTheme.typography.labelMedium.tabular().copy(
                     fontFamily = FontFamily.SansSerif,
                     fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium
                 ),
-                color = if (selected) ElectricCyan else TextPrimary,
+                color = if (selected) colorScheme.onPrimary else colorScheme.onSurface,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
             )
@@ -3532,14 +3673,20 @@ private fun StatusActionChip(
     onClick: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val vw = MaterialTheme.vwColors
+    val bg = if (active) vw.successContainer else vw.infoContainer
+    val fg = if (active) vw.onSuccessContainer else vw.onInfoContainer
+    val dot = if (active) vw.statusActiveDot else vw.statusWaitingDot
+
     Surface(
         modifier = modifier
-            .height(44.dp)
+            .height(48.dp)
             .clip(RoundedCornerShape(10.dp))
             .clickable(onClick = onClick)
             .testTag(testTag),
-        color = if (active) SuccessBadgeBg else WarningBadgeBg,
-        shape = RoundedCornerShape(10.dp)
+        color = bg,
+        shape = RoundedCornerShape(10.dp),
+        border = BorderStroke(1.dp, dot.copy(alpha = 0.3f))
     ) {
         Row(
             modifier = Modifier
@@ -3551,7 +3698,7 @@ private fun StatusActionChip(
             Icon(
                 imageVector = icon,
                 contentDescription = label,
-                tint = if (active) SuccessBadgeFg else WarningBadgeFg,
+                tint = fg,
                 modifier = Modifier.size(16.dp)
             )
             Spacer(modifier = Modifier.width(6.dp))
@@ -3561,7 +3708,7 @@ private fun StatusActionChip(
                     fontFamily = FontFamily.SansSerif,
                     fontWeight = FontWeight.SemiBold
                 ),
-                color = if (active) SuccessBadgeFg else WarningBadgeFg,
+                color = fg,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
             )
@@ -3576,12 +3723,14 @@ private fun ProjectionEngineCard(
     onStopProjection: () -> Unit,
     onInjectTouch: (Int, Int) -> Unit
 ) {
+    val colorScheme = MaterialTheme.colorScheme
+    val vw = MaterialTheme.vwColors
     val proj = state.projectionStats
     Surface(
         modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(14.dp),
-        color = ObsidianSurfaceHigh,
-        border = BorderStroke(1.dp, ObsidianBorder)
+        shape = RoundedCornerShape(12.dp),
+        color = colorScheme.surfaceVariant,
+        border = BorderStroke(1.dp, colorScheme.outline)
     ) {
         Column(
             modifier = Modifier
@@ -3601,12 +3750,14 @@ private fun ProjectionEngineCard(
                         VideoSourceMode.CANVAS_TEST_CARD -> "Конвейер Тест-карта (Canvas) + H.264"
                     },
                     style = MaterialTheme.typography.titleSmall,
-                    color = TextPrimary
+                    color = colorScheme.onSurface,
+                    modifier = Modifier.weight(1f)
                 )
+                Spacer(modifier = Modifier.width(6.dp))
                 Text(
                     text = if (proj.spsPpsConfigured) "SPS/PPS LOCKED" else "AVC Baseline",
                     style = MaterialTheme.typography.labelSmall,
-                    color = ElectricCyan
+                    color = vw.accentBlue
                 )
             }
 
@@ -3641,8 +3792,8 @@ private fun ProjectionEngineCard(
             Text(
                 text = "Режим: ${state.appMode.title} • MP: ${proj.mediaProjectionState}" +
                     (proj.lastMediaProjectionError?.let { " • $it" } ?: ""),
-                style = MaterialTheme.typography.labelSmall,
-                color = if (proj.lastMediaProjectionError != null) CoralAlert else TextSecondary
+                style = MaterialTheme.typography.labelSmall.tabular(),
+                color = if (proj.lastMediaProjectionError != null) colorScheme.error else colorScheme.onSurfaceVariant
             )
 
             Row(
@@ -3654,10 +3805,11 @@ private fun ProjectionEngineCard(
                         onClick = { onStartProjection(state.configuredWidth, state.configuredHeight, 30) },
                         modifier = Modifier
                             .weight(1f)
+                            .heightIn(min = 48.dp)
                             .testTag("start_projection_btn"),
                         colors = ButtonDefaults.buttonColors(
-                            containerColor = ElectricCyan,
-                            contentColor = Color(0xFF001D24)
+                            containerColor = colorScheme.primary,
+                            contentColor = colorScheme.onPrimary
                         ),
                         shape = RoundedCornerShape(10.dp)
                     ) {
@@ -3681,6 +3833,7 @@ private fun ProjectionEngineCard(
                         onClick = { onInjectTouch(120, 180) },
                         modifier = Modifier
                             .weight(1f)
+                            .heightIn(min = 48.dp)
                             .testTag("inject_touch_dock_btn"),
                         shape = RoundedCornerShape(10.dp)
                     ) {
@@ -3690,6 +3843,7 @@ private fun ProjectionEngineCard(
                         onClick = { onInjectTouch(680, 360) },
                         modifier = Modifier
                             .weight(1f)
+                            .heightIn(min = 48.dp)
                             .testTag("inject_touch_launcher_btn"),
                         shape = RoundedCornerShape(10.dp)
                     ) {
@@ -3697,11 +3851,13 @@ private fun ProjectionEngineCard(
                     }
                     OutlinedButton(
                         onClick = onStopProjection,
-                        modifier = Modifier.testTag("stop_projection_btn"),
+                        modifier = Modifier
+                            .heightIn(min = 48.dp)
+                            .testTag("stop_projection_btn"),
                         shape = RoundedCornerShape(10.dp),
-                        border = BorderStroke(1.dp, ObsidianBorder)
+                        border = BorderStroke(1.dp, colorScheme.error.copy(alpha = 0.55f))
                     ) {
-                        Text("Стоп", color = CoralAlert)
+                        Text("Стоп", color = colorScheme.error)
                     }
                 }
             }
@@ -3715,11 +3871,13 @@ private fun TransportControlsCard(
     onStartOrScanBridge: () -> Unit,
     onStopBridge: () -> Unit
 ) {
+    val colorScheme = MaterialTheme.colorScheme
+    val vw = MaterialTheme.vwColors
     Surface(
         modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(14.dp),
-        color = ObsidianSurfaceHigh,
-        border = BorderStroke(1.dp, ObsidianBorder)
+        shape = RoundedCornerShape(12.dp),
+        color = colorScheme.surfaceVariant,
+        border = BorderStroke(1.dp, colorScheme.outline)
     ) {
         Column(
             modifier = Modifier
@@ -3735,12 +3893,12 @@ private fun TransportControlsCard(
                 Text(
                     text = "Транспорт USB AOA",
                     style = MaterialTheme.typography.titleSmall,
-                    color = TextPrimary
+                    color = colorScheme.onSurface
                 )
                 Text(
                     text = if (state.wakeLockHeld) "WakeLock: ACTIVE" else "DirectBufferPool",
                     style = MaterialTheme.typography.labelSmall,
-                    color = TelemetryEmerald
+                    color = vw.onSuccessContainer
                 )
             }
 
@@ -3776,10 +3934,11 @@ private fun TransportControlsCard(
                     onClick = onStartOrScanBridge,
                     modifier = Modifier
                         .weight(1f)
+                        .heightIn(min = 48.dp)
                         .testTag("scan_connect_usb_button"),
                     colors = ButtonDefaults.buttonColors(
-                        containerColor = ElectricCyan,
-                        contentColor = Color(0xFF001D24)
+                        containerColor = colorScheme.primary,
+                        contentColor = colorScheme.onPrimary
                     ),
                     shape = RoundedCornerShape(10.dp)
                 ) {
@@ -3798,18 +3957,20 @@ private fun TransportControlsCard(
                 if (state.isServiceRunning) {
                     OutlinedButton(
                         onClick = onStopBridge,
-                        modifier = Modifier.testTag("stop_bridge_button"),
+                        modifier = Modifier
+                            .heightIn(min = 48.dp)
+                            .testTag("stop_bridge_button"),
                         shape = RoundedCornerShape(10.dp),
-                        border = BorderStroke(1.dp, ObsidianBorder)
+                        border = BorderStroke(1.dp, colorScheme.error.copy(alpha = 0.55f))
                     ) {
                         Icon(
                             imageVector = CockpitIcons.Stop,
                             contentDescription = "Stop Service",
-                            tint = CoralAlert,
+                            tint = colorScheme.error,
                             modifier = Modifier.size(18.dp)
                         )
                         Spacer(modifier = Modifier.width(4.dp))
-                        Text("Стоп", color = CoralAlert)
+                        Text("Стоп", color = colorScheme.error)
                     }
                 }
             }
@@ -3824,28 +3985,30 @@ private fun MetricPill(
     subValue: String,
     modifier: Modifier = Modifier
 ) {
+    val colorScheme = MaterialTheme.colorScheme
+    val vw = MaterialTheme.vwColors
     Column(
         modifier = modifier
             .clip(RoundedCornerShape(10.dp))
-            .background(ObsidianSurface)
-            .border(1.dp, ObsidianBorder, RoundedCornerShape(10.dp))
+            .background(colorScheme.surface)
+            .border(1.dp, colorScheme.outline, RoundedCornerShape(10.dp))
             .padding(10.dp)
     ) {
         Text(
             text = label,
             style = MaterialTheme.typography.labelSmall,
-            color = TextMuted
+            color = vw.textMuted
         )
         Spacer(modifier = Modifier.height(2.dp))
         Text(
             text = value,
-            style = MaterialTheme.typography.titleMedium,
-            color = TextPrimary
+            style = MaterialTheme.typography.titleMedium.tabular(),
+            color = colorScheme.onSurface
         )
         Text(
             text = subValue,
-            style = MaterialTheme.typography.labelSmall,
-            color = ElectricCyan
+            style = MaterialTheme.typography.labelSmall.tabular(),
+            color = vw.accentBlue
         )
     }
 }
@@ -3854,11 +4017,13 @@ private fun MetricPill(
 private fun ChannelMultiplexerGrid(
     channelCounts: Map<CarLifeChannel, Long>
 ) {
+    val colorScheme = MaterialTheme.colorScheme
+    val vw = MaterialTheme.vwColors
     Surface(
         modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(14.dp),
-        color = ObsidianSurfaceHigh,
-        border = BorderStroke(1.dp, ObsidianBorder)
+        shape = RoundedCornerShape(12.dp),
+        color = colorScheme.surfaceVariant,
+        border = BorderStroke(1.dp, colorScheme.outline)
     ) {
         Column(
             modifier = Modifier
@@ -3869,7 +4034,7 @@ private fun ChannelMultiplexerGrid(
             Text(
                 text = "Каналы мультиплексора CarLife (0x0001 .. 0x0006)",
                 style = MaterialTheme.typography.titleSmall,
-                color = TextPrimary
+                color = colorScheme.onSurface
             )
 
             val pairs = CarLifeChannel.entries.chunked(2)
@@ -3880,13 +4045,13 @@ private fun ChannelMultiplexerGrid(
                 ) {
                     for (channel in rowChannels) {
                         val count = channelCounts[channel] ?: 0L
-                        val badgeColor = if (channel.hasTimestampHeader) TelemetryEmerald else ElectricCyan
+                        val badgeColor = if (channel.hasTimestampHeader) vw.onSuccessContainer else vw.accentBlue
                         Column(
                             modifier = Modifier
                                 .weight(1f)
                                 .clip(RoundedCornerShape(10.dp))
-                                .background(ObsidianSurface)
-                                .border(1.dp, ObsidianBorder, RoundedCornerShape(10.dp))
+                                .background(colorScheme.surface)
+                                .border(1.dp, colorScheme.outline, RoundedCornerShape(10.dp))
                                 .padding(10.dp)
                         ) {
                             Row(
@@ -3896,25 +4061,25 @@ private fun ChannelMultiplexerGrid(
                             ) {
                                 Text(
                                     text = "0x%04X".format(channel.id),
-                                    style = MaterialTheme.typography.labelMedium,
+                                    style = MaterialTheme.typography.labelMedium.tabular(),
                                     color = badgeColor
                                 )
                                 Text(
                                     text = "${channel.headerSizeBytes}B HDR",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = TextMuted
+                                    style = MaterialTheme.typography.labelSmall.tabular(),
+                                    color = vw.textMuted
                                 )
                             }
                             Spacer(modifier = Modifier.height(2.dp))
                             Text(
                                 text = channel.label,
                                 style = MaterialTheme.typography.titleSmall,
-                                color = TextPrimary
+                                color = colorScheme.onSurface
                             )
                             Text(
                                 text = "$count пакетов",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = if (count > 0) badgeColor else TextSecondary
+                                style = MaterialTheme.typography.labelSmall.tabular(),
+                                color = if (count > 0) badgeColor else colorScheme.onSurfaceVariant
                             )
                         }
                     }
@@ -3934,14 +4099,16 @@ private fun CodecTestButton(
     modifier: Modifier = Modifier,
     onClick: () -> Unit
 ) {
+    val colorScheme = MaterialTheme.colorScheme
     Surface(
         modifier = modifier
+            .heightIn(min = 48.dp)
             .clip(RoundedCornerShape(10.dp))
             .clickable(onClick = onClick)
             .testTag(testTag),
-        color = ObsidianSurface,
+        color = colorScheme.surface,
         shape = RoundedCornerShape(10.dp),
-        border = BorderStroke(1.dp, ObsidianBorder)
+        border = BorderStroke(1.dp, colorScheme.outline)
     ) {
         Row(
             modifier = Modifier.padding(10.dp),
@@ -3958,11 +4125,11 @@ private fun CodecTestButton(
                 Text(
                     text = title,
                     style = MaterialTheme.typography.titleSmall,
-                    color = TextPrimary
+                    color = colorScheme.onSurface
                 )
                 Text(
                     text = subtitle,
-                    style = MaterialTheme.typography.labelSmall,
+                    style = MaterialTheme.typography.labelSmall.tabular(),
                     color = accent
                 )
             }
@@ -3972,12 +4139,15 @@ private fun CodecTestButton(
 
 @Composable
 private fun PacketLogItemCard(entry: PacketLogEntry) {
-    val accent = if (entry.channel.hasTimestampHeader) TelemetryEmerald else ElectricCyan
+    val colorScheme = MaterialTheme.colorScheme
+    val vw = MaterialTheme.vwColors
+    val accent = if (entry.channel.hasTimestampHeader) vw.onSuccessContainer else vw.accentBlue
     Card(
         modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(12.dp),
-        colors = CardDefaults.cardColors(containerColor = ObsidianSurface),
-        border = BorderStroke(1.dp, ObsidianBorder)
+        shape = RoundedCornerShape(14.dp),
+        colors = CardDefaults.cardColors(containerColor = colorScheme.surface),
+        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
+        border = BorderStroke(1.dp, colorScheme.outline)
     ) {
         Column(
             modifier = Modifier
@@ -4001,14 +4171,14 @@ private fun PacketLogItemCard(entry: PacketLogEntry) {
                     )
                     Text(
                         text = "• ${entry.channel.label} (0x%04X)".format(entry.channel.id),
-                        style = MaterialTheme.typography.labelSmall,
-                        color = TextPrimary
+                        style = MaterialTheme.typography.labelSmall.tabular(),
+                        color = colorScheme.onSurface
                     )
                 }
                 Text(
                     text = entry.timestampFormatted,
-                    style = MaterialTheme.typography.labelSmall,
-                    color = TextMuted
+                    style = MaterialTheme.typography.labelSmall.tabular(),
+                    color = vw.textMuted
                 )
             }
 
@@ -4018,35 +4188,35 @@ private fun PacketLogItemCard(entry: PacketLogEntry) {
             ) {
                 Text(
                     text = "Header: ${entry.headerSizeBytes}B",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = TextSecondary
+                    style = MaterialTheme.typography.labelSmall.tabular(),
+                    color = colorScheme.onSurfaceVariant
                 )
                 Text(
                     text = "Payload: ${entry.payloadSizeBytes}B",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = TextSecondary
+                    style = MaterialTheme.typography.labelSmall.tabular(),
+                    color = colorScheme.onSurfaceVariant
                 )
                 if (entry.channel.hasTimestampHeader) {
                     Text(
                         text = "TS: ${entry.mediaTimestampMs}ms",
-                        style = MaterialTheme.typography.labelSmall,
-                        color = TelemetryEmerald
+                        style = MaterialTheme.typography.labelSmall.tabular(),
+                        color = vw.onSuccessContainer
                     )
                 }
                 entry.serviceName?.let { service ->
                     Text(
                         text = service,
                         style = MaterialTheme.typography.labelSmall,
-                        color = AmberSignal
+                        color = vw.onWarningContainer
                     )
                 }
             }
 
             Text(
                 text = entry.hexPreview,
-                style = MaterialTheme.typography.labelSmall,
+                style = MaterialTheme.typography.labelSmall.tabular(),
                 fontFamily = JetBrainsMonoFamily,
-                color = TextMuted,
+                color = vw.textMuted,
                 modifier = Modifier.fillMaxWidth()
             )
         }
@@ -4055,11 +4225,14 @@ private fun PacketLogItemCard(entry: PacketLogEntry) {
 
 @Composable
 private fun EmptyPacketLogCard() {
+    val colorScheme = MaterialTheme.colorScheme
+    val vw = MaterialTheme.vwColors
     Card(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(14.dp),
-        colors = CardDefaults.cardColors(containerColor = ObsidianSurface),
-        border = BorderStroke(1.dp, ObsidianBorder)
+        colors = CardDefaults.cardColors(containerColor = colorScheme.surface),
+        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
+        border = BorderStroke(1.dp, colorScheme.outline)
     ) {
         Column(
             modifier = Modifier
@@ -4071,18 +4244,18 @@ private fun EmptyPacketLogCard() {
             Icon(
                 imageVector = CockpitIcons.Cable,
                 contentDescription = "No packets yet",
-                tint = ElectricCyan,
+                tint = vw.accentBlue,
                 modifier = Modifier.size(28.dp)
             )
             Text(
                 text = "Нет захваченных кадров CarLife",
                 style = MaterialTheme.typography.titleSmall,
-                color = TextPrimary
+                color = colorScheme.onSurface
             )
             Text(
                 text = "Нажмите на любой тестовый вектор выше для проверки бинарного протокола.",
                 style = MaterialTheme.typography.bodyMedium,
-                color = TextSecondary
+                color = colorScheme.onSurfaceVariant
             )
         }
     }
@@ -4096,14 +4269,16 @@ private fun MirroringNodeStatusRow(
     badgePositive: Boolean,
     detail: String
 ) {
+    val colorScheme = MaterialTheme.colorScheme
+    val vw = MaterialTheme.vwColors
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .clip(RoundedCornerShape(8.dp))
-            .background(ObsidianSurface)
-            .border(1.dp, ObsidianBorder, RoundedCornerShape(8.dp))
-            .padding(horizontal = 10.dp, vertical = 7.dp),
-        verticalArrangement = Arrangement.spacedBy(3.dp)
+            .clip(RoundedCornerShape(10.dp))
+            .background(colorScheme.surface)
+            .border(1.dp, colorScheme.outline, RoundedCornerShape(10.dp))
+            .padding(horizontal = 10.dp, vertical = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp)
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -4116,52 +4291,40 @@ private fun MirroringNodeStatusRow(
                 modifier = Modifier.weight(1f)
             ) {
                 Surface(
-                    color = ElectricCyan.copy(alpha = 0.16f),
+                    color = colorScheme.primaryContainer,
                     shape = CircleShape
                 ) {
                     Text(
                         text = index,
-                        style = MaterialTheme.typography.labelSmall.copy(
-                            fontWeight = FontWeight.Bold,
-                            fontFamily = JetBrainsMonoFamily
+                        style = MaterialTheme.typography.labelSmall.tabular().copy(
+                            fontWeight = FontWeight.Bold
                         ),
-                        color = ElectricCyan,
+                        color = colorScheme.onPrimaryContainer,
                         modifier = Modifier.padding(horizontal = 6.dp, vertical = 1.dp)
                     )
                 }
                 Text(
                     text = label,
                     style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
-                    color = TextPrimary,
+                    color = colorScheme.onSurface,
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
             }
             Spacer(modifier = Modifier.width(6.dp))
-            Surface(
-                color = if (badgePositive) SuccessBadgeBg else WarningBadgeBg,
-                shape = RoundedCornerShape(6.dp)
-            ) {
-                Text(
-                    text = statusBadge,
-                    style = MaterialTheme.typography.labelSmall.copy(
-                        fontWeight = FontWeight.SemiBold,
-                        fontFamily = JetBrainsMonoFamily
-                    ),
-                    color = if (badgePositive) SuccessBadgeFg else WarningBadgeFg,
-                    softWrap = false,
-                    maxLines = 1,
-                    modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp)
-                )
-            }
+            VwStatusBadge(
+                label = statusBadge,
+                tone = if (badgePositive) VwBadgeTone.ACTIVE else VwBadgeTone.WAITING
+            )
         }
         Text(
             text = detail,
-            style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFamily),
-            color = TextSecondary,
+            style = MaterialTheme.typography.labelSmall.tabular(),
+            color = colorScheme.onSurfaceVariant,
             maxLines = 2,
             overflow = TextOverflow.Ellipsis
         )
     }
 }
+
 

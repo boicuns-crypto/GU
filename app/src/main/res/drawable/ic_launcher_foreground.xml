@@ -1,8 +1,98 @@
 <?xml version="1.0" encoding="utf-8"?>
-<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
-    <item
-        android:width="66dp"
-        android:height="66dp"
-        android:drawable="@drawable/img_app_icon_fg_1794551033047"
-        android:gravity="center" />
-</layer-list>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- All elements centered strictly within 66x66 safe zone (21..87) -->
+
+    <!-- Outer geometric silver ring in VW emblem style (#DCE5F0, strokeWidth=2.5) -->
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M54,24 A30,30 0 1,1 53.99,24 Z"
+        android:strokeWidth="2.5"
+        android:strokeColor="#FFDCE5F0" />
+
+    <!-- Subtle inner metallic bezel line -->
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M54,27.2 A26.8,26.8 0 1,1 53.99,27.2 Z"
+        android:strokeWidth="0.65"
+        android:strokeColor="#38DCE5F0" />
+
+    <!-- Top thin wide geometric wordmark: JETTA -->
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M39.6,37.4 L39.6,41.2 C39.6,42.3 38.8,43.0 37.6,43.0 C36.5,43.0 35.8,42.4 35.5,41.6 M48.4,37.4 L43.4,37.4 L43.4,43.0 L48.4,43.0 M43.4,40.2 L47.6,40.2 M51.2,37.4 L56.8,37.4 M54.0,37.4 L54.0,43.0 M59.2,37.4 L64.8,37.4 M62.0,37.4 L62.0,43.0 M67.2,43.0 L70.0,37.4 L72.8,43.0 M68.3,41.1 L71.7,41.1"
+        android:strokeWidth="1.4"
+        android:strokeColor="#FFE4ECF5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+
+    <!-- Center bold geometric emblem lettering: VS7 -->
+    <path
+        android:fillColor="#00000000"
+        android:pathData="M32.8,48.0 L38.2,61.8 L43.6,48.0 M59.0,50.5 C58.7,48.8 57.0,48.0 54.0,48.0 C50.9,48.0 49.0,49.2 49.0,51.2 C49.0,53.2 50.8,54.2 54.0,54.9 C57.4,55.6 59.4,56.7 59.4,58.9 C59.4,61.2 57.3,62.3 53.8,62.3 C50.6,62.3 48.8,61.3 48.4,59.5 M64.4,48.2 L75.2,48.2 L68.2,62.3"
+        android:strokeWidth="3.2"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round" />
+
+    <!-- Soft VW Electric Blue ambient glow beneath VS7 -->
+    <path android:pathData="M31.5,69.0 Q54.0,66.9 76.5,69.0 Q54.0,71.1 31.5,69.0 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:endX="76.5"
+                android:endY="69.0"
+                android:startX="31.5"
+                android:startY="69.0"
+                android:type="linear">
+                <item
+                    android:color="#0000A3FF"
+                    android:offset="0.0" />
+                <item
+                    android:color="#5500A3FF"
+                    android:offset="0.3" />
+                <item
+                    android:color="#8800A3FF"
+                    android:offset="0.5" />
+                <item
+                    android:color="#5500A3FF"
+                    android:offset="0.7" />
+                <item
+                    android:color="#0000A3FF"
+                    android:offset="1.0" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Sharp tapered VW Electric Blue signature light bar (#00A3FF) -->
+    <path android:pathData="M33.0,69.0 Q54.0,67.85 75.0,69.0 Q54.0,70.15 33.0,69.0 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:endX="75.0"
+                android:endY="69.0"
+                android:startX="33.0"
+                android:startY="69.0"
+                android:type="linear">
+                <item
+                    android:color="#0000A3FF"
+                    android:offset="0.0" />
+                <item
+                    android:color="#FF00A3FF"
+                    android:offset="0.22" />
+                <item
+                    android:color="#FFC2ECFF"
+                    android:offset="0.5" />
+                <item
+                    android:color="#FF00A3FF"
+                    android:offset="0.78" />
+                <item
+                    android:color="#0000A3FF"
+                    android:offset="1.0" />
+            </gradient>
+        </aapt:attr>
+    </path>
+</vector>

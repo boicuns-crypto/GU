@@ -22,6 +22,6 @@ dependencyResolutionManagement {
   }
 }
 
-rootProject.name = "CarLife Bridge"
+rootProject.name = "Jetta VS7"
 
 include(":app")

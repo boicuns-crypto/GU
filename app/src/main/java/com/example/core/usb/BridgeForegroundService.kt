@@ -45,6 +45,7 @@ import com.example.protocol.carlife.CarLifeMsgType
 import com.example.protocol.carlife.CarLifeTouchDecoder
 import com.example.protocol.carlife.CarLifeTouchEventType
 import com.example.protocol.carlife.HandshakeTestProfile
+import com.example.ui.theme.ThemePreferences
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -780,7 +781,8 @@ class BridgeForegroundService : Service() {
         createNotificationChannel()
         acquireWakeLock()
 
-        // Restore persisted AppMode (COCKPIT / MIRRORING / SHIZUKU_COCKPIT) before initializing engines
+        // Restore persisted AppMode (COCKPIT / MIRRORING / SHIZUKU_COCKPIT) and ThemeMode before initializing engines
+        ThemePreferences.init(applicationContext)
         BridgeTelemetryBus.restoreSavedAppMode(applicationContext)
         // Default Jetta VS7 Mode 1: AOA 20B (8B AOA [00 00 00 02][len+12] + 12B video header [len][ts][00 02 00 01])
         val initialRuntime = BridgeTelemetryBus.runtimeState.value
