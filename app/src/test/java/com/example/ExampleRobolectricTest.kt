@@ -13,9 +13,11 @@ import android.os.Bundle
 import android.view.KeyEvent
 import android.view.MotionEvent
 import androidx.test.core.app.ApplicationProvider
+import com.example.core.audio.AudioCapturePreferences
 import com.example.core.audio.CarLifeAudioCaptureManager
 import com.example.core.carlife.CarLifeHardKeyPacket
 import com.example.core.carlife.CarLifeTouchPacket
+import com.example.core.input.CarLifeAccessibilityService
 import com.example.core.projection.AppMode
 import com.example.core.projection.AppModePreferences
 import com.example.core.projection.CockpitProjectionManager
@@ -645,6 +647,228 @@ class ExampleRobolectricTest {
     bitmap.recycle()
     kotlinx.coroutines.runBlocking { manager.stopProjection() }
   }
+
+  @Test
+  fun `cold start service onCreate does not consume pending single-use MediaProjection token before FGS promotion`() {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    MediaProjectionTokenStore.clearToken()
+    try {
+      val tokenIntent = Intent("android.media.projection.COLD_START_TEST").putExtra("nonce", 99)
+      MediaProjectionTokenStore.saveToken(Activity.RESULT_OK, tokenIntent)
+      assertTrue("Pending token must be present before onCreate", MediaProjectionTokenStore.hasPendingToken.value)
+
+      // Cold-start onCreate() alone MUST NOT start projection or burn the single-use Intent
+      val controller = Robolectric.buildService(BridgeForegroundService::class.java).create()
+      val service = controller.get()
+
+      // Give background dispatcher a moment to prove onCreate() didn't launch a racing startProjection
+      Thread.sleep(100L)
+      assertTrue(
+        "Single-use MediaProjection token must NOT be consumed in onCreate() before promoteToForeground()",
+        MediaProjectionTokenStore.hasPendingToken.value
+      )
+
+      // Also verify CockpitProjectionManager FGS gate directly blocks audio projection creation while FGS is not ready
+      val mpBeforeFgs = kotlinx.coroutines.runBlocking {
+        service.projectionManager.getOrCreateMediaProjectionForAudio()
+      }
+      assertEquals(null, mpBeforeFgs)
+      assertTrue(
+        "Token must remain unconsumed while isMediaProjectionFgsReady is false",
+        MediaProjectionTokenStore.hasPendingToken.value
+      )
+
+      controller.destroy()
+    } finally {
+      MediaProjectionTokenStore.clearToken()
+      AppModePreferences.clear(context)
+    }
+  }
+
+  @Test
+  fun `mirroring touch mapping rejects black pillarbox bars and applies edge-back guard on S26 Ultra`() {
+    // Portrait S26 Ultra (1440x3120) projected onto 1280x720 HU:
+    // Active region width = 720 * (1440 / 3120) = 332.3px, centered -> X in [473.8, 806.2]
+    val leftBlackBarTap = CarLifeAccessibilityService.mapHuTouchToPhysicalScreenDetailed(
+      rawX = 50,
+      rawY = 360,
+      huWidth = 1280f,
+      huHeight = 720f,
+      screenWidth = 1440,
+      screenHeight = 3120,
+      applyEdgeGuard = true
+    )
+    assertFalse("Tap deep in left black pillarbox bar must be ignored", leftBlackBarTap.isInsideActiveArea)
+    assertFalse(leftBlackBarTap.isLandscape)
+
+    val rightBlackBarTap = CarLifeAccessibilityService.mapHuTouchToPhysicalScreenDetailed(
+      rawX = 1230,
+      rawY = 360,
+      huWidth = 1280f,
+      huHeight = 720f,
+      screenWidth = 1440,
+      screenHeight = 3120,
+      applyEdgeGuard = true
+    )
+    assertFalse("Tap deep in right black pillarbox bar must be ignored", rightBlackBarTap.isInsideActiveArea)
+
+    val centerTap = CarLifeAccessibilityService.mapHuTouchToPhysicalScreenDetailed(
+      rawX = 640,
+      rawY = 360,
+      huWidth = 1280f,
+      huHeight = 720f,
+      screenWidth = 1440,
+      screenHeight = 3120,
+      applyEdgeGuard = true
+    )
+    assertTrue("Center tap must be inside active mirrored region", centerTap.isInsideActiveArea)
+    assertEquals(720f, centerTap.x, 8f)
+    assertEquals(1560f, centerTap.y, 12f)
+
+    // Tap right on the inner left border of active portrait area -> clamped away from One UI Back edge (>= 14px)
+    val leftEdgeTap = CarLifeAccessibilityService.mapHuTouchToPhysicalScreenDetailed(
+      rawX = 474,
+      rawY = 360,
+      huWidth = 1280f,
+      huHeight = 720f,
+      screenWidth = 1440,
+      screenHeight = 3120,
+      applyEdgeGuard = true
+    )
+    assertTrue(leftEdgeTap.isInsideActiveArea)
+    assertTrue(
+      "Expected left-edge touch to stay inside edge-back guard (>= ${CarLifeAccessibilityService.EDGE_BACK_GUARD_PX}), got ${leftEdgeTap.x}",
+      leftEdgeTap.x >= CarLifeAccessibilityService.EDGE_BACK_GUARD_PX
+    )
+
+    // Landscape S26 Ultra (3120x1440) projected onto 1280x720 HU:
+    // Active region height = 1280 / (3120 / 1440) = 590.8px, centered -> Y in [64.6, 655.4]
+    val topLetterboxTap = CarLifeAccessibilityService.mapHuTouchToPhysicalScreenDetailed(
+      rawX = 640,
+      rawY = 10,
+      huWidth = 1280f,
+      huHeight = 720f,
+      screenWidth = 3120,
+      screenHeight = 1440,
+      applyEdgeGuard = true
+    )
+    assertTrue(topLetterboxTap.isLandscape)
+    assertFalse("Tap deep in top letterbox bar must be ignored", topLetterboxTap.isInsideActiveArea)
+
+    val landscapeCenterTap = CarLifeAccessibilityService.mapHuTouchToPhysicalScreenDetailed(
+      rawX = 640,
+      rawY = 360,
+      huWidth = 1280f,
+      huHeight = 720f,
+      screenWidth = 3120,
+      screenHeight = 1440,
+      applyEdgeGuard = true
+    )
+    assertTrue(landscapeCenterTap.isInsideActiveArea)
+    assertEquals(1560f, landscapeCenterTap.x, 8f)
+    assertEquals(720f, landscapeCenterTap.y, 8f)
+  }
+
+  @Test
+  fun `audio speaker mute preference persists across service restart and detects muted silence threshold`() {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    try {
+      AudioCapturePreferences.clear(context)
+      assertTrue("Default mute speaker preference should be true", AudioCapturePreferences.loadMutePhoneSpeaker(context))
+
+      // Persist false -> reset in-memory bus -> restart BridgeForegroundService -> must restore false
+      BridgeTelemetryBus.setMutePhoneSpeakerDuringUsbAudio(false, context)
+      assertFalse(AudioCapturePreferences.loadMutePhoneSpeaker(context))
+
+      BridgeTelemetryBus.setMutePhoneSpeakerDuringUsbAudio(true, context = null)
+      val svcController = Robolectric.buildService(BridgeForegroundService::class.java).create()
+      assertFalse(
+        "BridgeForegroundService must restore persisted mutePhoneSpeakerDuringUsbAudio=false",
+        BridgeTelemetryBus.runtimeState.value.mutePhoneSpeakerDuringUsbAudio
+      )
+      svcController.destroy()
+
+      // Verify silence-under-mute diagnostic heuristic
+      assertFalse(
+        CarLifeAudioCaptureManager.shouldShowMuteSilenceWarning(
+          sentPcmPackets = 0L,
+          skippedSilentPackets = 79L,
+          isMutedByBridge = true
+        )
+      )
+      assertTrue(
+        CarLifeAudioCaptureManager.shouldShowMuteSilenceWarning(
+          sentPcmPackets = 0L,
+          skippedSilentPackets = 80L,
+          isMutedByBridge = true
+        )
+      )
+      assertFalse(
+        CarLifeAudioCaptureManager.shouldShowMuteSilenceWarning(
+          sentPcmPackets = 5L,
+          skippedSilentPackets = 200L,
+          isMutedByBridge = true
+        )
+      )
+      assertFalse(
+        CarLifeAudioCaptureManager.shouldShowMuteSilenceWarning(
+          sentPcmPackets = 0L,
+          skippedSilentPackets = 200L,
+          isMutedByBridge = false
+        )
+      )
+    } finally {
+      AudioCapturePreferences.clear(context)
+      BridgeTelemetryBus.setMutePhoneSpeakerDuringUsbAudio(true, context)
+    }
+  }
+
+  @Test
+  fun `mirroring long press and double click touch packets preserve mirroring isolation and diagnostics`() {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val manager = CockpitProjectionManager(
+      context = context,
+      onEncodedVideoNal = { _, _, _ -> }
+    )
+    manager.appMode = AppMode.MIRRORING
+    manager.videoSourceMode = VideoSourceMode.SCREEN_MIRRORING
+
+    kotlinx.coroutines.runBlocking {
+      manager.injectTouchPacket(
+        CarLifeTouchPacket(
+          androidAction = MotionEvent.ACTION_DOWN,
+          rawX = 640,
+          rawY = 360,
+          huWidth = 1280,
+          huHeight = 720,
+          synthesizeClickUp = false,
+          isDoubleClick = false,
+          isLongPress = true
+        )
+      )
+      val longPressDiag = manager.stats.value.lastTouchDiagnostic
+      assertTrue(
+        "Expected Mirror/A11y diagnostic for LONG_PRESS, got: $longPressDiag",
+        longPressDiag.contains("CarLifeAccessibilityService") || longPressDiag.contains("Mirror Touch")
+      )
+
+      manager.injectTouchPacket(
+        CarLifeTouchPacket(
+          androidAction = MotionEvent.ACTION_DOWN,
+          rawX = 640,
+          rawY = 360,
+          huWidth = 1280,
+          huHeight = 720,
+          synthesizeClickUp = false,
+          isDoubleClick = true,
+          isLongPress = false
+        )
+      )
+      assertEquals(AppMode.MIRRORING, manager.appMode)
+      manager.stopProjection()
+    }
+  }
 }
+
 
 

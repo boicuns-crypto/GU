@@ -43,14 +43,53 @@ data class AudioCaptureStats(
     val mutePhoneSpeakerDuringUsbAudio: Boolean = true,
     val isPhoneSpeakerMutedByBridge: Boolean = false,
     val savedPhoneMusicVolume: Int? = null,
+    val currentMusicVolume: Int? = null,
     val mediaInitSent: Boolean = false,
     val sentInitPackets: Long = 0L,
     val sentPcmPackets: Long = 0L,
     val skippedSilentPackets: Long = 0L,
     val sentPcmBytes: Long = 0L,
     val sentStopPackets: Long = 0L,
+    val isSilenceWarningActive: Boolean = false,
+    val silenceWarningMessage: String? = null,
     val statusMessage: String = "Аудио 0x0003: ожидание MediaProjection и разрешения RECORD_AUDIO (48 кГц Stereo 16-bit PCM)"
 )
+
+/**
+ * SharedPreferences persistence for the phone-speaker mute option during USB AudioPlaybackCapture.
+ */
+object AudioCapturePreferences {
+    private const val PREFS_NAME = "carlife_bridge_prefs"
+    private const val KEY_MUTE_PHONE_SPEAKER = "mute_phone_speaker_during_usb_audio"
+
+    fun saveMutePhoneSpeaker(context: Context, enabled: Boolean) {
+        runCatching {
+            context.applicationContext
+                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putBoolean(KEY_MUTE_PHONE_SPEAKER, enabled)
+                .commit()
+        }
+    }
+
+    fun loadMutePhoneSpeaker(context: Context): Boolean {
+        return runCatching {
+            context.applicationContext
+                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .getBoolean(KEY_MUTE_PHONE_SPEAKER, true)
+        }.getOrDefault(true)
+    }
+
+    fun clear(context: Context) {
+        runCatching {
+            context.applicationContext
+                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .remove(KEY_MUTE_PHONE_SPEAKER)
+                .commit()
+        }
+    }
+}
 
 /**
  * Captures system playback audio (Yandex Music, Navigator, 2GIS, YouTube, etc.) via
@@ -99,13 +138,27 @@ class CarLifeAudioCaptureManager(
         } else if (isCapturingFlag.get()) {
             mutePhoneSpeakerIfEnabled()
         } else {
-            _stats.update { it.copy(mutePhoneSpeakerDuringUsbAudio = true) }
+            val curVol = runCatching { audioManager?.getStreamVolume(AudioManager.STREAM_MUSIC) }.getOrNull()
+            _stats.update {
+                it.copy(
+                    mutePhoneSpeakerDuringUsbAudio = true,
+                    currentMusicVolume = curVol
+                )
+            }
         }
     }
 
     internal fun mutePhoneSpeakerIfEnabled() {
         if (!mutePhoneSpeakerFlag.get()) {
-            _stats.update { it.copy(mutePhoneSpeakerDuringUsbAudio = false) }
+            val curVol = runCatching { audioManager?.getStreamVolume(AudioManager.STREAM_MUSIC) }.getOrNull()
+            _stats.update {
+                it.copy(
+                    mutePhoneSpeakerDuringUsbAudio = false,
+                    currentMusicVolume = curVol,
+                    isSilenceWarningActive = false,
+                    silenceWarningMessage = null
+                )
+            }
             return
         }
         val am = audioManager ?: return
@@ -130,12 +183,14 @@ class CarLifeAudioCaptureManager(
             }
             capturedSavedVol = savedMusicVolumeIndex
         }
-        Log.i(TAG, "Phone STREAM_MUSIC muted=0 (saved volume=$capturedSavedVol)")
+        val postMuteVol = runCatching { am.getStreamVolume(AudioManager.STREAM_MUSIC) }.getOrNull()
+        Log.i(TAG, "Phone STREAM_MUSIC muted=0 (saved volume=$capturedSavedVol, now=$postMuteVol)")
         _stats.update {
             it.copy(
                 mutePhoneSpeakerDuringUsbAudio = true,
                 isPhoneSpeakerMutedByBridge = muted,
-                savedPhoneMusicVolume = capturedSavedVol
+                savedPhoneMusicVolume = capturedSavedVol,
+                currentMusicVolume = postMuteVol
             )
         }
     }
@@ -151,11 +206,15 @@ class CarLifeAudioCaptureManager(
             runCatching { am.setStreamVolume(AudioManager.STREAM_MUSIC, prevVol, 0) }
             Log.i(TAG, "Restored phone STREAM_MUSIC volume to $prevVol")
         }
+        val restoredVol = runCatching { am?.getStreamVolume(AudioManager.STREAM_MUSIC) }.getOrNull()
         _stats.update {
             it.copy(
                 mutePhoneSpeakerDuringUsbAudio = mutePhoneSpeakerFlag.get(),
                 isPhoneSpeakerMutedByBridge = false,
-                savedPhoneMusicVolume = null
+                savedPhoneMusicVolume = null,
+                currentMusicVolume = restoredVol,
+                isSilenceWarningActive = false,
+                silenceWarningMessage = null
             )
         }
     }
@@ -367,7 +426,23 @@ class CarLifeAudioCaptureManager(
                         if (skippedSinceUiUpdate >= 25) {
                             val deltaSkipped = skippedSinceUiUpdate.toLong()
                             skippedSinceUiUpdate = 0
-                            _stats.update { it.copy(skippedSilentPackets = it.skippedSilentPackets + deltaSkipped) }
+                            _stats.update { current ->
+                                val totalSkipped = current.skippedSilentPackets + deltaSkipped
+                                val warnSilence = shouldShowMuteSilenceWarning(
+                                    sentPcmPackets = current.sentPcmPackets,
+                                    skippedSilentPackets = totalSkipped,
+                                    isMutedByBridge = current.isPhoneSpeakerMutedByBridge
+                                )
+                                current.copy(
+                                    skippedSilentPackets = totalSkipped,
+                                    isSilenceWarningActive = warnSilence,
+                                    silenceWarningMessage = if (warnSilence) {
+                                        SILENCE_UNDER_MUTE_WARNING
+                                    } else {
+                                        null
+                                    }
+                                )
+                            }
                         }
                         continue
                     }
@@ -390,7 +465,7 @@ class CarLifeAudioCaptureManager(
 
                     sentSinceUiUpdate++
                     bytesSinceUiUpdate += pcmPayload.size.toLong()
-                    if (sentSinceUiUpdate >= 10) {
+                    if (sentSinceUiUpdate >= 10 || _stats.value.isSilenceWarningActive) {
                         val deltaPackets = sentSinceUiUpdate.toLong()
                         val deltaBytes = bytesSinceUiUpdate
                         val deltaSkipped = skippedSinceUiUpdate.toLong()
@@ -401,7 +476,9 @@ class CarLifeAudioCaptureManager(
                             current.copy(
                                 sentPcmPackets = current.sentPcmPackets + deltaPackets,
                                 sentPcmBytes = current.sentPcmBytes + deltaBytes,
-                                skippedSilentPackets = current.skippedSilentPackets + deltaSkipped
+                                skippedSilentPackets = current.skippedSilentPackets + deltaSkipped,
+                                isSilenceWarningActive = false,
+                                silenceWarningMessage = null
                             )
                         }
                     }
@@ -515,6 +592,20 @@ class CarLifeAudioCaptureManager(
 
         fun currentTimestampSec(nowMs: Long = System.currentTimeMillis()): Long {
             return (nowMs / 1000L) and 0x7FFF_FFFFL
+        }
+
+        const val SILENCE_WARNING_THRESHOLD_PACKETS = 80L // ~1.7s of consecutive all-zero PCM chunks
+        const val SILENCE_UNDER_MUTE_WARNING =
+            "Динамик в 0 может глушить AudioPlaybackCapture на Samsung — отключите приглушение или используйте Bluetooth аудио ГУ"
+
+        fun shouldShowMuteSilenceWarning(
+            sentPcmPackets: Long,
+            skippedSilentPackets: Long,
+            isMutedByBridge: Boolean
+        ): Boolean {
+            return isMutedByBridge &&
+                sentPcmPackets == 0L &&
+                skippedSilentPackets >= SILENCE_WARNING_THRESHOLD_PACKETS
         }
 
         /**

@@ -197,7 +197,9 @@ data class CarLifeTouchPacket(
     val rawY: Int,
     val huWidth: Int,
     val huHeight: Int,
-    val synthesizeClickUp: Boolean = false
+    val synthesizeClickUp: Boolean = false,
+    val isDoubleClick: Boolean = false,
+    val isLongPress: Boolean = false
 )
 
 /**

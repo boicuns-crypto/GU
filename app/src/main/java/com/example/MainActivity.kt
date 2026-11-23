@@ -1735,13 +1735,30 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                         }
                     }
 
-                    // Панель точной диагностики активного режима и MediaProjection (Android 14–16)
-                    val effectiveDiagnosticError = mpError ?: state.projectionStats.lastMediaProjectionError
+                    // Единая панель диагностики Зеркалирования по 5 узлам (Android 14–16)
+                    val projStats = state.projectionStats
+                    val audioStatsForDiag = state.audioCaptureStats
+                    val hasRecordAudioForDiag = remember(audioStatsForDiag.hasRecordAudioPermission, checklistStatus) {
+                        CarLifeAudioCaptureManager.hasRecordAudioPermission(context)
+                    }
+                    val effectiveDiagnosticError = mpError ?: projStats.lastMediaProjectionError
                     val diagBorderColor = when {
                         effectiveDiagnosticError != null -> CoralAlert.copy(alpha = 0.75f)
-                        state.projectionStats.usingMediaProjection || mpIsActive -> TelemetryEmerald.copy(alpha = 0.7f)
+                        audioStatsForDiag.isSilenceWarningActive -> AmberSignal.copy(alpha = 0.8f)
+                        projStats.usingMediaProjection || mpIsActive -> TelemetryEmerald.copy(alpha = 0.7f)
                         else -> AmberSignal.copy(alpha = 0.7f)
                     }
+                    val disableSpeakerMuteNow = {
+                        BridgeTelemetryBus.setMutePhoneSpeakerDuringUsbAudio(false, context)
+                        if (state.isServiceRunning) {
+                            val muteIntent = Intent(context, BridgeForegroundService::class.java).apply {
+                                action = BridgeForegroundService.ACTION_SET_MUTE_PHONE_SPEAKER
+                                putExtra(BridgeForegroundService.EXTRA_MUTE_PHONE_SPEAKER, false)
+                            }
+                            safeStartService(context, muteIntent)
+                        }
+                    }
+
                     Surface(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -1753,8 +1770,9 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                         Column(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .padding(12.dp),
-                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                                .padding(12.dp)
+                                .testTag("mirroring_health_panel"),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
@@ -1762,24 +1780,26 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
                                 Text(
-                                    text = "Диагностика режима и MediaProjection",
+                                    text = "Диагностика Зеркалирования (5 узлов)",
                                     style = MaterialTheme.typography.labelLarge,
-                                    color = TextPrimary
+                                    color = TextPrimary,
+                                    modifier = Modifier.weight(1f)
                                 )
+                                Spacer(modifier = Modifier.width(8.dp))
                                 val mpChipBg = when {
                                     effectiveDiagnosticError != null -> WarningBadgeBg
-                                    state.projectionStats.usingMediaProjection || mpIsActive -> SuccessBadgeBg
+                                    projStats.usingMediaProjection || mpIsActive -> SuccessBadgeBg
                                     else -> ObsidianSurfaceHigh
                                 }
                                 val mpChipFg = when {
                                     effectiveDiagnosticError != null -> CoralAlert
-                                    state.projectionStats.usingMediaProjection || mpIsActive -> SuccessBadgeFg
+                                    projStats.usingMediaProjection || mpIsActive -> SuccessBadgeFg
                                     else -> AmberSignal
                                 }
                                 Surface(color = mpChipBg, shape = RoundedCornerShape(6.dp)) {
                                     Text(
                                         text = when {
-                                            state.projectionStats.usingMediaProjection || mpIsActive -> "MP LIVE"
+                                            projStats.usingMediaProjection || mpIsActive -> "MP LIVE"
                                             mpHasPending -> "ТОКЕН ГОТОВ"
                                             effectiveDiagnosticError != null -> "ОШИБКА MP"
                                             else -> "НЕТ ТОКЕНА"
@@ -1793,33 +1813,92 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                 }
                             }
 
-                            Text(
-                                text = "Режим (сохранён): ${activeAppMode.title} • Источник: ${state.videoSourceMode.title}",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = ElectricCyan
+                            // Узел 1: Режим и запрет тихого отката
+                            MirroringNodeStatusRow(
+                                index = "1",
+                                label = "Режим",
+                                statusBadge = if (activeAppMode == AppMode.MIRRORING) "ЗЕРКАЛО" else activeAppMode.name,
+                                badgePositive = true,
+                                detail = "${activeAppMode.title} • ${state.videoSourceMode.title}" +
+                                    if (activeAppMode == AppMode.MIRRORING) " • откат в Кокпит заблокирован" else ""
                             )
-                            Text(
-                                text = "MediaProjection: ${state.projectionStats.mediaProjectionState} ($mpDetail)",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = if (state.projectionStats.usingMediaProjection || mpIsActive) {
-                                    TelemetryEmerald
-                                } else {
-                                    TextSecondary
-                                }
+
+                            // Узел 2: FGS + MediaProjection
+                            val fgsMpOk = projStats.usingMediaProjection || mpIsActive
+                            val fgsBadge = when {
+                                fgsMpOk && projStats.isMediaProjectionFgsActive -> "FGS+MP ОК"
+                                fgsMpOk -> "MP LIVE"
+                                projStats.isMediaProjectionFgsActive -> "FGS ОК"
+                                mpHasPending -> "ТОКЕН ЖДЁТ"
+                                else -> "ОЖИД. MP"
+                            }
+                            MirroringNodeStatusRow(
+                                index = "2",
+                                label = "FGS + MediaProjection",
+                                statusBadge = fgsBadge,
+                                badgePositive = fgsMpOk,
+                                detail = "${projStats.mediaProjectionState} • FGS mediaProjection=${if (projStats.isMediaProjectionFgsActive) "ДА" else "НЕТ"} ($mpDetail)"
                             )
-                            Text(
-                                text = if (state.projectionStats.usingMediaProjection &&
-                                    state.projectionStats.virtualDisplayId != Display.DEFAULT_DISPLAY
-                                ) {
-                                    "VirtualDisplay: #${state.projectionStats.virtualDisplayId} (${state.projectionStats.width}×${state.projectionStats.height}@${state.projectionStats.fps}fps, ${state.projectionStats.virtualDisplayDpi} dpi)"
-                                } else if (activeAppMode == AppMode.MIRRORING) {
-                                    "VirtualDisplay: не создан • Откат в Кокпит СТРОГО ЗАПРЕЩЁН"
-                                } else {
-                                    "VirtualDisplay: Surface ${state.projectionStats.width}×${state.projectionStats.height}@${state.projectionStats.fps}fps"
-                                },
-                                style = MaterialTheme.typography.labelSmall,
-                                color = TextSecondary
+
+                            // Узел 3: Видео H.264, 30 FPS и ориентация экрана
+                            val orientationLabel = when {
+                                projStats.phoneScreenWidth > 0 && projStats.phoneScreenHeight > 0 ->
+                                    "${if (projStats.isPhoneLandscape) "Альбомная" else "Портретная"} ${projStats.phoneScreenWidth}×${projStats.phoneScreenHeight}"
+                                else -> "Ожидание экрана"
+                            }
+                            val vdLabel = if (projStats.usingMediaProjection && projStats.virtualDisplayId != Display.DEFAULT_DISPLAY) {
+                                "VD #${projStats.virtualDisplayId} (${projStats.virtualDisplayDpi} dpi)"
+                            } else if (activeAppMode == AppMode.MIRRORING) {
+                                "VD не создан (ожидание MP)"
+                            } else {
+                                "Surface ${projStats.width}×${projStats.height}"
+                            }
+                            val fpsBadgeText = if (projStats.actualFps > 0f) {
+                                "${"%.1f".format(projStats.actualFps)} FPS"
+                            } else if (projStats.isRunning) {
+                                "${projStats.fps} FPS"
+                            } else {
+                                "СТОП"
+                            }
+                            MirroringNodeStatusRow(
+                                index = "3",
+                                label = "Видео H.264 / 30 FPS",
+                                statusBadge = fpsBadgeText,
+                                badgePositive = projStats.isRunning && (projStats.actualFps == 0f || projStats.actualFps <= 35f),
+                                detail = "${projStats.width}×${projStats.height} • ${projStats.idrPerSec} IDR/с • ${projStats.activeEncoderProfile} • $vdLabel • $orientationLabel"
                             )
+
+                            // Узел 4: Тач 0x0006 (CarLifeAccessibilityService)
+                            val a11yOk = checklistStatus.step3AccessibilityEnabled
+                            MirroringNodeStatusRow(
+                                index = "4",
+                                label = "Тач 0x0006 (A11y)",
+                                statusBadge = if (a11yOk) "ВКЛ" else "ВЫКЛ",
+                                badgePositive = a11yOk,
+                                detail = projStats.lastTouchDiagnostic
+                            )
+
+                            // Узел 5: Аудио 0x0003 (AudioPlaybackCapture + динамик)
+                            val audioOk = audioStatsForDiag.isCapturing && !audioStatsForDiag.isSilenceWarningActive
+                            val audioBadge = when {
+                                audioStatsForDiag.isSilenceWarningActive -> "ТИШИНА"
+                                audioStatsForDiag.isCapturing -> "PCM ON"
+                                !hasRecordAudioForDiag -> "НЕТ ПРАВ"
+                                else -> "ГОТОВ"
+                            }
+                            val speakerNote = if (audioStatsForDiag.isPhoneSpeakerMutedByBridge) {
+                                "динамик 0 (сохр. ${audioStatsForDiag.savedPhoneMusicVolume ?: 0})"
+                            } else {
+                                "громкость=${audioStatsForDiag.currentMusicVolume ?: "—"}"
+                            }
+                            MirroringNodeStatusRow(
+                                index = "5",
+                                label = "Аудио 0x0003 PCM",
+                                statusBadge = audioBadge,
+                                badgePositive = audioOk || (hasRecordAudioForDiag && !audioStatsForDiag.isSilenceWarningActive),
+                                detail = "PCM: ${audioStatsForDiag.sentPcmPackets} пак. • тишина: ${audioStatsForDiag.skippedSilentPackets} • $speakerNote"
+                            )
+
                             if (!effectiveDiagnosticError.isNullOrBlank()) {
                                 Text(
                                     text = "Причина / ошибка: $effectiveDiagnosticError",
@@ -1828,8 +1907,50 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                     modifier = Modifier.testTag("mediaprojection_diagnostic_error")
                                 )
                             }
+
+                            if (audioStatsForDiag.isSilenceWarningActive && !audioStatsForDiag.silenceWarningMessage.isNullOrBlank()) {
+                                Surface(
+                                    color = WarningBadgeBg,
+                                    shape = RoundedCornerShape(10.dp),
+                                    border = BorderStroke(1.dp, AmberSignal.copy(alpha = 0.7f)),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .testTag("mute_silence_warning_banner")
+                                ) {
+                                    Column(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(10.dp),
+                                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                                    ) {
+                                        Text(
+                                            text = audioStatsForDiag.silenceWarningMessage,
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = WarningBadgeFg
+                                        )
+                                        FilledTonalButton(
+                                            onClick = disableSpeakerMuteNow,
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .heightIn(min = 48.dp)
+                                                .testTag("disable_mute_silence_warning_btn"),
+                                            shape = RoundedCornerShape(8.dp),
+                                            colors = ButtonDefaults.filledTonalButtonColors(
+                                                containerColor = AmberSignal.copy(alpha = 0.25f),
+                                                contentColor = WarningBadgeFg
+                                            )
+                                        ) {
+                                            Text(
+                                                text = "Отключить приглушение динамика",
+                                                fontWeight = FontWeight.SemiBold
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+
                             if (activeAppMode != AppMode.COCKPIT &&
-                                (!state.projectionStats.usingMediaProjection || !effectiveDiagnosticError.isNullOrBlank())
+                                (!projStats.usingMediaProjection || !effectiveDiagnosticError.isNullOrBlank())
                             ) {
                                 FilledTonalButton(
                                     onClick = onRequestMediaProjection,
@@ -1845,6 +1966,24 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                 ) {
                                     Text(
                                         text = "Выдать MediaProjection («Весь экран»)",
+                                        fontWeight = FontWeight.SemiBold
+                                    )
+                                }
+                            }
+
+                            if (activeAppMode == AppMode.MIRRORING && !a11yOk) {
+                                OutlinedButton(
+                                    onClick = onOpenAccessibilitySettings,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .heightIn(min = 48.dp)
+                                        .testTag("mirroring_open_a11y_btn"),
+                                    shape = RoundedCornerShape(10.dp),
+                                    border = BorderStroke(1.dp, AmberSignal.copy(alpha = 0.7f)),
+                                    colors = ButtonDefaults.outlinedButtonColors(contentColor = AmberSignal)
+                                ) {
+                                    Text(
+                                        text = "Включить службу тача (Спец. возможности)",
                                         fontWeight = FontWeight.SemiBold
                                     )
                                 }
@@ -2196,7 +2335,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                         Switch(
                             checked = state.mutePhoneSpeakerDuringUsbAudio,
                             onCheckedChange = { enabled ->
-                                BridgeTelemetryBus.setMutePhoneSpeakerDuringUsbAudio(enabled)
+                                BridgeTelemetryBus.setMutePhoneSpeakerDuringUsbAudio(enabled, context)
                                 if (state.isServiceRunning) {
                                     val muteIntent = Intent(context, BridgeForegroundService::class.java).apply {
                                         action = BridgeForegroundService.ACTION_SET_MUTE_PHONE_SPEAKER
@@ -2213,6 +2352,54 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                 uncheckedTrackColor = ObsidianSurfaceHigh
                             )
                         )
+                    }
+
+                    if (audioStats.isSilenceWarningActive && !audioStats.silenceWarningMessage.isNullOrBlank()) {
+                        Surface(
+                            color = WarningBadgeBg,
+                            shape = RoundedCornerShape(10.dp),
+                            border = BorderStroke(1.dp, AmberSignal.copy(alpha = 0.7f)),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(10.dp),
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Text(
+                                    text = audioStats.silenceWarningMessage,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = WarningBadgeFg
+                                )
+                                FilledTonalButton(
+                                    onClick = {
+                                        BridgeTelemetryBus.setMutePhoneSpeakerDuringUsbAudio(false, context)
+                                        if (state.isServiceRunning) {
+                                            val muteIntent = Intent(context, BridgeForegroundService::class.java).apply {
+                                                action = BridgeForegroundService.ACTION_SET_MUTE_PHONE_SPEAKER
+                                                putExtra(BridgeForegroundService.EXTRA_MUTE_PHONE_SPEAKER, false)
+                                            }
+                                            safeStartService(context, muteIntent)
+                                        }
+                                    },
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .heightIn(min = 48.dp)
+                                        .testTag("audio_card_disable_mute_btn"),
+                                    shape = RoundedCornerShape(8.dp),
+                                    colors = ButtonDefaults.filledTonalButtonColors(
+                                        containerColor = AmberSignal.copy(alpha = 0.25f),
+                                        contentColor = WarningBadgeFg
+                                    )
+                                ) {
+                                    Text(
+                                        text = "Отключить приглушение динамика",
+                                        fontWeight = FontWeight.SemiBold
+                                    )
+                                }
+                            }
+                        }
                     }
 
                     Button(
@@ -3900,3 +4087,81 @@ private fun EmptyPacketLogCard() {
         }
     }
 }
+
+@Composable
+private fun MirroringNodeStatusRow(
+    index: String,
+    label: String,
+    statusBadge: String,
+    badgePositive: Boolean,
+    detail: String
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp))
+            .background(ObsidianSurface)
+            .border(1.dp, ObsidianBorder, RoundedCornerShape(8.dp))
+            .padding(horizontal = 10.dp, vertical = 7.dp),
+        verticalArrangement = Arrangement.spacedBy(3.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                modifier = Modifier.weight(1f)
+            ) {
+                Surface(
+                    color = ElectricCyan.copy(alpha = 0.16f),
+                    shape = CircleShape
+                ) {
+                    Text(
+                        text = index,
+                        style = MaterialTheme.typography.labelSmall.copy(
+                            fontWeight = FontWeight.Bold,
+                            fontFamily = JetBrainsMonoFamily
+                        ),
+                        color = ElectricCyan,
+                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 1.dp)
+                    )
+                }
+                Text(
+                    text = label,
+                    style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
+                    color = TextPrimary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+            Spacer(modifier = Modifier.width(6.dp))
+            Surface(
+                color = if (badgePositive) SuccessBadgeBg else WarningBadgeBg,
+                shape = RoundedCornerShape(6.dp)
+            ) {
+                Text(
+                    text = statusBadge,
+                    style = MaterialTheme.typography.labelSmall.copy(
+                        fontWeight = FontWeight.SemiBold,
+                        fontFamily = JetBrainsMonoFamily
+                    ),
+                    color = if (badgePositive) SuccessBadgeFg else WarningBadgeFg,
+                    softWrap = false,
+                    maxLines = 1,
+                    modifier = Modifier.padding(horizontal = 7.dp, vertical = 2.dp)
+                )
+            }
+        }
+        Text(
+            text = detail,
+            style = MaterialTheme.typography.labelSmall.copy(fontFamily = JetBrainsMonoFamily),
+            color = TextSecondary,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis
+        )
+    }
+}
+

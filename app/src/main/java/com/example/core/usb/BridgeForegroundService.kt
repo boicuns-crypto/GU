@@ -21,6 +21,7 @@ import android.view.MotionEvent
 import androidx.core.app.NotificationCompat
 import com.example.MainActivity
 import com.example.R
+import com.example.core.audio.AudioCapturePreferences
 import com.example.core.audio.AudioCaptureStats
 import com.example.core.audio.CarLifeAudioCaptureManager
 import com.example.core.carlife.CarLifeHardKeyPacket
@@ -157,7 +158,16 @@ object BridgeTelemetryBus {
 
     fun restoreSavedAppMode(context: Context): AppMode {
         val saved = AppModePreferences.loadAppMode(context)
+        val savedMuteSpeaker = AudioCapturePreferences.loadMutePhoneSpeaker(context)
         applyAppModeState(saved, eventNote = "Восстановлен режим: ${saved.title}")
+        _runtimeState.update {
+            it.copy(
+                mutePhoneSpeakerDuringUsbAudio = savedMuteSpeaker,
+                audioCaptureStats = it.audioCaptureStats.copy(
+                    mutePhoneSpeakerDuringUsbAudio = savedMuteSpeaker
+                )
+            )
+        }
         return saved
     }
 
@@ -202,11 +212,18 @@ object BridgeTelemetryBus {
         }
     }
 
-    fun setMutePhoneSpeakerDuringUsbAudio(enabled: Boolean) {
+    fun setMutePhoneSpeakerDuringUsbAudio(enabled: Boolean, context: Context? = null) {
+        if (context != null) {
+            AudioCapturePreferences.saveMutePhoneSpeaker(context, enabled)
+        }
         _runtimeState.update {
             it.copy(
                 mutePhoneSpeakerDuringUsbAudio = enabled,
-                audioCaptureStats = it.audioCaptureStats.copy(mutePhoneSpeakerDuringUsbAudio = enabled),
+                audioCaptureStats = it.audioCaptureStats.copy(
+                    mutePhoneSpeakerDuringUsbAudio = enabled,
+                    isSilenceWarningActive = if (enabled) it.audioCaptureStats.isSilenceWarningActive else false,
+                    silenceWarningMessage = if (enabled) it.audioCaptureStats.silenceWarningMessage else null
+                ),
                 lastProtocolEvent = if (enabled) {
                     "Глушить динамик телефона при USB-звуке: ВКЛ"
                 } else {
@@ -222,13 +239,20 @@ object BridgeTelemetryBus {
             _runtimeState.value.appMode == AppMode.SHIZUKU_COCKPIT -> AppMode.SHIZUKU_COCKPIT
             else -> AppMode.COCKPIT
         }
+        val mappedLaunch = when (mappedAppMode) {
+            AppMode.MIRRORING -> AppLaunchMode.SCREEN_MIRRORING
+            AppMode.SHIZUKU_COCKPIT -> AppLaunchMode.SHIZUKU_VIRTUAL_DISPLAY
+            AppMode.COCKPIT -> AppLaunchMode.VIRTUAL_DISPLAY_IF_AVAILABLE
+        }
         if (context != null) {
             AppModePreferences.saveAppMode(context, mappedAppMode)
         }
+        CarLifeLauncherRepository.setAppLaunchMode(mappedLaunch)
         _runtimeState.update {
             it.copy(
                 appMode = mappedAppMode,
                 videoSourceMode = mode,
+                appLaunchMode = mappedLaunch,
                 lastProtocolEvent = "Источник видео: ${mode.title}"
             )
         }
@@ -469,6 +493,8 @@ class BridgeForegroundService : Service() {
     private var lastRealVideoFrameElapsedMs: Long = 0L
 
     private var autoTestJob: kotlinx.coroutines.Job? = null
+    private val isMediaProjectionFgsActive = java.util.concurrent.atomic.AtomicBoolean(false)
+    private val hasStartedInitialProjection = java.util.concurrent.atomic.AtomicBoolean(false)
 
     private fun clearPendingVideoTxQueue() {
         while (videoTxQueue.tryReceive().isSuccess) {
@@ -822,10 +848,21 @@ class BridgeForegroundService : Service() {
                     videoTxQueue.trySend(VideoTxItem.VideoHeartbeat(timestampMs = timestampMs))
                 }
             },
+            onMediaProjectionStopped = {
+                serviceScope.launch {
+                    if (::audioCaptureManager.isInitialized) {
+                        audioCaptureManager.stopCapture(
+                            sendMediaStop = usbTransport.state.value is UsbTransportState.Connected
+                        )
+                        audioCaptureManager.restorePhoneSpeakerVolume()
+                    }
+                }
+            },
             externalScope = serviceScope
         )
         projectionManager.appMode = activeAppMode
         projectionManager.videoSourceMode = activeVideoSourceMode
+        projectionManager.setMediaProjectionFgsReady(false)
         projectionManager.setVideoChannelReady(false)
 
         audioCaptureManager = CarLifeAudioCaptureManager(
@@ -901,18 +938,11 @@ class BridgeForegroundService : Service() {
             )
         }
 
-        // Immediately start selected Video Source + H.264 MediaCodec
-        // while keeping 0x0002 streaming locked until USB AOA handshake completes.
-        serviceScope.launch {
-            projectionManager.startProjection(
-                width = activeWidth,
-                height = activeHeight,
-                frameRate = 30,
-                bitRate = activeBitrateBps,
-                sourceMode = activeVideoSourceMode,
-                targetAppMode = activeAppMode
-            )
-        }
+        // NOTE: Do NOT call projectionManager.startProjection() inside onCreate().
+        // On Android 14–16 cold start, startForeground(..., FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+        // runs in onStartCommand(). Starting projection here would race ahead of FGS promotion
+        // and burn a single-use MediaProjection token before FGS is active.
+        // Initial projection is started inside onStartCommand() right after promoteToForeground().
 
         // Observe Projection Pipeline stats
         serviceScope.launch {
@@ -1048,7 +1078,29 @@ class BridgeForegroundService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         promoteToForeground(usbTransport.state.value)
 
-        when (intent?.action) {
+        val action = intent?.action
+        val handlesProjectionExplicitly = action == ACTION_GRANT_MEDIA_PROJECTION ||
+            action == ACTION_START_PROJECTION ||
+            action == ACTION_SET_APP_MODE ||
+            action == ACTION_SET_VIDEO_SOURCE_MODE ||
+            action == ACTION_STOP_PROJECTION ||
+            action == ACTION_DISCONNECT_STOP ||
+            action == ACTION_START_AUTO_TEST
+
+        if (!handlesProjectionExplicitly && hasStartedInitialProjection.compareAndSet(false, true)) {
+            serviceScope.launch {
+                projectionManager.startProjection(
+                    width = activeWidth,
+                    height = activeHeight,
+                    frameRate = 30,
+                    bitRate = activeBitrateBps,
+                    sourceMode = activeVideoSourceMode,
+                    targetAppMode = activeAppMode
+                )
+            }
+        }
+
+        when (action) {
             ACTION_ATTACH_ACCESSORY -> {
                 val accessory = extractAccessory(intent)
                 serviceScope.launch {
@@ -1063,6 +1115,7 @@ class BridgeForegroundService : Service() {
             }
 
             ACTION_GRANT_MEDIA_PROJECTION -> {
+                hasStartedInitialProjection.set(true)
                 val resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, Activity.RESULT_CANCELED)
                 val resultData: Intent? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                     intent.getParcelableExtra(EXTRA_RESULT_DATA, Intent::class.java)
@@ -1079,49 +1132,64 @@ class BridgeForegroundService : Service() {
                 controlStateMachine.setPreferredResolution(requestedW, requestedH)
 
                 if (resultCode == Activity.RESULT_OK && resultData != null) {
-                    if (!MediaProjectionTokenStore.hasPendingToken.value && !MediaProjectionTokenStore.isProjectionActive.value) {
+                    if (!MediaProjectionTokenStore.hasPendingToken.value) {
                         MediaProjectionTokenStore.saveToken(resultCode, resultData)
                     }
                     promoteToForeground(usbTransport.state.value)
-                    val targetW = activeWidth
-                    val targetH = activeHeight
-                    val targetFps = 30
-                    val wasHandshakeReady = (usbTransport.state.value is UsbTransportState.Connected) &&
-                        (isVideoChannelReadyForStreaming ||
-                            hasSentMdInfoInSession ||
-                            controlStateMachine.sessionState.value.phase == com.example.protocol.carlife.CarLifeSessionPhase.VIDEO_STREAMING)
-                    if (!wasHandshakeReady) {
-                        setVideoStreamingReady(false)
-                    }
-                    serviceScope.launch {
-                        resetVideoLogFlags()
-                        val effectiveReady = wasHandshakeReady || isVideoChannelReadyForStreaming || hasSentMdInfoInSession
-                        projectionManager.setVideoChannelReady(effectiveReady)
-                        projectionManager.startProjection(
-                            width = targetW,
-                            height = targetH,
-                            frameRate = targetFps,
-                            bitRate = activeBitrateBps,
-                            sourceMode = activeVideoSourceMode,
-                            targetAppMode = activeAppMode
-                        )
-                        if (effectiveReady || isVideoChannelReadyForStreaming || hasSentMdInfoInSession) {
-                            setVideoStreamingReady(true)
-                            projectionManager.unlockVideoChannelAndRequestSyncFrame()
-                            startAudioCaptureIfReady(reason = "MediaProjection Granted")
+                    if (!isMediaProjectionFgsActive.get() && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        val fgsErr = "FGS mediaProjection не подтверждён ОС — токен сохранён, повторите выдачу «Весь экран»"
+                        MediaProjectionTokenStore.recordError(fgsErr)
+                        BridgeTelemetryBus.updateState {
+                            it.copy(
+                                lastProtocolEvent = fgsErr,
+                                projectionStats = it.projectionStats.copy(
+                                    isMediaProjectionFgsActive = false,
+                                    mediaProjectionState = "Ошибка FGS",
+                                    lastMediaProjectionError = fgsErr
+                                )
+                            )
                         }
-                    }
-                    BridgeTelemetryBus.updateState {
-                        it.copy(
-                            configuredWidth = targetW,
-                            configuredHeight = targetH,
-                            configuredBitrateBps = activeBitrateBps,
-                            lastProtocolEvent = if (wasHandshakeReady) {
-                                "MediaProjection granted — Streaming 0x0002 ($targetW×$targetH @ ${activeBitrateBps / 1000} kbps)"
-                            } else {
-                                "MediaProjection granted ($targetW×$targetH) — SPS/PPS cached in memory"
+                    } else {
+                        val targetW = activeWidth
+                        val targetH = activeHeight
+                        val targetFps = 30
+                        val wasHandshakeReady = (usbTransport.state.value is UsbTransportState.Connected) &&
+                            (isVideoChannelReadyForStreaming ||
+                                hasSentMdInfoInSession ||
+                                controlStateMachine.sessionState.value.phase == com.example.protocol.carlife.CarLifeSessionPhase.VIDEO_STREAMING)
+                        if (!wasHandshakeReady) {
+                            setVideoStreamingReady(false)
+                        }
+                        serviceScope.launch {
+                            resetVideoLogFlags()
+                            val effectiveReady = wasHandshakeReady || isVideoChannelReadyForStreaming || hasSentMdInfoInSession
+                            projectionManager.setVideoChannelReady(effectiveReady)
+                            projectionManager.startProjection(
+                                width = targetW,
+                                height = targetH,
+                                frameRate = targetFps,
+                                bitRate = activeBitrateBps,
+                                sourceMode = activeVideoSourceMode,
+                                targetAppMode = activeAppMode
+                            )
+                            if (effectiveReady || isVideoChannelReadyForStreaming || hasSentMdInfoInSession) {
+                                setVideoStreamingReady(true)
+                                projectionManager.unlockVideoChannelAndRequestSyncFrame()
+                                startAudioCaptureIfReady(reason = "MediaProjection Granted")
                             }
-                        )
+                        }
+                        BridgeTelemetryBus.updateState {
+                            it.copy(
+                                configuredWidth = targetW,
+                                configuredHeight = targetH,
+                                configuredBitrateBps = activeBitrateBps,
+                                lastProtocolEvent = if (wasHandshakeReady) {
+                                    "MediaProjection granted — Streaming 0x0002 ($targetW×$targetH @ ${activeBitrateBps / 1000} kbps)"
+                                } else {
+                                    "MediaProjection granted ($targetW×$targetH) — SPS/PPS cached in memory"
+                                }
+                            )
+                        }
                     }
                 } else {
                     val deniedMsg = "Разрешение MediaProjection («Весь экран») отклонено (code=$resultCode)"
@@ -1176,6 +1244,7 @@ class BridgeForegroundService : Service() {
             }
 
             ACTION_START_PROJECTION -> {
+                hasStartedInitialProjection.set(true)
                 val width = intent.getIntExtra(EXTRA_WIDTH, activeWidth).coerceIn(480, 3840)
                 val height = intent.getIntExtra(EXTRA_HEIGHT, activeHeight).coerceIn(272, 2160)
                 val fps = intent.getIntExtra(EXTRA_FPS, 30)
@@ -1220,6 +1289,7 @@ class BridgeForegroundService : Service() {
             }
 
             ACTION_SET_APP_MODE -> {
+                hasStartedInitialProjection.set(true)
                 val mode = AppMode.fromId(intent.getStringExtra(EXTRA_APP_MODE))
                 val previousMode = activeAppMode
                 activeAppMode = mode
@@ -1237,6 +1307,10 @@ class BridgeForegroundService : Service() {
                 projectionManager.videoSourceMode = targetSource
                 projectionManager.setAppLaunchMode(targetLaunch)
                 BridgeTelemetryBus.setAppMode(mode, applicationContext)
+
+                if (mode != AppMode.COCKPIT && MediaProjectionTokenStore.hasValidToken.value && !isMediaProjectionFgsActive.get()) {
+                    promoteToForeground(usbTransport.state.value)
+                }
 
                 if (mode == AppMode.SHIZUKU_COCKPIT) {
                     CarLifeShizukuManager.init(applicationContext)
@@ -1272,7 +1346,7 @@ class BridgeForegroundService : Service() {
 
             ACTION_SET_MUTE_PHONE_SPEAKER -> {
                 val enabled = intent.getBooleanExtra(EXTRA_MUTE_PHONE_SPEAKER, true)
-                BridgeTelemetryBus.setMutePhoneSpeakerDuringUsbAudio(enabled)
+                BridgeTelemetryBus.setMutePhoneSpeakerDuringUsbAudio(enabled, applicationContext)
                 if (::audioCaptureManager.isInitialized) {
                     audioCaptureManager.setMutePhoneSpeakerEnabled(enabled)
                 }
@@ -1404,17 +1478,27 @@ class BridgeForegroundService : Service() {
             }
 
             ACTION_SET_VIDEO_SOURCE_MODE -> {
+                hasStartedInitialProjection.set(true)
                 val mode = VideoSourceMode.fromId(intent.getStringExtra(EXTRA_VIDEO_SOURCE_MODE))
                 val mappedAppMode = when {
                     mode == VideoSourceMode.SCREEN_MIRRORING -> AppMode.MIRRORING
                     activeAppMode == AppMode.SHIZUKU_COCKPIT -> AppMode.SHIZUKU_COCKPIT
                     else -> AppMode.COCKPIT
                 }
+                val mappedLaunch = when (mappedAppMode) {
+                    AppMode.MIRRORING -> AppLaunchMode.SCREEN_MIRRORING
+                    AppMode.SHIZUKU_COCKPIT -> AppLaunchMode.SHIZUKU_VIRTUAL_DISPLAY
+                    AppMode.COCKPIT -> AppLaunchMode.VIRTUAL_DISPLAY_IF_AVAILABLE
+                }
                 activeAppMode = mappedAppMode
                 activeVideoSourceMode = mode
                 projectionManager.appMode = mappedAppMode
                 projectionManager.videoSourceMode = mode
+                projectionManager.setAppLaunchMode(mappedLaunch)
                 BridgeTelemetryBus.setVideoSourceMode(mode, applicationContext)
+                if (mappedAppMode != AppMode.COCKPIT && MediaProjectionTokenStore.hasValidToken.value && !isMediaProjectionFgsActive.get()) {
+                    promoteToForeground(usbTransport.state.value)
+                }
                 serviceScope.launch {
                     val wasReady = isVideoChannelReadyForStreaming
                     resetVideoLogFlags()
@@ -1445,6 +1529,7 @@ class BridgeForegroundService : Service() {
             }
 
             ACTION_START_AUTO_TEST -> {
+                hasStartedInitialProjection.set(true)
                 startAutoTestCycle()
             }
 
@@ -1725,16 +1810,24 @@ class BridgeForegroundService : Service() {
                 )
                 when (decodedEvent) {
                     is CarLifeInputEvent.Touch -> {
-                        val isClick = decodedEvent.type == CarLifeTouchEventType.SINGLE_CLICK ||
-                            decodedEvent.type == CarLifeTouchEventType.DOUBLE_CLICK
+                        val isSingleClick = decodedEvent.type == CarLifeTouchEventType.SINGLE_CLICK
+                        val isDoubleClick = decodedEvent.type == CarLifeTouchEventType.DOUBLE_CLICK
+                        val isLongPress = decodedEvent.type == CarLifeTouchEventType.LONG_PRESS
+                        val actionForPacket = if (isSingleClick || isDoubleClick || isLongPress) {
+                            MotionEvent.ACTION_DOWN
+                        } else {
+                            decodedEvent.type.androidMotionAction
+                        }
                         projectionManager.injectTouchPacket(
                             CarLifeTouchPacket(
-                                androidAction = if (isClick) MotionEvent.ACTION_DOWN else decodedEvent.type.androidMotionAction,
+                                androidAction = actionForPacket,
                                 rawX = decodedEvent.rawX,
                                 rawY = decodedEvent.rawY,
                                 huWidth = decodedEvent.huWidth,
                                 huHeight = decodedEvent.huHeight,
-                                synthesizeClickUp = isClick
+                                synthesizeClickUp = isSingleClick,
+                                isDoubleClick = isDoubleClick,
+                                isLongPress = isLongPress
                             )
                         )
                     }
@@ -1837,6 +1930,7 @@ class BridgeForegroundService : Service() {
 
     private fun promoteToForeground(state: UsbTransportState) {
         val notification = buildNotification(state)
+        var mpFgsGranted = false
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             val hasMpToken = MediaProjectionTokenStore.hasValidToken.value ||
                 (::projectionManager.isInitialized && projectionManager.activeMediaProjection != null)
@@ -1852,8 +1946,14 @@ class BridgeForegroundService : Service() {
 
             try {
                 startForeground(NOTIFICATION_ID, notification, desiredType)
+                mpFgsGranted = hasMpToken
             } catch (e: RuntimeException) {
+                mpFgsGranted = false
                 Log.w(TAG, "FGS promotion with type=$desiredType failed (${e.message}); falling back to dataSync")
+                if (hasMpToken) {
+                    val fgsErr = "FGS mediaProjection отклонён ОС (${e.javaClass.simpleName}: ${e.message}) — повторно выдайте «Весь экран»"
+                    MediaProjectionTokenStore.recordError(fgsErr)
+                }
                 runCatching {
                     startForeground(
                         NOTIFICATION_ID,
@@ -1866,6 +1966,12 @@ class BridgeForegroundService : Service() {
             }
         } else {
             runCatching { startForeground(NOTIFICATION_ID, notification) }
+            mpFgsGranted = true
+        }
+
+        isMediaProjectionFgsActive.set(mpFgsGranted)
+        if (::projectionManager.isInitialized) {
+            projectionManager.setMediaProjectionFgsReady(mpFgsGranted)
         }
     }
 

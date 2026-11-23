@@ -6,13 +6,18 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.graphics.Path
+import android.hardware.display.DisplayManager
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import android.provider.Settings
+import android.util.DisplayMetrics
 import android.util.Log
 import android.view.Display
 import android.view.KeyEvent
 import android.view.MotionEvent
+import android.view.Surface
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -26,6 +31,19 @@ data class ScaledTouchPointer(
     val pointerId: Int,
     val x: Float,
     val y: Float
+)
+
+/**
+ * Result of mapping a Head Unit `(rawX, rawY)` touch coordinate to the physical phone screen,
+ * including whether the touch landed inside the active projected area (vs pillarbox/letterbox margins).
+ */
+data class MappedPhysicalTouch(
+    val x: Float,
+    val y: Float,
+    val isInsideActiveArea: Boolean,
+    val isLandscape: Boolean,
+    val screenWidth: Int,
+    val screenHeight: Int
 )
 
 /**
@@ -107,6 +125,46 @@ class CarLifeAccessibilityService : AccessibilityService() {
     }
 
     /**
+     * Synthesizes a long-press gesture (`600 ms` default) at `(x, y)` on [displayId].
+     */
+    fun injectLongPress(
+        displayId: Int = Display.DEFAULT_DISPLAY,
+        x: Float,
+        y: Float,
+        durationMs: Long = DEFAULT_LONG_PRESS_DURATION_MS
+    ): Boolean {
+        val safeX = x.coerceAtLeast(0f)
+        val safeY = y.coerceAtLeast(0f)
+        val path = Path().apply {
+            moveTo(safeX, safeY)
+        }
+        val clampedDuration = durationMs.coerceIn(MIN_LONG_PRESS_DURATION_MS, MAX_SWIPE_DURATION_MS)
+        val stroke = GestureDescription.StrokeDescription(path, 0L, clampedDuration)
+        val builder = GestureDescription.Builder().addStroke(stroke)
+        applyTargetDisplayId(builder, displayId)
+        return runCatching {
+            dispatchGesture(builder.build(), null, null)
+        }.getOrDefault(false)
+    }
+
+    /**
+     * Synthesizes a double-tap gesture (two 50 ms taps separated by an 80 ms gap) at `(x, y)`.
+     */
+    fun injectDoubleTap(
+        displayId: Int = Display.DEFAULT_DISPLAY,
+        x: Float,
+        y: Float
+    ): Boolean {
+        val firstOk = injectTap(displayId = displayId, x = x, y = y, durationMs = DEFAULT_TAP_DURATION_MS)
+        if (!firstOk) return false
+        Handler(Looper.getMainLooper()).postDelayed(
+            { injectTap(displayId = displayId, x = x, y = y, durationMs = DEFAULT_TAP_DURATION_MS) },
+            DOUBLE_TAP_INTERVAL_MS
+        )
+        return true
+    }
+
+    /**
      * Synthesizes a continuous drag/swipe path gesture (e.g. scrolling lists or dragging 2GIS/Navigator maps)
      * with duration clamped to `50..1500 ms`.
      */
@@ -173,9 +231,23 @@ class CarLifeAccessibilityService : AccessibilityService() {
         action: Int,
         x: Float,
         y: Float,
-        synthesizeClickUp: Boolean = false
+        synthesizeClickUp: Boolean = false,
+        isDoubleClick: Boolean = false,
+        isLongPress: Boolean = false
     ): Boolean {
+        if (isDoubleClick) {
+            isTrackingGesture = false
+            movementPoints.clear()
+            return injectDoubleTap(displayId = displayId, x = x, y = y)
+        }
+        if (isLongPress) {
+            isTrackingGesture = false
+            movementPoints.clear()
+            return injectLongPress(displayId = displayId, x = x, y = y)
+        }
         if (synthesizeClickUp) {
+            isTrackingGesture = false
+            movementPoints.clear()
             return injectTap(displayId = displayId, x = x, y = y, durationMs = DEFAULT_TAP_DURATION_MS)
         }
 
@@ -297,8 +369,12 @@ class CarLifeAccessibilityService : AccessibilityService() {
         const val DEFAULT_TAP_DURATION_MS = 50L // 40..60 ms short click
         const val MIN_TAP_DURATION_MS = 40L
         const val MAX_TAP_DURATION_MS = 60L
+        const val DEFAULT_LONG_PRESS_DURATION_MS = 600L
+        const val MIN_LONG_PRESS_DURATION_MS = 450L
+        const val DOUBLE_TAP_INTERVAL_MS = 110L
         const val MIN_SWIPE_DURATION_MS = 50L
         const val MAX_SWIPE_DURATION_MS = 1500L
+        const val EDGE_BACK_GUARD_PX = 14f
         private const val MAX_PATH_POINTS = 64
         private const val TAP_SLOP_PX_SQ = 256f // 16 px threshold
 
@@ -332,19 +408,109 @@ class CarLifeAccessibilityService : AccessibilityService() {
         }
 
         /**
-         * Reads the real physical smartphone screen bounds (`WindowManager.currentWindowMetrics.bounds`)
-         * reflecting the current portrait/landscape orientation.
+         * Reads the real physical smartphone screen bounds reflecting the live portrait/landscape
+         * orientation via `WindowManager.currentWindowMetrics.bounds` cross-checked against
+         * `DisplayManager.getDisplay(DEFAULT_DISPLAY)` rotation (prevents stale ApplicationContext bounds
+         * after background rotation on Android 14–16).
          */
         fun computePhysicalScreenSize(context: Context): Pair<Int, Int> {
+            val dmService = context.getSystemService(Context.DISPLAY_SERVICE) as? DisplayManager
+            val defaultDisplay = runCatching { dmService?.getDisplay(Display.DEFAULT_DISPLAY) }.getOrNull()
+            val rotation = runCatching { defaultDisplay?.rotation }.getOrNull()
+
+            var rawW = 0
+            var rawH = 0
+
             val wm = context.getSystemService(Context.WINDOW_SERVICE) as? WindowManager
             if (wm != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 val bounds = runCatching { wm.currentWindowMetrics.bounds }.getOrNull()
                 if (bounds != null && bounds.width() > 0 && bounds.height() > 0) {
-                    return bounds.width() to bounds.height()
+                    rawW = bounds.width()
+                    rawH = bounds.height()
                 }
             }
-            val dm = context.resources.displayMetrics
-            return dm.widthPixels.coerceAtLeast(1) to dm.heightPixels.coerceAtLeast(1)
+            if ((rawW <= 0 || rawH <= 0) && defaultDisplay != null) {
+                @Suppress("DEPRECATION")
+                val metrics = DisplayMetrics().also { runCatching { defaultDisplay.getRealMetrics(it) } }
+                if (metrics.widthPixels > 0 && metrics.heightPixels > 0) {
+                    rawW = metrics.widthPixels
+                    rawH = metrics.heightPixels
+                }
+            }
+            if (rawW <= 0 || rawH <= 0) {
+                val dm = context.resources.displayMetrics
+                rawW = dm.widthPixels.coerceAtLeast(1)
+                rawH = dm.heightPixels.coerceAtLeast(1)
+            }
+
+            // Cross-check with live Display rotation so background rotation never leaves swapped W/H
+            if (rotation != null && rawW != rawH) {
+                val isRotatedLandscape = rotation == Surface.ROTATION_90 || rotation == Surface.ROTATION_270
+                val isRotatedPortrait = rotation == Surface.ROTATION_0 || rotation == Surface.ROTATION_180
+                if (isRotatedLandscape && rawW < rawH) {
+                    return rawH to rawW
+                }
+                if (isRotatedPortrait && rawW > rawH) {
+                    return rawH to rawW
+                }
+            }
+            return rawW to rawH
+        }
+
+        /**
+         * Detailed Head Unit (`1280×720`) -> physical smartphone screen mapping that also reports
+         * whether the touch landed inside the active projected area (excluding pillarbox/letterbox black bars)
+         * and guards horizontal edge taps against accidentally triggering Samsung One UI back-swipe gestures.
+         */
+        fun mapHuTouchToPhysicalScreenDetailed(
+            rawX: Int,
+            rawY: Int,
+            huWidth: Float = 1280f,
+            huHeight: Float = 720f,
+            screenWidth: Int,
+            screenHeight: Int,
+            applyEdgeGuard: Boolean = true
+        ): MappedPhysicalTouch {
+            val safeHuW = huWidth.coerceAtLeast(1f)
+            val safeHuH = huHeight.coerceAtLeast(1f)
+            val safeScreenW = screenWidth.coerceAtLeast(1).toFloat()
+            val safeScreenH = screenHeight.coerceAtLeast(1).toFloat()
+
+            // MediaProjection AUTO_MIRROR fits the phone screen inside huWidth x huHeight preserving aspect ratio.
+            val scale = minOf(safeHuW / safeScreenW, safeHuH / safeScreenH)
+            val drawnW = (safeScreenW * scale).coerceAtLeast(1f)
+            val drawnH = (safeScreenH * scale).coerceAtLeast(1f)
+            val offsetX = (safeHuW - drawnW) / 2f
+            val offsetY = (safeHuH - drawnH) / 2f
+
+            // Allow a small 6 px forgiveness band around the active image border while rejecting deep black bars
+            val borderTolerancePx = 6f
+            val isInsideX = rawX.toFloat() >= (offsetX - borderTolerancePx) &&
+                rawX.toFloat() <= (offsetX + drawnW + borderTolerancePx)
+            val isInsideY = rawY.toFloat() >= (offsetY - borderTolerancePx) &&
+                rawY.toFloat() <= (offsetY + drawnH + borderTolerancePx)
+            val isInsideActiveArea = isInsideX && isInsideY
+
+            val normX = ((rawX.toFloat() - offsetX) / drawnW).coerceIn(0f, 1f)
+            val normY = ((rawY.toFloat() - offsetY) / drawnH).coerceIn(0f, 1f)
+
+            val maxX = (safeScreenW - 1f).coerceAtLeast(0f)
+            val maxY = (safeScreenH - 1f).coerceAtLeast(0f)
+            var physX = (normX * safeScreenW).coerceIn(0f, maxX)
+            val physY = (normY * safeScreenH).coerceIn(0f, maxY)
+
+            if (applyEdgeGuard && safeScreenW > EDGE_BACK_GUARD_PX * 4f) {
+                physX = physX.coerceIn(EDGE_BACK_GUARD_PX, maxX - EDGE_BACK_GUARD_PX)
+            }
+
+            return MappedPhysicalTouch(
+                x = physX,
+                y = physY,
+                isInsideActiveArea = isInsideActiveArea,
+                isLandscape = screenWidth > screenHeight,
+                screenWidth = screenWidth,
+                screenHeight = screenHeight
+            )
         }
 
         /**
@@ -361,24 +527,16 @@ class CarLifeAccessibilityService : AccessibilityService() {
             screenWidth: Int,
             screenHeight: Int
         ): Pair<Float, Float> {
-            val safeHuW = huWidth.coerceAtLeast(1f)
-            val safeHuH = huHeight.coerceAtLeast(1f)
-            val safeScreenW = screenWidth.coerceAtLeast(1).toFloat()
-            val safeScreenH = screenHeight.coerceAtLeast(1).toFloat()
-
-            // MediaProjection AUTO_MIRROR fits the phone screen inside huWidth x huHeight preserving aspect ratio.
-            val scale = minOf(safeHuW / safeScreenW, safeHuH / safeScreenH)
-            val drawnW = (safeScreenW * scale).coerceAtLeast(1f)
-            val drawnH = (safeScreenH * scale).coerceAtLeast(1f)
-            val offsetX = (safeHuW - drawnW) / 2f
-            val offsetY = (safeHuH - drawnH) / 2f
-
-            val normX = ((rawX.toFloat() - offsetX) / drawnW).coerceIn(0f, 1f)
-            val normY = ((rawY.toFloat() - offsetY) / drawnH).coerceIn(0f, 1f)
-
-            val physX = (normX * safeScreenW).coerceIn(0f, (safeScreenW - 1f).coerceAtLeast(0f))
-            val physY = (normY * safeScreenH).coerceIn(0f, (safeScreenH - 1f).coerceAtLeast(0f))
-            return physX to physY
+            val mapped = mapHuTouchToPhysicalScreenDetailed(
+                rawX = rawX,
+                rawY = rawY,
+                huWidth = huWidth,
+                huHeight = huHeight,
+                screenWidth = screenWidth,
+                screenHeight = screenHeight,
+                applyEdgeGuard = false
+            )
+            return mapped.x to mapped.y
         }
 
         fun computeSwipeDurationMs(downTimeMs: Long, upTimeMs: Long): Long {

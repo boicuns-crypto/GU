@@ -316,6 +316,7 @@ data class ProjectionPipelineStats(
     val appMode: AppMode = AppMode.MIRRORING,
     val videoSourceMode: VideoSourceMode = VideoSourceMode.SCREEN_MIRRORING,
     val usingMediaProjection: Boolean = false,
+    val isMediaProjectionFgsActive: Boolean = false,
     val virtualDisplayId: Int = Display.DEFAULT_DISPLAY,
     val virtualDisplayDpi: Int = CockpitProjectionManager.MIRROR_VIRTUAL_DISPLAY_DPI,
     val mediaProjectionState: String = "Ожидает разрешения («Весь экран»)",
@@ -323,6 +324,12 @@ data class ProjectionPipelineStats(
     val width: Int = 1280,
     val height: Int = 720,
     val fps: Int = 30,
+    val actualFps: Float = 0f,
+    val idrPerSec: Float = 0f,
+    val activeEncoderProfile: String = "AVCProfileBaseline+Level3+VBR",
+    val phoneScreenWidth: Int = 0,
+    val phoneScreenHeight: Int = 0,
+    val isPhoneLandscape: Boolean = false,
     val bitRateMbps: Int = 2,
     val bitRateKbps: Int = 2000,
     val encodedNalFrames: Long = 0L,
@@ -331,6 +338,7 @@ data class ProjectionPipelineStats(
     val spsPpsConfigured: Boolean = false,
     val injectedTouches: Long = 0L,
     val lastTouchPoint: Pair<Float, Float>? = null,
+    val lastTouchDiagnostic: String = "Ожидание касаний 0x0006",
     val activeCockpitWidget: String = "Зеркалирование экрана (MediaProjection) готово",
     val statusMessage: String = "Зеркалирование экрана (1280×720 @ 2.0 Мбит/с, VBR 30fps, AOA 20B)"
 )
@@ -347,6 +355,7 @@ class CockpitProjectionManager(
     context: Context,
     private val onEncodedVideoNal: (nalBytes: ByteArray, timestampMs: Long, isKeyFrame: Boolean) -> Unit,
     private val onVideoIdleHeartbeat: (timestampMs: Long) -> Unit = {},
+    private val onMediaProjectionStopped: () -> Unit = {},
     private val externalScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 ) {
     private val appContext = context.applicationContext
@@ -381,6 +390,24 @@ class CockpitProjectionManager(
     @Volatile
     var appLaunchMode: AppLaunchMode = AppLaunchMode.SCREEN_MIRRORING
         private set
+
+    /**
+     * Android 14–16 FGS gate: must be `true` (set by `BridgeForegroundService.promoteToForeground()`)
+     * before consuming the single-use `resultData` Intent in `getMediaProjection(...)`.
+     * Defaults to `true` for standalone unit tests; `BridgeForegroundService` initializes it to `false`
+     * until `startForeground(..., FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)` succeeds.
+     */
+    @Volatile
+    var isMediaProjectionFgsReady: Boolean = true
+        private set
+
+    @Volatile
+    private var lastConfiguredEncoderProfile: String = "AVCProfileBaseline+Level3+VBR"
+
+    fun setMediaProjectionFgsReady(ready: Boolean) {
+        isMediaProjectionFgsReady = ready
+        _stats.update { it.copy(isMediaProjectionFgsActive = ready) }
+    }
 
     init {
         CarLifeLauncherRepository.onFallbackToPhoneScreen = {
@@ -432,6 +459,7 @@ class CockpitProjectionManager(
                     detail = stopReason,
                     error = stopReason
                 )
+                runCatching { onMediaProjectionStopped() }
                 externalScope.launch {
                     projectionMutex.withLock {
                         if (mediaProjection === targetMp) {
@@ -488,6 +516,10 @@ class CockpitProjectionManager(
     suspend fun getOrCreateMediaProjectionForAudio(): MediaProjection? = projectionMutex.withLock {
         val currentMp = mediaProjection
         if (currentMp != null && !MediaProjectionTokenStore.hasPendingToken.value) {
+            return@withLock currentMp
+        }
+        if (!isMediaProjectionFgsReady) {
+            Log.w(TAG, "Skipping getMediaProjection(audio) until FGS FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION is active")
             return@withLock currentMp
         }
         val (tokenCode, tokenData) = MediaProjectionTokenStore.consumeToken()
@@ -596,10 +628,16 @@ class CockpitProjectionManager(
         val safeFps = if (frameRate in 15..60) frameRate else 30
         val safeBitRate = bitRate.coerceIn(400_000, 12_000_000)
 
+        val usesMpSource = sourceMode == VideoSourceMode.SCREEN_MIRRORING ||
+            sourceMode == VideoSourceMode.VIRTUAL_DISPLAY
         val alreadyActive = projectionMutex.withLock {
             val current = _stats.value
+            val needsFreshMpAttach = usesMpSource &&
+                !current.usingMediaProjection &&
+                (MediaProjectionTokenStore.hasPendingToken.value || mediaProjection != null)
             isEncoding.get() &&
                 mediaCodec != null &&
+                !needsFreshMpAttach &&
                 current.appMode == targetAppMode &&
                 current.videoSourceMode == sourceMode &&
                 current.width == safeWidth &&
@@ -758,18 +796,26 @@ class CockpitProjectionManager(
                 }
             } else {
                 if (usedMediaProjection && vDisplay != null) {
-                    val exactConfigMatches =
-                        virtualDisplayWidth == safeWidth &&
-                            virtualDisplayHeight == safeHeight &&
-                            virtualDisplayDpi == effectiveDpi &&
-                            virtualDisplayIsMirrorOnly == wantMirrorOnlyFlags &&
+                    val flagsMatch =
+                        virtualDisplayIsMirrorOnly == wantMirrorOnlyFlags &&
                             virtualDisplayFlags == targetVdFlags
-                    if (exactConfigMatches) {
-                        // Reuse VirtualDisplay ONLY when exact (width, height, dpi, flags) already match — zero intermediate resize.
+                    if (flagsMatch) {
+                        // Android 14–16 best practice: NEVER release+recreate VirtualDisplay when only surface/size/dpi changed.
+                        // Resize in-place if dimensions or DPI changed, then attach the new MediaCodec inputSurface.
+                        val dimensionsChanged =
+                            virtualDisplayWidth != safeWidth ||
+                                virtualDisplayHeight != safeHeight ||
+                                virtualDisplayDpi != effectiveDpi
                         runCatching {
+                            if (dimensionsChanged) {
+                                vDisplay!!.resize(safeWidth, safeHeight, effectiveDpi)
+                                virtualDisplayWidth = safeWidth
+                                virtualDisplayHeight = safeHeight
+                                virtualDisplayDpi = effectiveDpi
+                            }
                             vDisplay!!.surface = inputSurface
                         }.onFailure { e ->
-                            Log.w(TAG, "VirtualDisplay setSurface failed (${e.message}), recreating cleanly")
+                            Log.w(TAG, "VirtualDisplay resize/setSurface failed (${e.message}), recreating cleanly")
                             runCatching { vDisplay?.release() }
                             vDisplay = null
                             virtualDisplayWidth = 0
@@ -780,7 +826,7 @@ class CockpitProjectionManager(
                             usedMediaProjection = false
                         }
                     } else {
-                        // Dimensions, DPI, or mirroring flags changed: recreate VirtualDisplay cleanly.
+                        // Mirroring vs Presentation flags changed: release old VirtualDisplay cleanly.
                         dismissPresentationSafely()
                         runCatching { vDisplay?.surface = null }
                         runCatching { vDisplay?.release() }
@@ -796,53 +842,49 @@ class CockpitProjectionManager(
 
                 // If no existing VirtualDisplay, obtain MediaProjection from a newly consumed single-use token or reuse live activeMp
                 if (!usedMediaProjection) {
-                    val consumedToken = MediaProjectionTokenStore.consumeToken()
-                    if (consumedToken != null || activeMp != null) {
-                        runCatching {
-                            val mp: MediaProjection? = if (consumedToken != null) {
-                                // Stop any stale MediaProjection before exchanging the fresh single-use Intent
-                                activeMp?.let { oldMp ->
-                                    runCatching {
-                                        mediaProjectionCallback?.let { cb -> oldMp.unregisterCallback(cb) }
-                                        oldMp.stop()
+                    if (!isMediaProjectionFgsReady && activeMp == null && MediaProjectionTokenStore.hasPendingToken.value) {
+                        // CRITICAL for Android 14–16: DO NOT consume/burn the single-use Intent token before FGS mediaProjection is active!
+                        mpErrorMessage = "Ожидание FGS mediaProjection (одноразовый токен сохранён)"
+                        Log.w(TAG, "Deferred MediaProjection creation: FGS FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION not yet active")
+                    } else {
+                        val consumedToken = if (isMediaProjectionFgsReady) {
+                            MediaProjectionTokenStore.consumeToken()
+                        } else {
+                            null
+                        }
+                        if (consumedToken != null || activeMp != null) {
+                            val reusedWithoutFreshToken = (consumedToken == null && activeMp != null)
+                            runCatching {
+                                val mp: MediaProjection? = if (consumedToken != null) {
+                                    // Stop any stale MediaProjection before exchanging the fresh single-use Intent
+                                    activeMp?.let { oldMp ->
+                                        runCatching {
+                                            mediaProjectionCallback?.let { cb -> oldMp.unregisterCallback(cb) }
+                                            oldMp.stop()
+                                        }
+                                        mediaProjectionCallback = null
+                                        mediaProjection = null
                                     }
-                                    mediaProjectionCallback = null
-                                    mediaProjection = null
+                                    mediaProjectionManager.getMediaProjection(consumedToken.first, consumedToken.second)
+                                } else {
+                                    activeMp
                                 }
-                                mediaProjectionManager.getMediaProjection(consumedToken.first, consumedToken.second)
-                            } else {
-                                activeMp
-                            }
 
-                            if (mp != null) {
-                                if (mediaProjectionCallback == null || mp !== activeMp) {
-                                    val callback = createMediaProjectionCallback(mp)
-                                    mp.registerCallback(callback, mainHandler)
-                                    mediaProjectionCallback = callback
-                                }
-                                activeMp = mp
-                                mediaProjection = mp
-                                MediaProjectionTokenStore.setActiveProjection(
-                                    active = true,
-                                    detail = "MediaProjection активен (${if (wantMirrorOnlyFlags) "Зеркало" else "VD"})"
-                                )
-
-                                var createdFlags = targetVdFlags
-                                vDisplay = runCatching {
-                                    mp.createVirtualDisplay(
-                                        VIRTUAL_DISPLAY_NAME,
-                                        safeWidth,
-                                        safeHeight,
-                                        effectiveDpi,
-                                        createdFlags,
-                                        inputSurface,
-                                        null,
-                                        mainHandler
+                                if (mp != null) {
+                                    if (mediaProjectionCallback == null || mp !== activeMp) {
+                                        val callback = createMediaProjectionCallback(mp)
+                                        mp.registerCallback(callback, mainHandler)
+                                        mediaProjectionCallback = callback
+                                    }
+                                    activeMp = mp
+                                    mediaProjection = mp
+                                    MediaProjectionTokenStore.setActiveProjection(
+                                        active = true,
+                                        detail = "MediaProjection активен (${if (wantMirrorOnlyFlags) "Зеркало" else "VD"})"
                                     )
-                                }.getOrElse { firstErr ->
-                                    if (targetAppMode == AppMode.SHIZUKU_COCKPIT) {
-                                        createdFlags = DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or
-                                            DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION
+
+                                    var createdFlags = targetVdFlags
+                                    vDisplay = runCatching {
                                         mp.createVirtualDisplay(
                                             VIRTUAL_DISPLAY_NAME,
                                             safeWidth,
@@ -853,51 +895,72 @@ class CockpitProjectionManager(
                                             null,
                                             mainHandler
                                         )
-                                    } else {
-                                        throw firstErr
+                                    }.getOrElse { firstErr ->
+                                        if (targetAppMode == AppMode.SHIZUKU_COCKPIT) {
+                                            createdFlags = DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC or
+                                                DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION
+                                            mp.createVirtualDisplay(
+                                                VIRTUAL_DISPLAY_NAME,
+                                                safeWidth,
+                                                safeHeight,
+                                                effectiveDpi,
+                                                createdFlags,
+                                                inputSurface,
+                                                null,
+                                                mainHandler
+                                            )
+                                        } else {
+                                            throw firstErr
+                                        }
                                     }
+                                    virtualDisplayWidth = safeWidth
+                                    virtualDisplayHeight = safeHeight
+                                    virtualDisplayDpi = effectiveDpi
+                                    virtualDisplayIsMirrorOnly = wantMirrorOnlyFlags
+                                    virtualDisplayFlags = createdFlags
+                                    usedMediaProjection = true
+                                    mpErrorMessage = null
+                                } else {
+                                    mpErrorMessage = "getMediaProjection() вернул null — требуется повторно выдать «Весь экран»"
+                                    MediaProjectionTokenStore.setActiveProjection(
+                                        active = false,
+                                        detail = mpErrorMessage,
+                                        error = mpErrorMessage
+                                    )
                                 }
-                                virtualDisplayWidth = safeWidth
-                                virtualDisplayHeight = safeHeight
-                                virtualDisplayDpi = effectiveDpi
-                                virtualDisplayIsMirrorOnly = wantMirrorOnlyFlags
-                                virtualDisplayFlags = createdFlags
-                                usedMediaProjection = true
-                                mpErrorMessage = null
-                            } else {
-                                mpErrorMessage = "getMediaProjection() вернул null — требуется повторно выдать «Весь экран»"
+                            }.onFailure { e ->
+                                mpErrorMessage = if (reusedWithoutFreshToken &&
+                                    (e is SecurityException || e is IllegalStateException)
+                                ) {
+                                    "Android 14–16 требует повторно выдать «Весь экран» после смены режима VirtualDisplay (${e.javaClass.simpleName})"
+                                } else {
+                                    "${e.javaClass.simpleName}: ${e.message ?: "Ошибка MediaProjection"}"
+                                }
+                                Log.w(TAG, "MediaProjection / VirtualDisplay failed ($mpErrorMessage)")
+                                runCatching {
+                                    mediaProjectionCallback?.let { cb -> activeMp?.unregisterCallback(cb) }
+                                    activeMp?.stop()
+                                }
+                                mediaProjectionCallback = null
+                                mediaProjection = null
+                                activeMp = null
+                                vDisplay = null
+                                virtualDisplay = null
+                                virtualDisplayWidth = 0
+                                virtualDisplayHeight = 0
+                                virtualDisplayDpi = 0
+                                virtualDisplayIsMirrorOnly = false
+                                virtualDisplayFlags = 0
                                 MediaProjectionTokenStore.setActiveProjection(
                                     active = false,
                                     detail = mpErrorMessage,
                                     error = mpErrorMessage
                                 )
                             }
-                        }.onFailure { e ->
-                            mpErrorMessage = "${e.javaClass.simpleName}: ${e.message ?: "Ошибка MediaProjection"}"
-                            Log.w(TAG, "MediaProjection / VirtualDisplay failed ($mpErrorMessage)")
-                            runCatching {
-                                mediaProjectionCallback?.let { cb -> activeMp?.unregisterCallback(cb) }
-                                activeMp?.stop()
-                            }
-                            mediaProjectionCallback = null
-                            mediaProjection = null
-                            activeMp = null
-                            vDisplay = null
-                            virtualDisplay = null
-                            virtualDisplayWidth = 0
-                            virtualDisplayHeight = 0
-                            virtualDisplayDpi = 0
-                            virtualDisplayIsMirrorOnly = false
-                            virtualDisplayFlags = 0
-                            MediaProjectionTokenStore.setActiveProjection(
-                                active = false,
-                                detail = mpErrorMessage,
-                                error = mpErrorMessage
-                            )
+                        } else {
+                            mpErrorMessage = MediaProjectionTokenStore.lastError.value
+                                ?: "Токен MediaProjection отсутствует — выдайте «Весь экран»"
                         }
-                    } else {
-                        mpErrorMessage = MediaProjectionTokenStore.lastError.value
-                            ?: "Токен MediaProjection отсутствует — выдайте «Весь экран»"
                     }
                 }
 
@@ -957,12 +1020,16 @@ class CockpitProjectionManager(
                         bitrateBps = safeBitRate
                     )
 
+                    val (livePhoneW, livePhoneH) = CarLifeAccessibilityService.instance?.getPhysicalScreenSize()
+                        ?: CarLifeAccessibilityService.computePhysicalScreenSize(appContext)
+
                     _stats.update {
                         it.copy(
                             isRunning = true,
                             appMode = targetAppMode,
                             videoSourceMode = sourceMode,
                             usingMediaProjection = true,
+                            isMediaProjectionFgsActive = isMediaProjectionFgsReady,
                             virtualDisplayId = createdDisplay.displayId,
                             virtualDisplayDpi = effectiveDpi,
                             mediaProjectionState = "Активен (Весь экран)",
@@ -970,6 +1037,10 @@ class CockpitProjectionManager(
                             width = safeWidth,
                             height = safeHeight,
                             fps = safeFps,
+                            activeEncoderProfile = lastConfiguredEncoderProfile,
+                            phoneScreenWidth = livePhoneW,
+                            phoneScreenHeight = livePhoneH,
+                            isPhoneLandscape = livePhoneW > livePhoneH,
                             bitRateMbps = (safeBitRate / 1_000_000).coerceAtLeast(1),
                             bitRateKbps = safeBitRate / 1_000,
                             activeCockpitWidget = when {
@@ -1792,26 +1863,51 @@ class CockpitProjectionManager(
 
         return withContext(Dispatchers.Main.immediate) {
             if (appMode == AppMode.MIRRORING) {
-                val (screenW, screenH) = CarLifeAccessibilityService.computePhysicalScreenSize(appContext)
-                val (physX, physY) = CarLifeAccessibilityService.mapHuTouchToPhysicalScreen(
+                val a11yService = CarLifeAccessibilityService.instance
+                val (screenW, screenH) = a11yService?.getPhysicalScreenSize()
+                    ?: CarLifeAccessibilityService.computePhysicalScreenSize(appContext)
+                val mapped = CarLifeAccessibilityService.mapHuTouchToPhysicalScreenDetailed(
                     rawX = packet.rawX,
                     rawY = packet.rawY,
                     huWidth = huTouchMaxX,
                     huHeight = huTouchMaxY,
                     screenWidth = screenW,
-                    screenHeight = screenH
+                    screenHeight = screenH,
+                    applyEdgeGuard = true
                 )
-                val a11yService = CarLifeAccessibilityService.instance
+                val orientLabel = if (mapped.isLandscape) "Landscape" else "Portrait"
+
+                if (!mapped.isInsideActiveArea) {
+                    val skippedLabel =
+                        "Тач в чёрном поле HU(${packet.rawX},${packet.rawY}) пропущен ($screenW×$screenH $orientLabel)"
+                    _stats.update {
+                        it.copy(
+                            phoneScreenWidth = screenW,
+                            phoneScreenHeight = screenH,
+                            isPhoneLandscape = mapped.isLandscape,
+                            lastTouchDiagnostic = skippedLabel
+                        )
+                    }
+                    return@withContext false
+                }
+
                 val a11yDispatched = a11yService?.handleMotionStream(
                     displayId = Display.DEFAULT_DISPLAY,
                     action = packet.androidAction,
-                    x = physX,
-                    y = physY,
-                    synthesizeClickUp = packet.synthesizeClickUp
+                    x = mapped.x,
+                    y = mapped.y,
+                    synthesizeClickUp = packet.synthesizeClickUp,
+                    isDoubleClick = packet.isDoubleClick,
+                    isLongPress = packet.isLongPress
                 ) ?: false
 
+                val gestureTag = when {
+                    packet.isDoubleClick -> "2xTAP"
+                    packet.isLongPress -> "LONG"
+                    else -> "TOUCH"
+                }
                 val statusLabel = if (a11yService != null) {
-                    "Mirror Touch (${physX.toInt()},${physY.toInt()}) / ${screenW}×${screenH}"
+                    "Mirror $gestureTag HU(${packet.rawX},${packet.rawY}) -> (${mapped.x.toInt()},${mapped.y.toInt()}) / ${screenW}×${screenH} $orientLabel"
                 } else {
                     "Touch 0x0006 получен, но CarLifeAccessibilityService ВЫКЛ!"
                 }
@@ -1819,7 +1915,11 @@ class CockpitProjectionManager(
                 _stats.update {
                     it.copy(
                         injectedTouches = it.injectedTouches + 1L,
-                        lastTouchPoint = physX to physY,
+                        lastTouchPoint = mapped.x to mapped.y,
+                        phoneScreenWidth = screenW,
+                        phoneScreenHeight = screenH,
+                        isPhoneLandscape = mapped.isLandscape,
+                        lastTouchDiagnostic = statusLabel,
                         activeCockpitWidget = statusLabel,
                         statusMessage = statusLabel
                     )
@@ -2270,6 +2370,20 @@ class CockpitProjectionManager(
                 )
             )
             add(
+                "MinimalAVC+30fpsCap" to buildPreferredAvcMediaFormat(
+                    width = width,
+                    height = height,
+                    frameRate = frameRate,
+                    bitRate = bitRate,
+                    includeBaselineProfile = false,
+                    targetLevel = null,
+                    includeVbr = false,
+                    includeVendorTimingKeys = false,
+                    includeSamsungQpMax = false,
+                    includeFpsLimitKeys = true
+                )
+            )
+            add(
                 "MinimalAVC" to buildPreferredAvcMediaFormat(
                     width = width,
                     height = height,
@@ -2292,6 +2406,7 @@ class CockpitProjectionManager(
                     codec.reset()
                 }
                 codec.configure(candidate, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                lastConfiguredEncoderProfile = label
                 Log.i(TAG, "Configured H.264 encoder in $label ($width×$height @ ${frameRate}fps, ${bitRate / 1000}kbps)")
                 return codec
             } catch (e: Exception) {
@@ -2356,13 +2471,63 @@ class CockpitProjectionManager(
         var currentDynamicBitrate = initialBitRate
         var pendingSliceFrames = 0L
         var pendingSliceBytes = 0L
+        var fpsWindowStartMs = SystemClock.elapsedRealtime()
+        var fpsWindowFrames = 0
+        var fpsWindowIdrs = 0
+        var lastOrientationCheckMs = 0L
+        var lastKnownScreenSize: Pair<Int, Int>? = null
+
+        fun maybePublishFpsAndOrientation(nowMs: Long) {
+            val elapsedFpsMs = nowMs - fpsWindowStartMs
+            if (elapsedFpsMs >= 1000L) {
+                val measuredFps = (fpsWindowFrames * 1000f) / elapsedFpsMs.coerceAtLeast(1L)
+                val measuredIdrRate = (fpsWindowIdrs * 1000f) / elapsedFpsMs.coerceAtLeast(1L)
+                fpsWindowStartMs = nowMs
+                fpsWindowFrames = 0
+                fpsWindowIdrs = 0
+                _stats.update {
+                    it.copy(
+                        actualFps = measuredFps,
+                        idrPerSec = measuredIdrRate,
+                        activeEncoderProfile = lastConfiguredEncoderProfile
+                    )
+                }
+            }
+            if (appMode == AppMode.MIRRORING && (nowMs - lastOrientationCheckMs) >= 300L) {
+                lastOrientationCheckMs = nowMs
+                val currentSize = CarLifeAccessibilityService.instance?.getPhysicalScreenSize()
+                    ?: CarLifeAccessibilityService.computePhysicalScreenSize(appContext)
+                val prev = lastKnownScreenSize
+                if (prev != currentSize) {
+                    lastKnownScreenSize = currentSize
+                    _stats.update {
+                        it.copy(
+                            phoneScreenWidth = currentSize.first,
+                            phoneScreenHeight = currentSize.second,
+                            isPhoneLandscape = currentSize.first > currentSize.second
+                        )
+                    }
+                    if (prev != null && isVideoChannelReadyForStreaming) {
+                        // Orientation changed (Portrait <-> Landscape): request one crisp IDR sync frame
+                        runCatching {
+                            val syncParams = Bundle().apply {
+                                putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
+                            }
+                            codec.setParameters(syncParams)
+                        }
+                    }
+                }
+            }
+        }
 
         try {
             while (isActive && isEncoding.get()) {
                 val outIndex = codec.dequeueOutputBuffer(bufferInfo, DEQUEUE_TIMEOUT_US)
+                val loopNowMs = SystemClock.elapsedRealtime()
+                maybePublishFpsAndOrientation(loopNowMs)
                 when {
                     outIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> {
-                        val nowElapsed = SystemClock.elapsedRealtime()
+                        val nowElapsed = loopNowMs
                         // Per VideoOutputThread.smali: if no frame arrives from MediaCodec for >200 ms,
                         // send an empty MSG_VIDEO_HEARTBEAT (0x00020002, payloadLen = 0) instead of standalone SPS/PPS.
                         if (isVideoChannelReadyForStreaming &&
@@ -2466,6 +2631,8 @@ class CockpitProjectionManager(
                             }
 
                             if (containsIdrNal) {
+                                fpsWindowFrames++
+                                fpsWindowIdrs++
                                 lastCodecFrameElapsedMs = SystemClock.elapsedRealtime()
                                 awaitingFirstIdrAfterGateOpen.set(false)
                                 if (pendingSliceFrames > 0L) {
@@ -2481,12 +2648,13 @@ class CockpitProjectionManager(
                                     }
                                 }
                                 // Send ONE combined packet: cachedSpsPps + idrBytes (unless already prepended)
-                                // Keep steady configured CBR bitrate (2 000 000 bps default) for crisp 1280×720 clarity.
+                                // Keep steady configured VBR bitrate (2 000 000 bps default) for crisp 1280×720 clarity.
                                 emitCombinedSpsPpsAndIdr(
                                     idrBytes = rawNal,
                                     timestampMs = timestampMs
                                 )
                             } else if (!awaitingFirstIdrAfterGateOpen.get()) {
+                                fpsWindowFrames++
                                 lastCodecFrameElapsedMs = SystemClock.elapsedRealtime()
                                 // Regular P-frame (Slice): send as-is in ONE packet without splitting
                                 val slicePacket = CarLifeFrameCodec.ensureAnnexBStartCode(rawNal)
