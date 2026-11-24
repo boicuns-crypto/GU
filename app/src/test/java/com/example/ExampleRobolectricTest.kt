@@ -19,6 +19,7 @@ import com.example.core.audio.AudioCapturePreferences
 import com.example.core.audio.CarLifeAudioCaptureManager
 import com.example.core.carlife.CarLifeHardKeyPacket
 import com.example.core.carlife.CarLifeTouchPacket
+import com.example.core.config.AppEditionConfig
 import com.example.core.input.CarLifeAccessibilityService
 import com.example.core.input.TouchSensitivityConfig
 import com.example.core.input.TouchSensitivityPreset
@@ -36,6 +37,7 @@ import com.example.core.shizuku.CarLifeShizukuService
 import com.example.core.usb.BridgeForegroundService
 import com.example.core.usb.BridgeTelemetryBus
 import com.example.core.usb.CarLifeUsbWriteQueue
+import com.example.core.usb.UsbAccessoryTransport
 import com.example.protocol.carlife.CarLifeFrameCodec
 import androidx.compose.ui.graphics.Color
 import com.example.feature.cockpit.AppLaunchMode
@@ -322,13 +324,15 @@ class ExampleRobolectricTest {
     assertEquals(30f, fmt.getFloat(MediaFormat.KEY_MAX_FPS_TO_ENCODER), 0.001f)
     assertEquals(30, fmt.getInteger(MediaFormat.KEY_CAPTURE_RATE))
     assertEquals(2_000_000, fmt.getInteger(MediaFormat.KEY_BIT_RATE))
-    assertEquals(1, fmt.getInteger(MediaFormat.KEY_I_FRAME_INTERVAL))
+    assertEquals(2, fmt.getInteger(MediaFormat.KEY_I_FRAME_INTERVAL))
     assertEquals(MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR, fmt.getInteger(MediaFormat.KEY_BITRATE_MODE))
     assertEquals(MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline, fmt.getInteger(MediaFormat.KEY_PROFILE))
     assertEquals(MediaCodecInfo.CodecProfileLevel.AVCLevel3, fmt.getInteger(MediaFormat.KEY_LEVEL))
     assertEquals(0, fmt.getInteger(MediaFormat.KEY_PRIORITY))
+    assertEquals(120, fmt.getInteger(MediaFormat.KEY_OPERATING_RATE))
     assertEquals(100_000L, fmt.getLong(MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER))
     assertEquals(36, fmt.getInteger(CockpitProjectionManager.SAMSUNG_QP_P_MAX_KEY))
+    assertEquals(8, UsbAccessoryTransport.MAX_QUEUED_VIDEO_FRAMES)
   }
 
   @Test
@@ -1231,6 +1235,7 @@ class ExampleRobolectricTest {
       assertTrue(EmbeddedYandexMapsController.isTrustedYandexOrigin("https://maps.yandex.ru/"))
       assertFalse(EmbeddedYandexMapsController.isTrustedYandexOrigin("https://evil.example.com/"))
       assertFalse(EmbeddedYandexMapsController.isTrustedYandexOrigin(null))
+      assertTrue(EmbeddedYandexMapsController.HIDE_SMART_BANNER_JS.contains("MutationObserver"))
     } finally {
       CockpitUiStateController.showGrid()
     }
@@ -1375,6 +1380,76 @@ class ExampleRobolectricTest {
     } finally {
       manager.shizukuLeftPanelViewForTesting = null
       CarLifeShizukuManager.setServiceForTesting(null)
+    }
+  }
+
+  @Test
+  fun `CarLifeAccessibilityService arms disarms and matches Samsung SystemUI MediaProjection dialog labels`() {
+    try {
+      CarLifeAccessibilityService.disarmAutoConfirmMediaProjection()
+      assertFalse(CarLifeAccessibilityService.isAutoConfirmMediaProjectionArmed())
+
+      CarLifeAccessibilityService.armAutoConfirmMediaProjection(timeoutMs = 10_000L)
+      assertTrue(CarLifeAccessibilityService.isAutoConfirmMediaProjectionArmed())
+
+      CarLifeAccessibilityService.disarmAutoConfirmMediaProjection()
+      assertFalse(CarLifeAccessibilityService.isAutoConfirmMediaProjectionArmed())
+
+      assertTrue(CarLifeAccessibilityService.isMediaProjectionDialogPackage("com.android.systemui"))
+      assertFalse(CarLifeAccessibilityService.isMediaProjectionDialogPackage("com.example.other"))
+
+      assertTrue(CarLifeAccessibilityService.isSingleAppSelectorLabel("Одно приложение"))
+      assertTrue(CarLifeAccessibilityService.isSingleAppSelectorLabel("A single app"))
+      assertFalse(CarLifeAccessibilityService.isSingleAppSelectorLabel("Весь экран"))
+
+      assertTrue(CarLifeAccessibilityService.isEntireScreenOptionLabel("Весь экран"))
+      assertTrue(CarLifeAccessibilityService.isEntireScreenOptionLabel("Entire screen"))
+      assertTrue(CarLifeAccessibilityService.isEntireScreenOptionLabel("Поделиться всем экраном"))
+      assertFalse(CarLifeAccessibilityService.isEntireScreenOptionLabel("Одно приложение"))
+
+      assertTrue(CarLifeAccessibilityService.isPositiveConfirmButtonLabel("Начать"))
+      assertTrue(CarLifeAccessibilityService.isPositiveConfirmButtonLabel("Start now"))
+      assertTrue(CarLifeAccessibilityService.isPositiveConfirmButtonLabel("Разрешить"))
+      assertFalse(CarLifeAccessibilityService.isPositiveConfirmButtonLabel("Отмена"))
+      assertFalse(CarLifeAccessibilityService.isPositiveConfirmButtonLabel("Cancel"))
+    } finally {
+      CarLifeAccessibilityService.disarmAutoConfirmMediaProjection()
+    }
+  }
+
+  @Test
+  fun `Mirror-Only edition locks AppMode to MIRRORING and requires 4 checklist prerequisites`() {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    try {
+      AppEditionConfig.setMirrorOnlyOverrideForTesting(true)
+      assertTrue(AppEditionConfig.isMirrorOnly)
+      assertEquals("Mirror Only", AppEditionConfig.editionLabel)
+      assertEquals("Jetta Mirror", AppEditionConfig.appDisplayName)
+
+      AppModePreferences.saveAppMode(context, AppMode.COCKPIT)
+      assertEquals(AppMode.MIRRORING, AppModePreferences.loadAppMode(context))
+
+      BridgeTelemetryBus.setAppMode(AppMode.SHIZUKU_COCKPIT, context)
+      assertEquals(AppMode.MIRRORING, BridgeTelemetryBus.runtimeState.value.appMode)
+
+      val mirrorChecklist = SetupChecklistStatus(
+        step1BatteryUnrestricted = true,
+        step2OverlayGranted = true,
+        step3AccessibilityEnabled = true,
+        step4NotificationAccessGranted = false,
+        step5MediaProjectionGranted = true
+      )
+      assertEquals(4, mirrorChecklist.totalMandatorySteps)
+      assertEquals(4, mirrorChecklist.completedMandatorySteps)
+      assertTrue(mirrorChecklist.allPrerequisitesReady)
+
+      ScreenKeepAlivePreferences.clear(context)
+      assertTrue(ScreenKeepAlivePreferences.init(context).autoConfirmMediaProjection)
+      ScreenKeepAlivePreferences.updateConfig(context) { it.copy(autoConfirmMediaProjection = false) }
+      assertFalse(ScreenKeepAlivePreferences.init(context).autoConfirmMediaProjection)
+    } finally {
+      AppEditionConfig.setMirrorOnlyOverrideForTesting(null)
+      ScreenKeepAlivePreferences.clear(context)
     }
   }
 }

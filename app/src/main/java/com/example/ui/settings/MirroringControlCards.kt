@@ -459,6 +459,19 @@ fun ScreenKeepAliveSettingsCard(
                 }
             )
 
+            SettingsSwitchRow(
+                title = "Автоподтверждение «Весь экран»",
+                subtitle = "Автоматически выбирает «Весь экран» и нажимает «Начать» в системном окне MediaProjection (требует службу спец. возможностей)",
+                checked = config.autoConfirmMediaProjection,
+                testTag = "screen_auto_confirm_mp_switch",
+                onCheckedChange = { enabled ->
+                    ScreenKeepAlivePreferences.updateConfig(context) {
+                        it.copy(autoConfirmMediaProjection = enabled)
+                    }
+                    onNotifyServiceConfigChanged()
+                }
+            )
+
             val needsOverlayPerm = config.keepScreenAwakeOverlay ||
                 config.dimPhoneScreenDuringMirroring ||
                 config.autoRotateLeftOnUsb

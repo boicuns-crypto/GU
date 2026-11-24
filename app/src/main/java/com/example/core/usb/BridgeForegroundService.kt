@@ -26,6 +26,7 @@ import com.example.core.audio.AudioCaptureStats
 import com.example.core.audio.CarLifeAudioCaptureManager
 import com.example.core.carlife.CarLifeHardKeyPacket
 import com.example.core.carlife.CarLifeTouchPacket
+import com.example.core.config.AppEditionConfig
 import com.example.core.input.TouchSettingsPreferences
 import com.example.core.projection.AppMode
 import com.example.core.projection.AppModePreferences
@@ -164,7 +165,11 @@ object BridgeTelemetryBus {
     }
 
     fun restoreSavedAppMode(context: Context): AppMode {
-        val saved = AppModePreferences.loadAppMode(context)
+        val saved = if (AppEditionConfig.isMirrorOnly) {
+            AppMode.MIRRORING
+        } else {
+            AppModePreferences.loadAppMode(context)
+        }
         val savedMuteSpeaker = AudioCapturePreferences.loadMutePhoneSpeaker(context)
         applyAppModeState(saved, eventNote = "Восстановлен режим: ${saved.title}")
         _runtimeState.update {
@@ -179,10 +184,11 @@ object BridgeTelemetryBus {
     }
 
     fun setAppMode(mode: AppMode, context: Context? = null) {
+        val effectiveMode = if (AppEditionConfig.isMirrorOnly) AppMode.MIRRORING else mode
         if (context != null) {
-            AppModePreferences.saveAppMode(context, mode)
+            AppModePreferences.saveAppMode(context, effectiveMode)
         }
-        applyAppModeState(mode, eventNote = "Режим работы: ${mode.title}")
+        applyAppModeState(effectiveMode, eventNote = "Режим работы: ${effectiveMode.title}")
     }
 
     private fun applyAppModeState(mode: AppMode, eventNote: String) {
@@ -241,8 +247,9 @@ object BridgeTelemetryBus {
     }
 
     fun setVideoSourceMode(mode: VideoSourceMode, context: Context? = null) {
+        val effectiveSource = if (AppEditionConfig.isMirrorOnly) VideoSourceMode.SCREEN_MIRRORING else mode
         val mappedAppMode = when {
-            mode == VideoSourceMode.SCREEN_MIRRORING -> AppMode.MIRRORING
+            effectiveSource == VideoSourceMode.SCREEN_MIRRORING -> AppMode.MIRRORING
             _runtimeState.value.appMode == AppMode.SHIZUKU_COCKPIT -> AppMode.SHIZUKU_COCKPIT
             else -> AppMode.COCKPIT
         }
@@ -258,9 +265,9 @@ object BridgeTelemetryBus {
         _runtimeState.update {
             it.copy(
                 appMode = mappedAppMode,
-                videoSourceMode = mode,
+                videoSourceMode = effectiveSource,
                 appLaunchMode = mappedLaunch,
-                lastProtocolEvent = "Источник видео: ${mode.title}"
+                lastProtocolEvent = "Источник видео: ${effectiveSource.title}"
             )
         }
     }
@@ -485,6 +492,12 @@ class BridgeForegroundService : Service() {
     @Volatile
     private var lastRealVideoFrameElapsedMs: Long = 0L
 
+    @Volatile
+    private var lastDroppedVideoPFramesSent: Long = -1L
+
+    @Volatile
+    private var lastSyncedKeepAliveTuple: Triple<Boolean, Boolean, Boolean>? = null
+
     private var autoTestJob: kotlinx.coroutines.Job? = null
     private val isMediaProjectionFgsActive = java.util.concurrent.atomic.AtomicBoolean(false)
     private val hasStartedInitialProjection = java.util.concurrent.atomic.AtomicBoolean(false)
@@ -542,8 +555,14 @@ class BridgeForegroundService : Service() {
         lastRealVideoFrameElapsedMs = now
 
         val droppedNow = usbTransport.droppedVideoPFrames
-        if (::projectionManager.isInitialized) {
-            projectionManager.updateDroppedVideoPFrames(droppedNow)
+        if (droppedNow != lastDroppedVideoPFramesSent) {
+            lastDroppedVideoPFramesSent = droppedNow
+            if (::projectionManager.isInitialized) {
+                projectionManager.updateDroppedVideoPFrames(droppedNow)
+            }
+            if (BridgeTelemetryBus.runtimeState.value.droppedVideoPFrames != droppedNow) {
+                BridgeTelemetryBus.updateState { it.copy(droppedVideoPFrames = droppedNow) }
+            }
         }
 
         val logPacketsInUi = BridgeTelemetryBus.runtimeState.value.logPacketsInUi
@@ -575,16 +594,13 @@ class BridgeForegroundService : Service() {
                     txFramesTotal = usbTransport.txFrames
                 )
             }
-        } else if (isBundledKeyFrame || pktIndex % 15L == 0L) {
+        } else if (pktIndex % 30L == 0L) {
             BridgeTelemetryBus.recordVideoFrameCountersOnly(
                 rxBytesTotal = usbTransport.rxBytes,
                 txBytesTotal = usbTransport.txBytes,
                 rxFramesTotal = usbTransport.rxFrames,
                 txFramesTotal = usbTransport.txFrames
             )
-            if (BridgeTelemetryBus.runtimeState.value.droppedVideoPFrames != droppedNow) {
-                BridgeTelemetryBus.updateState { it.copy(droppedVideoPFrames = droppedNow) }
-            }
         }
         return true
     }
@@ -787,9 +803,11 @@ class BridgeForegroundService : Service() {
         CarLifeFrameCodec.useNestedVideoMsgHeader = currentNestedMode
         isVideoChannelReadyForStreaming = false
 
-        CarLifeShizukuManager.init(applicationContext)
-        if (activeAppMode == AppMode.SHIZUKU_COCKPIT) {
-            CarLifeShizukuManager.bindUserServiceIfReady(applicationContext)
+        if (!AppEditionConfig.isMirrorOnly) {
+            CarLifeShizukuManager.init(applicationContext)
+            if (activeAppMode == AppMode.SHIZUKU_COCKPIT) {
+                CarLifeShizukuManager.bindUserServiceIfReady(applicationContext)
+            }
         }
 
         usbTransport = UsbAccessoryTransport(
@@ -972,7 +990,6 @@ class BridgeForegroundService : Service() {
                 BridgeTelemetryBus.updateState { current ->
                     current.copy(projectionStats = projStats)
                 }
-                syncScreenKeepAliveState()
             }
         }
 
@@ -1323,7 +1340,8 @@ class BridgeForegroundService : Service() {
 
             ACTION_SET_APP_MODE -> {
                 hasStartedInitialProjection.set(true)
-                val mode = AppMode.fromId(intent.getStringExtra(EXTRA_APP_MODE))
+                val requestedMode = AppMode.fromId(intent.getStringExtra(EXTRA_APP_MODE))
+                val mode = if (AppEditionConfig.isMirrorOnly) AppMode.MIRRORING else requestedMode
                 val previousMode = activeAppMode
                 activeAppMode = mode
                 val targetSource = when (mode) {
@@ -1345,11 +1363,13 @@ class BridgeForegroundService : Service() {
                     promoteToForeground(usbTransport.state.value)
                 }
 
-                if (mode == AppMode.SHIZUKU_COCKPIT) {
-                    CarLifeShizukuManager.init(applicationContext)
-                    CarLifeShizukuManager.bindUserServiceIfReady(applicationContext)
-                } else if (previousMode == AppMode.SHIZUKU_COCKPIT) {
-                    CarLifeShizukuManager.unbindUserService(applicationContext)
+                if (!AppEditionConfig.isMirrorOnly) {
+                    if (mode == AppMode.SHIZUKU_COCKPIT) {
+                        CarLifeShizukuManager.init(applicationContext)
+                        CarLifeShizukuManager.bindUserServiceIfReady(applicationContext)
+                    } else if (previousMode == AppMode.SHIZUKU_COCKPIT) {
+                        CarLifeShizukuManager.unbindUserService(applicationContext)
+                    }
                 }
                 syncScreenKeepAliveState()
 
@@ -1513,7 +1533,8 @@ class BridgeForegroundService : Service() {
 
             ACTION_SET_VIDEO_SOURCE_MODE -> {
                 hasStartedInitialProjection.set(true)
-                val mode = VideoSourceMode.fromId(intent.getStringExtra(EXTRA_VIDEO_SOURCE_MODE))
+                val requestedSource = VideoSourceMode.fromId(intent.getStringExtra(EXTRA_VIDEO_SOURCE_MODE))
+                val mode = if (AppEditionConfig.isMirrorOnly) VideoSourceMode.SCREEN_MIRRORING else requestedSource
                 val mappedAppMode = when {
                     mode == VideoSourceMode.SCREEN_MIRRORING -> AppMode.MIRRORING
                     activeAppMode == AppMode.SHIZUKU_COCKPIT -> AppMode.SHIZUKU_COCKPIT
@@ -1582,7 +1603,7 @@ class BridgeForegroundService : Service() {
 
             ACTION_UPDATE_SCREEN_KEEP_ALIVE -> {
                 ScreenKeepAlivePreferences.init(applicationContext)
-                syncScreenKeepAliveState()
+                syncScreenKeepAliveState(force = true)
             }
 
             ACTION_DISCONNECT_STOP -> {
@@ -1609,14 +1630,23 @@ class BridgeForegroundService : Service() {
         return START_STICKY
     }
 
-    private fun syncScreenKeepAliveState(usbConnectedOverride: Boolean? = null) {
+    private fun syncScreenKeepAliveState(
+        usbConnectedOverride: Boolean? = null,
+        force: Boolean = false
+    ) {
         if (!::screenKeepAliveManager.isInitialized) return
         val usbConnected = usbConnectedOverride
             ?: (::usbTransport.isInitialized && usbTransport.state.value is UsbTransportState.Connected)
+        val mirroringMode = activeAppMode == AppMode.MIRRORING
+        val currentTuple = Triple(true, usbConnected, mirroringMode)
+        if (!force && lastSyncedKeepAliveTuple == currentTuple) {
+            return
+        }
+        lastSyncedKeepAliveTuple = currentTuple
         screenKeepAliveManager.updateSessionState(
             isSessionActive = true,
             isUsbConnected = usbConnected,
-            isMirroringMode = activeAppMode == AppMode.MIRRORING
+            isMirroringMode = mirroringMode
         )
     }
 
@@ -1653,7 +1683,9 @@ class BridgeForegroundService : Service() {
                 lastProtocolEvent = "BridgeForegroundService stopped"
             )
         }
-        runCatching { CarLifeShizukuManager.unbindUserService(applicationContext) }
+        if (!AppEditionConfig.isMirrorOnly) {
+            runCatching { CarLifeShizukuManager.unbindUserService(applicationContext) }
+        }
         serviceScope.cancel()
         super.onDestroy()
     }

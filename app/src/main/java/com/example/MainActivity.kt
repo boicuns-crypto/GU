@@ -114,6 +114,7 @@ import android.view.Display
 import android.view.KeyEvent
 import android.view.WindowManager
 import com.example.core.audio.CarLifeAudioCaptureManager
+import com.example.core.config.AppEditionConfig
 import com.example.core.input.CarLifeAccessibilityService
 import com.example.core.input.TouchSettingsPreferences
 import com.example.core.projection.AppMode
@@ -177,6 +178,7 @@ class MainActivity : ComponentActivity() {
         mediaProjectionLauncher = registerForActivityResult(
             ActivityResultContracts.StartActivityForResult()
         ) { result ->
+            CarLifeAccessibilityService.disarmAutoConfirmMediaProjection()
             val data = result.data
             if (result.resultCode == Activity.RESULT_OK && data != null) {
                 BridgeForegroundService.grantMediaProjection(
@@ -202,8 +204,10 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        CarLifeShizukuManager.init(this)
-        MediaPlayerController.initialize(this)
+        if (!AppEditionConfig.isMirrorOnly) {
+            CarLifeShizukuManager.init(this)
+            MediaPlayerController.initialize(this)
+        }
         handleUsbAccessoryIntent(intent)
 
         setContent {
@@ -262,13 +266,15 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        MediaPlayerController.refreshSessions()
-        val snapshot = CarLifeShizukuManager.refreshStatus(this)
-        if (BridgeTelemetryBus.runtimeState.value.appMode == AppMode.SHIZUKU_COCKPIT &&
-            snapshot.isBinderAlive &&
-            snapshot.hasPermission
-        ) {
-            CarLifeShizukuManager.bindUserServiceIfReady(this)
+        if (!AppEditionConfig.isMirrorOnly) {
+            MediaPlayerController.refreshSessions()
+            val snapshot = CarLifeShizukuManager.refreshStatus(this)
+            if (BridgeTelemetryBus.runtimeState.value.appMode == AppMode.SHIZUKU_COCKPIT &&
+                snapshot.isBinderAlive &&
+                snapshot.hasPermission
+            ) {
+                CarLifeShizukuManager.bindUserServiceIfReady(this)
+            }
         }
     }
 
@@ -288,8 +294,14 @@ class MainActivity : ComponentActivity() {
             } else {
                 mpManager.createScreenCaptureIntent()
             }
+            if (ScreenKeepAlivePreferences.config.value.autoConfirmMediaProjection) {
+                CarLifeAccessibilityService.armAutoConfirmMediaProjection()
+            } else {
+                CarLifeAccessibilityService.disarmAutoConfirmMediaProjection()
+            }
             mediaProjectionLauncher.launch(captureIntent)
         }.onFailure { e ->
+            CarLifeAccessibilityService.disarmAutoConfirmMediaProjection()
             val errMsg = "Не удалось открыть запрос MediaProjection («Весь экран»): ${e.message}"
             MediaProjectionTokenStore.recordError(errMsg)
             BridgeTelemetryBus.updateState { current ->
@@ -371,20 +383,32 @@ data class SetupChecklistStatus(
     val step5MediaProjectionGranted: Boolean = false,
     val isUsbConnected: Boolean = false
 ) {
+    val totalMandatorySteps: Int
+        get() = if (AppEditionConfig.isMirrorOnly) 4 else 5
+
     val completedMandatorySteps: Int
-        get() = listOf(
-            step1BatteryUnrestricted,
-            step2OverlayGranted,
-            step3AccessibilityEnabled,
-            step4NotificationAccessGranted,
-            step5MediaProjectionGranted
-        ).count { it }
+        get() = if (AppEditionConfig.isMirrorOnly) {
+            listOf(
+                step1BatteryUnrestricted,
+                step2OverlayGranted,
+                step3AccessibilityEnabled,
+                step5MediaProjectionGranted
+            ).count { it }
+        } else {
+            listOf(
+                step1BatteryUnrestricted,
+                step2OverlayGranted,
+                step3AccessibilityEnabled,
+                step4NotificationAccessGranted,
+                step5MediaProjectionGranted
+            ).count { it }
+        }
 
     val allPrerequisitesReady: Boolean
         get() = step1BatteryUnrestricted &&
             step2OverlayGranted &&
             step3AccessibilityEnabled &&
-            step4NotificationAccessGranted &&
+            (AppEditionConfig.isMirrorOnly || step4NotificationAccessGranted) &&
             step5MediaProjectionGranted
 }
 
@@ -438,11 +462,11 @@ fun CarLifeBridgeApp(
     val a11yEnabled by CarLifeAccessibilityService.isServiceEnabled.collectAsStateWithLifecycle()
     val hasMediaProjectionToken by MediaProjectionTokenStore.hasValidToken.collectAsStateWithLifecycle()
 
-    // 3 Tabs:
-    // 0 = «Лаунчер» (VW Digital Cockpit)
-    // 1 = «Подключение» (Setup Checklist)
-    // 2 = «Настройки» (Audited Settings & Live Packet Log)
-    var selectedTab by rememberSaveable { mutableIntStateOf(0) }
+    val isMirrorOnly = AppEditionConfig.isMirrorOnly
+    // Full Edition: 0 = «Лаунчер», 1 = «Подключение», 2 = «Настройки»
+    // Mirror-Only Edition: 1 = «Подключение» (default), 2 = «Настройки»
+    var selectedTab by rememberSaveable { mutableIntStateOf(if (isMirrorOnly) 1 else 0) }
+    val effectiveSelectedTab = if (isMirrorOnly && selectedTab == 0) 1 else selectedTab
 
     var configuredWidth by rememberSaveable { mutableIntStateOf(1280) }
     var configuredHeight by rememberSaveable { mutableIntStateOf(720) }
@@ -507,7 +531,9 @@ fun CarLifeBridgeApp(
                 notificationPermissionLauncher.launch(arrayOf(Manifest.permission.POST_NOTIFICATIONS))
             }
         }
-        CarLifeLauncherRepository.loadInstalledApps(context)
+        if (!isMirrorOnly) {
+            CarLifeLauncherRepository.loadInstalledApps(context)
+        }
         if (!runtimeState.isServiceRunning) {
             BridgeForegroundService.startDefaultProjection(context)
         }
@@ -545,18 +571,20 @@ fun CarLifeBridgeApp(
                                 .padding(horizontal = 8.dp),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            VwBottomNavItem(
-                                label = "Лаунчер",
-                                icon = CockpitIcons.AppsGrid,
-                                selected = selectedTab == 0,
-                                testTag = "nav_app_launcher",
-                                onClick = { selectedTab = 0 },
-                                modifier = Modifier.weight(1f)
-                            )
+                            if (!isMirrorOnly) {
+                                VwBottomNavItem(
+                                    label = "Лаунчер",
+                                    icon = CockpitIcons.AppsGrid,
+                                    selected = effectiveSelectedTab == 0,
+                                    testTag = "nav_app_launcher",
+                                    onClick = { selectedTab = 0 },
+                                    modifier = Modifier.weight(1f)
+                                )
+                            }
                             VwBottomNavItem(
                                 label = "Подключение",
                                 icon = Icons.Default.CheckCircle,
-                                selected = selectedTab == 1,
+                                selected = effectiveSelectedTab == 1,
                                 testTag = "nav_setup_checklist",
                                 onClick = { selectedTab = 1 },
                                 modifier = Modifier.weight(1f)
@@ -564,7 +592,7 @@ fun CarLifeBridgeApp(
                             VwBottomNavItem(
                                 label = "Настройки",
                                 icon = Icons.Default.Settings,
-                                selected = selectedTab == 2,
+                                selected = effectiveSelectedTab == 2,
                                 testTag = "nav_settings",
                                 onClick = { selectedTab = 2 },
                                 modifier = Modifier.weight(1f)
@@ -597,18 +625,20 @@ fun CarLifeBridgeApp(
                             verticalArrangement = Arrangement.Center,
                             horizontalAlignment = Alignment.CenterHorizontally
                         ) {
-                            VwRailNavItem(
-                                label = "Лаунчер",
-                                icon = CockpitIcons.AppsGrid,
-                                selected = selectedTab == 0,
-                                testTag = "nav_app_launcher",
-                                onClick = { selectedTab = 0 }
-                            )
-                            Spacer(modifier = Modifier.height(10.dp))
+                            if (!isMirrorOnly) {
+                                VwRailNavItem(
+                                    label = "Лаунчер",
+                                    icon = CockpitIcons.AppsGrid,
+                                    selected = effectiveSelectedTab == 0,
+                                    testTag = "nav_app_launcher",
+                                    onClick = { selectedTab = 0 }
+                                )
+                                Spacer(modifier = Modifier.height(10.dp))
+                            }
                             VwRailNavItem(
                                 label = "Подключ.",
                                 icon = Icons.Default.CheckCircle,
-                                selected = selectedTab == 1,
+                                selected = effectiveSelectedTab == 1,
                                 testTag = "nav_setup_checklist",
                                 onClick = { selectedTab = 1 }
                             )
@@ -616,7 +646,7 @@ fun CarLifeBridgeApp(
                             VwRailNavItem(
                                 label = "Настройки",
                                 icon = Icons.Default.Settings,
-                                selected = selectedTab == 2,
+                                selected = effectiveSelectedTab == 2,
                                 testTag = "nav_settings",
                                 onClick = { selectedTab = 2 }
                             )
@@ -637,7 +667,7 @@ fun CarLifeBridgeApp(
                     .fillMaxHeight(),
                 contentAlignment = Alignment.TopCenter
             ) {
-                when (selectedTab) {
+                when (effectiveSelectedTab) {
                     0 -> CarLifeAppLauncherScreen(
                         virtualDisplayId = runtimeState.projectionStats.virtualDisplayId,
                         mediaState = mediaState,
@@ -1004,6 +1034,7 @@ private fun OnboardingChecklistScreen(
 ) {
     val colorScheme = MaterialTheme.colorScheme
     val vw = MaterialTheme.vwColors
+    val isMirrorOnly = AppEditionConfig.isMirrorOnly
 
     LazyColumn(
         modifier = Modifier
@@ -1034,7 +1065,11 @@ private fun OnboardingChecklistScreen(
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = "JETTA VS7 • ПОДКЛЮЧЕНИЕ",
+                                text = if (isMirrorOnly) {
+                                    "JETTA MIRROR • ЗЕРКАЛИРОВАНИЕ"
+                                } else {
+                                    "JETTA VS7 • ПОДКЛЮЧЕНИЕ"
+                                },
                                 style = MaterialTheme.typography.labelSmall.copy(
                                     fontWeight = FontWeight.Bold,
                                     letterSpacing = 0.8.sp
@@ -1042,30 +1077,34 @@ private fun OnboardingChecklistScreen(
                                 color = vw.accentBlue
                             )
                             Text(
-                                text = "Мастер настройки CarLife",
+                                text = if (isMirrorOnly) {
+                                    "Мастер настройки Зеркалирования"
+                                } else {
+                                    "Мастер настройки CarLife"
+                                },
                                 style = MaterialTheme.typography.titleMedium,
                                 color = colorScheme.onSurface
                             )
                         }
                         Spacer(modifier = Modifier.width(8.dp))
                         VwStatusBadge(
-                            label = "${status.completedMandatorySteps} / 5",
+                            label = "${status.completedMandatorySteps} / ${status.totalMandatorySteps}",
                             tone = if (status.allPrerequisitesReady) VwBadgeTone.ACTIVE else VwBadgeTone.WAITING
                         )
                     }
 
                     Text(
                         text = if (status.allPrerequisitesReady) {
-                            "Все 5 разрешений выданы. Видеопоток H.264 (SPS/PPS + IDR) готов к передаче без зависания на 90%."
+                            "Все ${status.totalMandatorySteps} разрешения выданы. Видеопоток H.264 (SPS/PPS + IDR) готов к передаче без зависания на 90%."
                         } else {
-                            "Выполните 5 шагов подготовки перед подключением USB-кабеля к ГУ автомобиля, чтобы CarLife проходил загрузку 90% → 100%."
+                            "Выполните ${status.totalMandatorySteps} шага подготовки перед подключением USB-кабеля к ГУ автомобиля, чтобы CarLife проходил загрузку 90% → 100%."
                         },
                         style = MaterialTheme.typography.bodyMedium,
                         color = colorScheme.onSurfaceVariant
                     )
 
                     LinearProgressIndicator(
-                        progress = { status.completedMandatorySteps / 5f },
+                        progress = { status.completedMandatorySteps / status.totalMandatorySteps.toFloat() },
                         modifier = Modifier
                             .fillMaxWidth()
                             .height(5.dp)
@@ -1127,23 +1166,25 @@ private fun OnboardingChecklistScreen(
             )
         }
 
-        // ШАГ 4: Доступ к уведомлениям
-        item {
-            ChecklistStepCard(
-                title = "Шаг 4. Доступ к уведомлениям (Для виджета музыки на ГУ)",
-                isCompleted = status.step4NotificationAccessGranted,
-                description = "Разрешите чтение уведомлений для отображения обложек треков и управления Яндекс.Музыкой / Spotify с экрана ГУ.",
-                primaryButtonText = if (status.step4NotificationAccessGranted) {
-                    "Доступ к уведомлениям открыт"
-                } else {
-                    "Разрешить доступ к уведомлениям"
-                },
-                testTag = "step4_notifications_btn",
-                onPrimaryClick = onOpenNotificationListenerSettings
-            )
+        // ШАГ 4: Доступ к уведомлениям (только в Full-версии с виджетом плеера Кокпита)
+        if (!isMirrorOnly) {
+            item {
+                ChecklistStepCard(
+                    title = "Шаг 4. Доступ к уведомлениям (Для виджета музыки на ГУ)",
+                    isCompleted = status.step4NotificationAccessGranted,
+                    description = "Разрешите чтение уведомлений для отображения обложек треков и управления Яндекс.Музыкой / Spotify с экрана ГУ.",
+                    primaryButtonText = if (status.step4NotificationAccessGranted) {
+                        "Доступ к уведомлениям открыт"
+                    } else {
+                        "Разрешить доступ к уведомлениям"
+                    },
+                    testTag = "step4_notifications_btn",
+                    onPrimaryClick = onOpenNotificationListenerSettings
+                )
+            }
         }
 
-        // ШАГ 5: Захват экрана (MediaProjection) — КРИТИЧНО ДЛЯ ПРОХОЖДЕНИЯ 90%
+        // ШАГ 5 (или 4 в Mirror Only): Захват экрана (MediaProjection) — КРИТИЧНО ДЛЯ ПРОХОЖДЕНИЯ 90%
         item {
             Card(
                 modifier = Modifier.fillMaxWidth(),
@@ -1164,7 +1205,11 @@ private fun OnboardingChecklistScreen(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(
-                            text = "Шаг 5. Захват экрана (MediaProjection) — КРИТИЧНО ДЛЯ 90%",
+                            text = if (isMirrorOnly) {
+                                "Шаг 4. Захват экрана (MediaProjection) — КРИТИЧНО ДЛЯ 90%"
+                            } else {
+                                "Шаг 5. Захват экрана (MediaProjection) — КРИТИЧНО ДЛЯ 90%"
+                            },
                             style = MaterialTheme.typography.titleMedium,
                             color = colorScheme.onSurface,
                             modifier = Modifier.weight(1f)
@@ -1284,7 +1329,11 @@ private fun OnboardingChecklistScreen(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(
-                            text = "Шаг 6. Подключение USB-кабеля к ГУ автомобиля",
+                            text = if (isMirrorOnly) {
+                                "Шаг 5. Подключение USB-кабеля к ГУ автомобиля"
+                            } else {
+                                "Шаг 6. Подключение USB-кабеля к ГУ автомобиля"
+                            },
                             style = MaterialTheme.typography.titleMedium,
                             color = if (step6Active) colorScheme.onSurface else vw.textMuted,
                             modifier = Modifier.weight(1f)
@@ -1341,15 +1390,17 @@ private fun OnboardingChecklistScreen(
                             )
                         }
 
-                        OutlinedButton(
-                            onClick = onOpenLauncherTab,
-                            modifier = Modifier
-                                .heightIn(min = 48.dp)
-                                .testTag("step6_open_launcher_btn"),
-                            shape = RoundedCornerShape(10.dp),
-                            border = BorderStroke(1.dp, colorScheme.outline)
-                        ) {
-                            Text("Лаунчер", color = colorScheme.primary)
+                        if (!isMirrorOnly) {
+                            OutlinedButton(
+                                onClick = onOpenLauncherTab,
+                                modifier = Modifier
+                                    .heightIn(min = 48.dp)
+                                    .testTag("step6_open_launcher_btn"),
+                                shape = RoundedCornerShape(10.dp),
+                                border = BorderStroke(1.dp, colorScheme.outline)
+                            ) {
+                                Text("Лаунчер", color = colorScheme.primary)
+                            }
                         }
                     }
                 }
@@ -1522,6 +1573,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
     val context = LocalContext.current
     val colorScheme = MaterialTheme.colorScheme
     val vw = MaterialTheme.vwColors
+    val isMirrorOnly = AppEditionConfig.isMirrorOnly
     val activeThemeMode by ThemePreferences.themeMode.collectAsState()
     var diagnosticsExpanded by rememberSaveable { mutableStateOf(false) }
     var mirroringDiagExpanded by rememberSaveable { mutableStateOf(false) }
@@ -1572,7 +1624,11 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                 color = colorScheme.onSurface
                             )
                             Text(
-                                text = "Оформление VW MIB3, медиаплеер и GPS для встроенной карты",
+                                text = if (isMirrorOnly) {
+                                    "Оформление VW MIB3 • Редакция Mirror Only"
+                                } else {
+                                    "Оформление VW MIB3, медиаплеер и GPS для встроенной карты"
+                                },
                                 style = MaterialTheme.typography.labelSmall,
                                 color = colorScheme.onSurfaceVariant
                             )
@@ -1655,127 +1711,129 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                         }
                     }
 
-                    // Доступ к медиаплееру (NotificationListenerService / MediaSessionManager)
-                    val mediaAccessOk = checklistStatus.step4NotificationAccessGranted || mediaState.hasNotificationAccess
-                    Surface(
-                        color = colorScheme.background,
-                        shape = RoundedCornerShape(10.dp),
-                        border = BorderStroke(1.dp, colorScheme.outline)
-                    ) {
-                        Column(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(12.dp),
-                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                    if (!isMirrorOnly) {
+                        // Доступ к медиаплееру (NotificationListenerService / MediaSessionManager)
+                        val mediaAccessOk = checklistStatus.step4NotificationAccessGranted || mediaState.hasNotificationAccess
+                        Surface(
+                            color = colorScheme.background,
+                            shape = RoundedCornerShape(10.dp),
+                            border = BorderStroke(1.dp, colorScheme.outline)
                         ) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Column(modifier = Modifier.weight(1f)) {
-                                    Text(
-                                        text = "Доступ к медиаплееру (Уведомления)",
-                                        style = MaterialTheme.typography.labelLarge,
-                                        color = colorScheme.onSurface
-                                    )
-                                    val mediaSubtitle = when {
-                                        !mediaAccessOk ->
-                                            "Разрешите доступ к уведомлениям для виджета ⏮ ⏯ ⏭ в левой панели VW"
-                                        mediaState.title.isNotBlank() && mediaState.packageName.isNotBlank() ->
-                                            "${mediaState.playerAppTitle}: ${mediaState.title}" +
-                                                if (mediaState.artist.isNotBlank()) " — ${mediaState.artist}" else ""
-                                        else ->
-                                            "Подключено • Ожидание активного плеера (Я.Музыка, Spotify, VK, Poweramp)"
-                                    }
-                                    Text(
-                                        text = mediaSubtitle,
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = if (mediaAccessOk) vw.onSuccessContainer else colorScheme.onSurfaceVariant,
-                                        maxLines = 2,
-                                        overflow = TextOverflow.Ellipsis
-                                    )
-                                }
-                                Spacer(modifier = Modifier.width(8.dp))
-                                VwStatusBadge(
-                                    label = if (mediaAccessOk) "Вкл" else "Настроить",
-                                    tone = if (mediaAccessOk) VwBadgeTone.ACTIVE else VwBadgeTone.WARNING
-                                )
-                            }
-
-                            FilledTonalButton(
-                                onClick = onOpenNotificationListenerSettings,
+                            Column(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .heightIn(min = 48.dp)
-                                    .testTag("open_media_notification_access_btn"),
-                                shape = RoundedCornerShape(10.dp),
-                                colors = ButtonDefaults.filledTonalButtonColors(
-                                    containerColor = if (mediaAccessOk) colorScheme.surfaceVariant else colorScheme.primaryContainer,
-                                    contentColor = if (mediaAccessOk) colorScheme.onSurface else colorScheme.onPrimaryContainer
-                                )
+                                    .padding(12.dp),
+                                verticalArrangement = Arrangement.spacedBy(8.dp)
                             ) {
-                                Icon(
-                                    imageVector = CockpitIcons.MusicNote,
-                                    contentDescription = "Доступ к медиаплееру",
-                                    modifier = Modifier.size(18.dp)
-                                )
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text(
-                                    text = if (mediaAccessOk) {
-                                        "Доступ к медиаплееру открыт (Настройки)"
-                                    } else {
-                                        "Доступ к медиаплееру (Уведомления)"
-                                    },
-                                    fontWeight = FontWeight.SemiBold
-                                )
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            text = "Доступ к медиаплееру (Уведомления)",
+                                            style = MaterialTheme.typography.labelLarge,
+                                            color = colorScheme.onSurface
+                                        )
+                                        val mediaSubtitle = when {
+                                            !mediaAccessOk ->
+                                                "Разрешите доступ к уведомлениям для виджета ⏮ ⏯ ⏭ в левой панели VW"
+                                            mediaState.title.isNotBlank() && mediaState.packageName.isNotBlank() ->
+                                                "${mediaState.playerAppTitle}: ${mediaState.title}" +
+                                                    if (mediaState.artist.isNotBlank()) " — ${mediaState.artist}" else ""
+                                            else ->
+                                                "Подключено • Ожидание активного плеера (Я.Музыка, Spotify, VK, Poweramp)"
+                                        }
+                                        Text(
+                                            text = mediaSubtitle,
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = if (mediaAccessOk) vw.onSuccessContainer else colorScheme.onSurfaceVariant,
+                                            maxLines = 2,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    }
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    VwStatusBadge(
+                                        label = if (mediaAccessOk) "Вкл" else "Настроить",
+                                        tone = if (mediaAccessOk) VwBadgeTone.ACTIVE else VwBadgeTone.WARNING
+                                    )
+                                }
+
+                                FilledTonalButton(
+                                    onClick = onOpenNotificationListenerSettings,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .heightIn(min = 48.dp)
+                                        .testTag("open_media_notification_access_btn"),
+                                    shape = RoundedCornerShape(10.dp),
+                                    colors = ButtonDefaults.filledTonalButtonColors(
+                                        containerColor = if (mediaAccessOk) colorScheme.surfaceVariant else colorScheme.primaryContainer,
+                                        contentColor = if (mediaAccessOk) colorScheme.onSurface else colorScheme.onPrimaryContainer
+                                    )
+                                ) {
+                                    Icon(
+                                        imageVector = CockpitIcons.MusicNote,
+                                        contentDescription = "Доступ к медиаплееру",
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    Text(
+                                        text = if (mediaAccessOk) {
+                                            "Доступ к медиаплееру открыт (Настройки)"
+                                        } else {
+                                            "Доступ к медиаплееру (Уведомления)"
+                                        },
+                                        fontWeight = FontWeight.SemiBold
+                                    )
+                                }
                             }
                         }
-                    }
 
-                    // Геолокация (GPS) для встроенных Яндекс Карт в режиме Кокпит
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(10.dp))
-                            .background(colorScheme.background)
-                            .border(1.dp, colorScheme.outline, RoundedCornerShape(10.dp))
-                            .padding(horizontal = 12.dp, vertical = 10.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(
+                        // Геолокация (GPS) для встроенных Яндекс Карт в режиме Кокпит
+                        Row(
                             modifier = Modifier
-                                .weight(1f)
-                                .padding(end = 8.dp),
-                            verticalArrangement = Arrangement.spacedBy(2.dp)
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(colorScheme.background)
+                                .border(1.dp, colorScheme.outline, RoundedCornerShape(10.dp))
+                                .padding(horizontal = 12.dp, vertical = 10.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Text(
-                                text = "Геолокация (GPS) для Яндекс Карт",
-                                style = MaterialTheme.typography.labelLarge,
-                                color = colorScheme.onSurface
-                            )
-                            Text(
-                                text = if (hasLocationPermission) {
-                                    "Активна — встроенная карта Кокпита определяет текущую позицию"
-                                } else {
-                                    "Нужна для автоцентрирования встроенных Яндекс Карт в Кокпите"
-                                },
-                                style = MaterialTheme.typography.labelSmall,
-                                color = colorScheme.onSurfaceVariant
-                            )
-                        }
-                        if (hasLocationPermission) {
-                            VwStatusBadge(label = "GPS ОК", tone = VwBadgeTone.ACTIVE)
-                        } else {
-                            FilledTonalButton(
-                                onClick = onRequestLocationPermission,
+                            Column(
                                 modifier = Modifier
-                                    .heightIn(min = 48.dp)
-                                    .testTag("request_location_permission_btn"),
-                                shape = RoundedCornerShape(10.dp)
+                                    .weight(1f)
+                                    .padding(end = 8.dp),
+                                verticalArrangement = Arrangement.spacedBy(2.dp)
                             ) {
-                                Text("Разрешить", fontWeight = FontWeight.SemiBold)
+                                Text(
+                                    text = "Геолокация (GPS) для Яндекс Карт",
+                                    style = MaterialTheme.typography.labelLarge,
+                                    color = colorScheme.onSurface
+                                )
+                                Text(
+                                    text = if (hasLocationPermission) {
+                                        "Активна — встроенная карта Кокпита определяет текущую позицию"
+                                    } else {
+                                        "Нужна для автоцентрирования встроенных Яндекс Карт в Кокпите"
+                                    },
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = colorScheme.onSurfaceVariant
+                                )
+                            }
+                            if (hasLocationPermission) {
+                                VwStatusBadge(label = "GPS ОК", tone = VwBadgeTone.ACTIVE)
+                            } else {
+                                FilledTonalButton(
+                                    onClick = onRequestLocationPermission,
+                                    modifier = Modifier
+                                        .heightIn(min = 48.dp)
+                                        .testTag("request_location_permission_btn"),
+                                    shape = RoundedCornerShape(10.dp)
+                                ) {
+                                    Text("Разрешить", fontWeight = FontWeight.SemiBold)
+                                }
                             }
                         }
                     }
@@ -1783,23 +1841,26 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
             }
         }
 
-        // 2. Режим работы: 3 независимых режима (Кокпит | Зеркало | Shizuku)
+        // 2. Режим работы (Full: Кокпит | Зеркало | Shizuku; Mirror Only: бейдж + 5-узловая диагностика)
         item {
-            val activeAppMode = state.appMode
+            val activeAppMode = if (isMirrorOnly) AppMode.MIRRORING else state.appMode
             val shizukuStatus by CarLifeShizukuManager.status.collectAsStateWithLifecycle()
             val mpIsActive by MediaProjectionTokenStore.isProjectionActive.collectAsStateWithLifecycle()
             val mpHasPending by MediaProjectionTokenStore.hasPendingToken.collectAsStateWithLifecycle()
             val mpError by MediaProjectionTokenStore.lastError.collectAsStateWithLifecycle()
             val mpDetail by MediaProjectionTokenStore.statusDetail.collectAsStateWithLifecycle()
 
-            LaunchedEffect(activeAppMode) {
-                CarLifeShizukuManager.refreshStatus(context)
-                if (activeAppMode == AppMode.SHIZUKU_COCKPIT) {
-                    CarLifeShizukuManager.bindUserServiceIfReady(context)
+            if (!isMirrorOnly) {
+                LaunchedEffect(activeAppMode) {
+                    CarLifeShizukuManager.refreshStatus(context)
+                    if (activeAppMode == AppMode.SHIZUKU_COCKPIT) {
+                        CarLifeShizukuManager.bindUserServiceIfReady(context)
+                    }
                 }
             }
 
             fun selectAppMode(mode: AppMode) {
+                if (isMirrorOnly) return
                 BridgeTelemetryBus.setAppMode(mode, context)
                 when (mode) {
                     AppMode.SHIZUKU_COCKPIT -> {
@@ -1850,200 +1911,214 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = "Режим работы",
+                                text = if (isMirrorOnly) {
+                                    "Jetta Mirror • Только Зеркалирование"
+                                } else {
+                                    "Режим работы"
+                                },
                                 style = MaterialTheme.typography.titleMedium,
                                 color = colorScheme.onSurface
                             )
                             Spacer(modifier = Modifier.height(2.dp))
                             Text(
-                                text = "Кокпит с картой, Зеркалирование экрана или Shizuku-навигатор",
+                                text = if (isMirrorOnly) {
+                                    "Облегчённая сборка: прямой захват экрана 30 FPS + звук 0x0003 без лаунчера и Shizuku"
+                                } else {
+                                    "Кокпит с картой, Зеркалирование экрана или Shizuku-навигатор"
+                                },
                                 style = MaterialTheme.typography.labelSmall,
                                 color = colorScheme.onSurfaceVariant
                             )
                         }
                         Spacer(modifier = Modifier.width(8.dp))
                         VwStatusBadge(
-                            label = when (activeAppMode) {
-                                AppMode.COCKPIT -> "Кокпит"
-                                AppMode.MIRRORING -> "Зеркало"
-                                AppMode.SHIZUKU_COCKPIT -> "Shizuku"
+                            label = if (isMirrorOnly) {
+                                "MIRROR ONLY"
+                            } else {
+                                when (activeAppMode) {
+                                    AppMode.COCKPIT -> "Кокпит"
+                                    AppMode.MIRRORING -> "Зеркало"
+                                    AppMode.SHIZUKU_COCKPIT -> "Shizuku"
+                                }
                             },
                             tone = VwBadgeTone.ACTIVE
                         )
                     }
 
-                    // Единый горизонтальный сегментированный контрол VW MIB3 (Кокпит | Зеркало | Shizuku)
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(12.dp))
-                            .background(colorScheme.background)
-                            .border(1.dp, colorScheme.outline, RoundedCornerShape(12.dp))
-                            .padding(3.dp),
-                        horizontalArrangement = Arrangement.spacedBy(3.dp)
-                    ) {
-                        AppMode.entries.forEach { mode ->
-                            val isSelected = activeAppMode == mode
-                            val tag = when (mode) {
-                                AppMode.COCKPIT -> "app_mode_cockpit_btn"
-                                AppMode.MIRRORING -> "app_mode_mirroring_btn"
-                                AppMode.SHIZUKU_COCKPIT -> "app_mode_shizuku_cockpit_btn"
-                            }
-                            val shortLabel = when (mode) {
-                                AppMode.COCKPIT -> "Кокпит"
-                                AppMode.MIRRORING -> "Зеркало"
-                                AppMode.SHIZUKU_COCKPIT -> "Shizuku"
-                            }
-                            val segmentBg by animateColorAsState(
-                                targetValue = if (isSelected) colorScheme.primary else Color.Transparent,
-                                animationSpec = tween(durationMillis = 180),
-                                label = "mode_seg_bg"
-                            )
-                            val segmentText by animateColorAsState(
-                                targetValue = if (isSelected) colorScheme.onPrimary else colorScheme.onSurfaceVariant,
-                                animationSpec = tween(durationMillis = 180),
-                                label = "mode_seg_text"
-                            )
-                            val bottomLine by animateColorAsState(
-                                targetValue = if (isSelected) {
-                                    if (vw.isDark) Color.White.copy(alpha = 0.85f) else vw.accentBlue
-                                } else {
-                                    Color.Transparent
-                                },
-                                animationSpec = tween(durationMillis = 180),
-                                label = "mode_seg_line"
-                            )
-                            Column(
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .heightIn(min = 48.dp)
-                                    .clip(RoundedCornerShape(9.dp))
-                                    .background(segmentBg)
-                                    .selectable(
-                                        selected = isSelected,
-                                        onClick = { selectAppMode(mode) },
-                                        role = Role.RadioButton
-                                    )
-                                    .testTag(tag),
-                                horizontalAlignment = Alignment.CenterHorizontally,
-                                verticalArrangement = Arrangement.Center
-                            ) {
-                                Text(
-                                    text = shortLabel,
-                                    style = MaterialTheme.typography.labelLarge.copy(
-                                        fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Medium
-                                    ),
-                                    color = segmentText,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                                Spacer(modifier = Modifier.height(3.dp))
-                                Box(
-                                    modifier = Modifier
-                                        .width(26.dp)
-                                        .height(2.5.dp)
-                                        .clip(RoundedCornerShape(2.dp))
-                                        .background(bottomLine)
-                                )
-                            }
-                        }
-                    }
-
-                    // Описание активного режима
-                    Surface(
-                        color = colorScheme.surfaceVariant,
-                        shape = RoundedCornerShape(10.dp),
-                        border = BorderStroke(1.dp, colorScheme.outline)
-                    ) {
-                        Column(
+                    if (!isMirrorOnly) {
+                        // Единый горизонтальный сегментированный контрол VW MIB3 (Кокпит | Зеркало | Shizuku)
+                        Row(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .padding(horizontal = 12.dp, vertical = 10.dp),
-                            verticalArrangement = Arrangement.spacedBy(3.dp)
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(colorScheme.background)
+                                .border(1.dp, colorScheme.outline, RoundedCornerShape(12.dp))
+                                .padding(3.dp),
+                            horizontalArrangement = Arrangement.spacedBy(3.dp)
                         ) {
-                            Text(
-                                text = activeAppMode.title,
-                                style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.SemiBold),
-                                color = colorScheme.onSurface
-                            )
-                            Text(
-                                text = when (activeAppMode) {
-                                    AppMode.COCKPIT ->
-                                        "Постоянная левая панель VW (250 px) с плеером + мгновенное переключение между сеткой приложений и встроенными Яндекс Картами."
-                                    AppMode.MIRRORING ->
-                                        "Прямое зеркалирование экрана телефона 30 FPS + звук 0x0003. Тач ГУ передаётся через службу спец. возможностей."
-                                    AppMode.SHIZUKU_COCKPIT ->
-                                        "Настоящий Яндекс Навигатор / 2ГИС на VirtualDisplay + постоянный оверлей левой панели VW (250 px) с умной маршрутизацией тача."
-                                },
-                                style = MaterialTheme.typography.labelSmall,
-                                color = colorScheme.onSurfaceVariant
-                            )
+                            AppMode.entries.forEach { mode ->
+                                val isSelected = activeAppMode == mode
+                                val tag = when (mode) {
+                                    AppMode.COCKPIT -> "app_mode_cockpit_btn"
+                                    AppMode.MIRRORING -> "app_mode_mirroring_btn"
+                                    AppMode.SHIZUKU_COCKPIT -> "app_mode_shizuku_cockpit_btn"
+                                }
+                                val shortLabel = when (mode) {
+                                    AppMode.COCKPIT -> "Кокпит"
+                                    AppMode.MIRRORING -> "Зеркало"
+                                    AppMode.SHIZUKU_COCKPIT -> "Shizuku"
+                                }
+                                val segmentBg by animateColorAsState(
+                                    targetValue = if (isSelected) colorScheme.primary else Color.Transparent,
+                                    animationSpec = tween(durationMillis = 180),
+                                    label = "mode_seg_bg"
+                                )
+                                val segmentText by animateColorAsState(
+                                    targetValue = if (isSelected) colorScheme.onPrimary else colorScheme.onSurfaceVariant,
+                                    animationSpec = tween(durationMillis = 180),
+                                    label = "mode_seg_text"
+                                )
+                                val bottomLine by animateColorAsState(
+                                    targetValue = if (isSelected) {
+                                        if (vw.isDark) Color.White.copy(alpha = 0.85f) else vw.accentBlue
+                                    } else {
+                                        Color.Transparent
+                                    },
+                                    animationSpec = tween(durationMillis = 180),
+                                    label = "mode_seg_line"
+                                )
+                                Column(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .heightIn(min = 48.dp)
+                                        .clip(RoundedCornerShape(9.dp))
+                                        .background(segmentBg)
+                                        .selectable(
+                                            selected = isSelected,
+                                            onClick = { selectAppMode(mode) },
+                                            role = Role.RadioButton
+                                        )
+                                        .testTag(tag),
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                    verticalArrangement = Arrangement.Center
+                                ) {
+                                    Text(
+                                        text = shortLabel,
+                                        style = MaterialTheme.typography.labelLarge.copy(
+                                            fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Medium
+                                        ),
+                                        color = segmentText,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    Spacer(modifier = Modifier.height(3.dp))
+                                    Box(
+                                        modifier = Modifier
+                                            .width(26.dp)
+                                            .height(2.5.dp)
+                                            .clip(RoundedCornerShape(2.dp))
+                                            .background(bottomLine)
+                                    )
+                                }
+                            }
                         }
-                    }
 
-                    // Блок Shizuku показываем только при выборе режима «Shizuku»
-                    if (activeAppMode == AppMode.SHIZUKU_COCKPIT) {
-                        val shizukuOk = shizukuStatus.isBinderAlive && shizukuStatus.hasPermission
+                        // Описание активного режима
                         Surface(
-                            color = colorScheme.background,
+                            color = colorScheme.surfaceVariant,
                             shape = RoundedCornerShape(10.dp),
                             border = BorderStroke(1.dp, colorScheme.outline)
                         ) {
                             Column(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .padding(12.dp),
-                                verticalArrangement = Arrangement.spacedBy(8.dp)
+                                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                                verticalArrangement = Arrangement.spacedBy(3.dp)
                             ) {
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.SpaceBetween,
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Text(
-                                        text = "Служба Shizuku (Второй экран)",
-                                        style = MaterialTheme.typography.labelLarge,
-                                        color = colorScheme.onSurface,
-                                        modifier = Modifier.weight(1f)
-                                    )
-                                    Spacer(modifier = Modifier.width(8.dp))
-                                    VwStatusBadge(
-                                        label = shizukuStatus.statusLabel,
-                                        tone = if (shizukuOk) VwBadgeTone.ACTIVE else VwBadgeTone.WAITING,
-                                        modifier = Modifier.testTag("shizuku_status_badge")
-                                    )
-                                }
                                 Text(
-                                    text = "${shizukuStatus.statusLabel} • ${shizukuStatus.detailMessage}",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = if (shizukuOk) vw.onSuccessContainer else colorScheme.onSurfaceVariant,
-                                    modifier = Modifier.testTag("shizuku_status_detail")
+                                    text = activeAppMode.title,
+                                    style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.SemiBold),
+                                    color = colorScheme.onSurface
                                 )
-                                FilledTonalButton(
-                                    onClick = {
-                                        CarLifeShizukuManager.requestPermission(context)
+                                Text(
+                                    text = when (activeAppMode) {
+                                        AppMode.COCKPIT ->
+                                            "Постоянная левая панель VW (250 px) с плеером + мгновенное переключение между сеткой приложений и встроенными Яндекс Картами."
+                                        AppMode.MIRRORING ->
+                                            "Прямое зеркалирование экрана телефона 30 FPS + звук 0x0003. Тач ГУ передаётся через службу спец. возможностей."
+                                        AppMode.SHIZUKU_COCKPIT ->
+                                            "Настоящий Яндекс Навигатор / 2ГИС на VirtualDisplay + постоянный оверлей левой панели VW (250 px) с умной маршрутизацией тача."
                                     },
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+
+                        // Блок Shizuku показываем только при выборе режима «Shizuku»
+                        if (activeAppMode == AppMode.SHIZUKU_COCKPIT) {
+                            val shizukuOk = shizukuStatus.isBinderAlive && shizukuStatus.hasPermission
+                            Surface(
+                                color = colorScheme.background,
+                                shape = RoundedCornerShape(10.dp),
+                                border = BorderStroke(1.dp, colorScheme.outline)
+                            ) {
+                                Column(
                                     modifier = Modifier
                                         .fillMaxWidth()
-                                        .heightIn(min = 48.dp)
-                                        .testTag("request_shizuku_permission_btn"),
-                                    shape = RoundedCornerShape(10.dp),
-                                    colors = ButtonDefaults.filledTonalButtonColors(
-                                        containerColor = if (shizukuOk) vw.successContainer else colorScheme.primaryContainer,
-                                        contentColor = if (shizukuOk) vw.onSuccessContainer else colorScheme.onPrimaryContainer
-                                    )
+                                        .padding(12.dp),
+                                    verticalArrangement = Arrangement.spacedBy(8.dp)
                                 ) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(
+                                            text = "Служба Shizuku (Второй экран)",
+                                            style = MaterialTheme.typography.labelLarge,
+                                            color = colorScheme.onSurface,
+                                            modifier = Modifier.weight(1f)
+                                        )
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        VwStatusBadge(
+                                            label = shizukuStatus.statusLabel,
+                                            tone = if (shizukuOk) VwBadgeTone.ACTIVE else VwBadgeTone.WAITING,
+                                            modifier = Modifier.testTag("shizuku_status_badge")
+                                        )
+                                    }
                                     Text(
-                                        text = when {
-                                            shizukuStatus.isBinderAlive && shizukuStatus.hasPermission && shizukuStatus.isUserServiceBound ->
-                                                "Shizuku подключён (Обновить)"
-                                            shizukuStatus.isBinderAlive && shizukuStatus.hasPermission ->
-                                                "Подключить Shizuku UserService"
-                                            else ->
-                                                "Запросить права Shizuku"
-                                        },
-                                        fontWeight = FontWeight.SemiBold
+                                        text = "${shizukuStatus.statusLabel} • ${shizukuStatus.detailMessage}",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = if (shizukuOk) vw.onSuccessContainer else colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.testTag("shizuku_status_detail")
                                     )
+                                    FilledTonalButton(
+                                        onClick = {
+                                            CarLifeShizukuManager.requestPermission(context)
+                                        },
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .heightIn(min = 48.dp)
+                                            .testTag("request_shizuku_permission_btn"),
+                                        shape = RoundedCornerShape(10.dp),
+                                        colors = ButtonDefaults.filledTonalButtonColors(
+                                            containerColor = if (shizukuOk) vw.successContainer else colorScheme.primaryContainer,
+                                            contentColor = if (shizukuOk) vw.onSuccessContainer else colorScheme.onPrimaryContainer
+                                        )
+                                    ) {
+                                        Text(
+                                            text = when {
+                                                shizukuStatus.isBinderAlive && shizukuStatus.hasPermission && shizukuStatus.isUserServiceBound ->
+                                                    "Shizuku подключён (Обновить)"
+                                                shizukuStatus.isBinderAlive && shizukuStatus.hasPermission ->
+                                                    "Подключить Shizuku UserService"
+                                                else ->
+                                                    "Запросить права Shizuku"
+                                            },
+                                            fontWeight = FontWeight.SemiBold
+                                        )
+                                    }
                                 }
                             }
                         }

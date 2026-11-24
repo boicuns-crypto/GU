@@ -11,11 +11,13 @@ import android.media.AudioPlaybackCaptureConfiguration
 import android.media.AudioRecord
 import android.media.projection.MediaProjection
 import android.os.Build
+import android.os.Process
 import android.util.Log
 import androidx.core.content.ContextCompat
 import com.example.protocol.carlife.CarLifeFrame
 import com.example.protocol.carlife.CarLifeFrameCodec
 import com.example.protocol.carlife.CarlifeMusicInitProto
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -23,6 +25,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -119,6 +122,15 @@ class CarLifeAudioCaptureManager(
 
     private var audioRecord: AudioRecord? = null
     private var captureJob: Job? = null
+    private val audioCaptureDispatcher = Executors.newSingleThreadExecutor { runnable ->
+        Thread({
+            runCatching { Process.setThreadPriority(Process.THREAD_PRIORITY_AUDIO) }
+            runnable.run()
+        }, "CarLifeAudioCaptureThread").apply {
+            isDaemon = true
+            priority = Thread.MAX_PRIORITY - 1
+        }
+    }.asCoroutineDispatcher()
 
     private val _stats = MutableStateFlow(
         AudioCaptureStats(
@@ -389,7 +401,7 @@ class CarLifeAudioCaptureManager(
             )
         }
 
-        captureJob = externalScope.launch(Dispatchers.IO) {
+        captureJob = externalScope.launch(audioCaptureDispatcher) {
             val readBuffer = ByteArray(PCM_CHUNK_SIZE_BYTES)
             var sentSinceUiUpdate = 0
             var skippedSinceUiUpdate = 0
@@ -465,7 +477,7 @@ class CarLifeAudioCaptureManager(
 
                     sentSinceUiUpdate++
                     bytesSinceUiUpdate += pcmPayload.size.toLong()
-                    if (sentSinceUiUpdate >= 10 || _stats.value.isSilenceWarningActive) {
+                    if (sentSinceUiUpdate >= 25 || _stats.value.isSilenceWarningActive) {
                         val deltaPackets = sentSinceUiUpdate.toLong()
                         val deltaBytes = bytesSinceUiUpdate
                         val deltaSkipped = skippedSinceUiUpdate.toLong()

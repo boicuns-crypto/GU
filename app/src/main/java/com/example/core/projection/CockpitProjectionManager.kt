@@ -232,6 +232,9 @@ object AppModePreferences {
     }
 
     fun loadAppMode(context: Context): AppMode {
+        if (com.example.core.config.AppEditionConfig.isMirrorOnly) {
+            return AppMode.MIRRORING
+        }
         val savedId = runCatching {
             context.applicationContext
                 .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -414,6 +417,9 @@ class CockpitProjectionManager(
 
     @Volatile
     private var lastKnownScreenSize: Pair<Int, Int>? = null
+
+    @Volatile
+    private var lastMirrorTouchStatsUpdateMs: Long = 0L
 
     @Volatile
     private var isPhoneScreenOffFlag: Boolean = false
@@ -2055,8 +2061,15 @@ class CockpitProjectionManager(
         return withContext(Dispatchers.Main.immediate) {
             if (appMode == AppMode.MIRRORING) {
                 val a11yService = CarLifeAccessibilityService.instance
-                val (screenW, screenH) = a11yService?.getPhysicalScreenSize()
-                    ?: CarLifeAccessibilityService.computePhysicalScreenSize(appContext)
+                val cachedSize = lastKnownScreenSize
+                val (screenW, screenH) = if (cachedSize != null && packet.androidAction != MotionEvent.ACTION_DOWN) {
+                    cachedSize
+                } else {
+                    (a11yService?.getPhysicalScreenSize()
+                        ?: CarLifeAccessibilityService.computePhysicalScreenSize(appContext)).also {
+                        lastKnownScreenSize = it
+                    }
+                }
                 val mapped = CarLifeAccessibilityService.mapHuTouchToPhysicalScreenDetailed(
                     rawX = packet.rawX,
                     rawY = packet.rawY,
@@ -2069,15 +2082,17 @@ class CockpitProjectionManager(
                 val orientLabel = if (mapped.isLandscape) "Landscape" else "Portrait"
 
                 if (!mapped.isInsideActiveArea) {
-                    val skippedLabel =
-                        "Тач в чёрном поле HU(${packet.rawX},${packet.rawY}) пропущен ($screenW×$screenH $orientLabel)"
-                    _stats.update {
-                        it.copy(
-                            phoneScreenWidth = screenW,
-                            phoneScreenHeight = screenH,
-                            isPhoneLandscape = mapped.isLandscape,
-                            lastTouchDiagnostic = skippedLabel
-                        )
+                    if (packet.androidAction != MotionEvent.ACTION_MOVE) {
+                        val skippedLabel =
+                            "Тач в чёрном поле HU(${packet.rawX},${packet.rawY}) пропущен ($screenW×$screenH $orientLabel)"
+                        _stats.update {
+                            it.copy(
+                                phoneScreenWidth = screenW,
+                                phoneScreenHeight = screenH,
+                                isPhoneLandscape = mapped.isLandscape,
+                                lastTouchDiagnostic = skippedLabel
+                            )
+                        }
                     }
                     return@withContext false
                 }
@@ -2092,28 +2107,35 @@ class CockpitProjectionManager(
                     isLongPress = packet.isLongPress
                 ) ?: false
 
-                val gestureTag = when {
-                    packet.isDoubleClick -> "2xTAP"
-                    packet.isLongPress -> "LONG"
-                    else -> "TOUCH"
-                }
-                val statusLabel = if (a11yService != null) {
-                    "Mirror $gestureTag HU(${packet.rawX},${packet.rawY}) -> (${mapped.x.toInt()},${mapped.y.toInt()}) / ${screenW}×${screenH} $orientLabel"
-                } else {
-                    "Touch 0x0006 получен, но CarLifeAccessibilityService ВЫКЛ!"
-                }
+                val nowMs = SystemClock.elapsedRealtime()
+                val shouldPublishStats = packet.androidAction != MotionEvent.ACTION_MOVE ||
+                    a11yService == null ||
+                    (nowMs - lastMirrorTouchStatsUpdateMs) >= 250L
+                if (shouldPublishStats) {
+                    lastMirrorTouchStatsUpdateMs = nowMs
+                    val gestureTag = when {
+                        packet.isDoubleClick -> "2xTAP"
+                        packet.isLongPress -> "LONG"
+                        else -> "TOUCH"
+                    }
+                    val statusLabel = if (a11yService != null) {
+                        "Mirror $gestureTag HU(${packet.rawX},${packet.rawY}) -> (${mapped.x.toInt()},${mapped.y.toInt()}) / ${screenW}×${screenH} $orientLabel"
+                    } else {
+                        "Touch 0x0006 получен, но CarLifeAccessibilityService ВЫКЛ!"
+                    }
 
-                _stats.update {
-                    it.copy(
-                        injectedTouches = it.injectedTouches + 1L,
-                        lastTouchPoint = mapped.x to mapped.y,
-                        phoneScreenWidth = screenW,
-                        phoneScreenHeight = screenH,
-                        isPhoneLandscape = mapped.isLandscape,
-                        lastTouchDiagnostic = statusLabel,
-                        activeCockpitWidget = statusLabel,
-                        statusMessage = statusLabel
-                    )
+                    _stats.update {
+                        it.copy(
+                            injectedTouches = it.injectedTouches + 1L,
+                            lastTouchPoint = mapped.x to mapped.y,
+                            phoneScreenWidth = screenW,
+                            phoneScreenHeight = screenH,
+                            isPhoneLandscape = mapped.isLandscape,
+                            lastTouchDiagnostic = statusLabel,
+                            activeCockpitWidget = statusLabel,
+                            statusMessage = statusLabel
+                        )
+                    }
                 }
                 return@withContext a11yDispatched
             }
@@ -2850,7 +2872,6 @@ class CockpitProjectionManager(
                                 requestEncoderSyncFrameOnly()
                             }
                         }
-                        yield()
                     }
 
                     outIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
@@ -3007,8 +3028,8 @@ class CockpitProjectionManager(
     companion object {
         private const val TAG = "CockpitProjectionMgr"
         private const val VIRTUAL_DISPLAY_NAME = "CarLife_AppMirroring_Display"
-        private const val DEQUEUE_TIMEOUT_US = 8_000L
-        private const val CONGESTION_IDR_COOLDOWN_MS = 400L
+        private const val DEQUEUE_TIMEOUT_US = 10_000L
+        private const val CONGESTION_IDR_COOLDOWN_MS = 200L
         private const val WINDOW_TYPE_PRIVATE_PRESENTATION = 2030
         private const val WINDOW_TYPE_PRESENTATION = 2037
         const val DEFAULT_WIDTH = 1280
@@ -3024,7 +3045,7 @@ class CockpitProjectionManager(
          * 30 FPS input capping for 120 Hz Samsung displays:
          * `1280×720`, VBR (`BITRATE_MODE_VBR = 1`), `AVCProfileBaseline (1)`, `AVCLevel3 (0x100)`,
          * `KEY_FRAME_RATE = 30`, `KEY_MAX_FPS_TO_ENCODER = 30f`, `KEY_CAPTURE_RATE = 30`,
-         * `KEY_I_FRAME_INTERVAL = 1`, `KEY_REPEAT_PREVIOUS_FRAME_AFTER = 100_000L`,
+         * `KEY_I_FRAME_INTERVAL = 2`, `KEY_OPERATING_RATE = 120`, `KEY_REPEAT_PREVIOUS_FRAME_AFTER = 100_000L`,
          * `KEY_PRIORITY = 0` (realtime), optional `KEY_LOW_LATENCY = 1` (API 30+),
          * and Samsung `video-qp-p-max = 36`.
          */
@@ -3053,7 +3074,7 @@ class CockpitProjectionManager(
                 }
                 setInteger(MediaFormat.KEY_CAPTURE_RATE, frameRate)
             }
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2)
             if (includeBaselineProfile) {
                 setInteger(
                     MediaFormat.KEY_PROFILE,
@@ -3072,7 +3093,7 @@ class CockpitProjectionManager(
             if (includeVendorTimingKeys) {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                     setInteger(MediaFormat.KEY_PRIORITY, 0) // 0 = realtime priority
-                    setInteger(MediaFormat.KEY_OPERATING_RATE, frameRate)
+                    setInteger(MediaFormat.KEY_OPERATING_RATE, 120)
                 }
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)

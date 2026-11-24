@@ -280,7 +280,7 @@ class UsbAccessoryTransport(
      * Enqueues a [CarLifeFrame] into [CarLifeUsbWriteQueue] without blocking `MediaCodec` (`0x0002`)
      * or `AudioRecord` (`0x0003`) threads on USB I/O:
      * - Audio (`0x0003`) and Control (`0x0001`) packets take strict priority over video frames.
-     * - Stale video `0x0002` P-frames are evicted when > 5 video frames accumulate in the queue.
+     * - Stale video `0x0002` P-frames are evicted when > 8 video frames accumulate in the queue.
      */
     fun enqueueFrameNonBlocking(
         frame: CarLifeFrame,
@@ -631,7 +631,7 @@ class UsbAccessoryTransport(
         const val MAX_AOA_CHUNK = 16_384
         const val MAX_AOA_WRITE_SIZE = MAX_AOA_CHUNK
         const val WRITER_QUEUE_CAPACITY = 512
-        const val MAX_QUEUED_VIDEO_FRAMES = 5
+        const val MAX_QUEUED_VIDEO_FRAMES = 8
 
         val KNOWN_MANUFACTURERS = setOf(
             "Baidu",
@@ -652,7 +652,7 @@ class UsbAccessoryTransport(
 /**
  * Thread-safe USB AOA write queue backed by [LinkedBlockingQueue]s with two guarantees:
  * 1. Audio (`0x0003`) and Control (`0x0001`) packets ALWAYS dequeue ahead of buffered `0x0002` video frames.
- * 2. When more than [maxVideoFrames] (default `5`) video frames build up in the queue, stale `0x0002`
+ * 2. When more than [maxVideoFrames] (default `8`) video frames build up in the queue, stale `0x0002`
  *    P-frames are evicted cleanly so head-unit latency never accumulates.
  */
 internal class CarLifeUsbWriteQueue(

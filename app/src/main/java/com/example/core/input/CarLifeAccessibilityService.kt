@@ -6,6 +6,7 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.graphics.Path
+import android.graphics.Rect
 import android.hardware.display.DisplayManager
 import android.os.Build
 import android.os.Handler
@@ -20,6 +21,9 @@ import android.view.MotionEvent
 import android.view.Surface
 import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityNodeInfo
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -59,15 +63,155 @@ class CarLifeAccessibilityService : AccessibilityService() {
     private var isTrackingGesture: Boolean = false
     private val movementPoints = ArrayList<Pair<Float, Float>>(64)
 
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val autoConfirmInProgress = AtomicBoolean(false)
+
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
         _isServiceEnabled.value = true
-        Log.i(TAG, "CarLifeAccessibilityService connected (canPerformGestures=true)")
+        Log.i(TAG, "CarLifeAccessibilityService connected (canPerformGestures=true, autoConfirmReady=true)")
     }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent?) {
-        // Window tree inspection is not needed for coordinate gesture dispatch
+        if (event == null || !isAutoConfirmMediaProjectionArmed()) return
+        val pkgName = event.packageName?.toString().orEmpty()
+        val clsName = event.className?.toString().orEmpty()
+        if (!isMediaProjectionDialogPackage(pkgName, clsName)) return
+
+        if (!autoConfirmInProgress.compareAndSet(false, true)) return
+        mainHandler.postDelayed({
+            try {
+                attemptAutoConfirmMediaProjectionWindow()
+            } finally {
+                autoConfirmInProgress.set(false)
+            }
+        }, AUTO_CONFIRM_DEBOUNCE_MS)
+    }
+
+    private fun attemptAutoConfirmMediaProjectionWindow() {
+        if (!isAutoConfirmMediaProjectionArmed()) return
+        val roots = buildList {
+            runCatching { rootInActiveWindow }.getOrNull()?.let { add(it) }
+            runCatching { windows }.getOrNull()?.forEach { w ->
+                runCatching { w.root }.getOrNull()?.let { r ->
+                    if (none { it === r }) add(r)
+                }
+            }
+        }
+        if (roots.isEmpty()) return
+
+        for (root in roots) {
+            val rootPkg = root.packageName?.toString().orEmpty()
+            if (!isMediaProjectionDialogPackage(rootPkg, "")) continue
+
+            // Step 1: If Android 14–16 shows a "Single app / Entire screen" spinner dropdown, select "Entire screen" first.
+            val singleAppNode = findFirstMatchingNode(root) { node ->
+                isSingleAppSelectorLabel(node.text?.toString()) ||
+                    isSingleAppSelectorLabel(node.contentDescription?.toString())
+            }
+            if (singleAppNode != null) {
+                val entireScreenOption = findFirstMatchingNode(root) { node ->
+                    isEntireScreenOptionLabel(node.text?.toString()) ||
+                        isEntireScreenOptionLabel(node.contentDescription?.toString())
+                }
+                if (entireScreenOption != null) {
+                    clickNodeOrParent(entireScreenOption)
+                    return
+                } else {
+                    clickNodeOrParent(singleAppNode)
+                    return
+                }
+            }
+
+            // Step 2: If a dropdown popup is open showing "Весь экран" / "Entire screen", pick it before clicking Start.
+            val entireScreenItem = findFirstMatchingNode(root) { node ->
+                val clickableOrCheckable = node.isClickable || node.isCheckable || node.parent?.isClickable == true
+                @Suppress("DEPRECATION")
+                val alreadyChecked = node.isChecked
+                clickableOrCheckable && !node.isSelected && !alreadyChecked &&
+                    (isEntireScreenOptionLabel(node.text?.toString()) ||
+                        isEntireScreenOptionLabel(node.contentDescription?.toString()))
+            }
+            if (entireScreenItem != null &&
+                findConfirmButtonNode(root) == null
+            ) {
+                clickNodeOrParent(entireScreenItem)
+                return
+            }
+
+            // Step 3: Click the positive confirm button ("Начать" / "Start now" / android:id/button1).
+            val confirmBtn = findConfirmButtonNode(root)
+            if (confirmBtn != null && confirmBtn.isEnabled) {
+                val clicked = clickNodeOrParent(confirmBtn)
+                val tapped = if (!clicked) tapNodeBoundsFallback(confirmBtn) else true
+                if (clicked || tapped) {
+                    disarmAutoConfirmMediaProjection()
+                    Log.i(TAG, "Auto-confirmed MediaProjection full-screen consent (actionClick=$clicked, gestureTap=$tapped)")
+                    return
+                }
+            }
+        }
+    }
+
+    private fun findConfirmButtonNode(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        for (viewId in POSITIVE_BUTTON_VIEW_IDS) {
+            val byId = runCatching { root.findAccessibilityNodeInfosByViewId(viewId) }.getOrNull().orEmpty()
+            val candidate = byId.firstOrNull { it.isVisibleToUser && it.isEnabled }
+            if (candidate != null) return candidate
+        }
+        return findFirstMatchingNode(root) { node ->
+            node.isVisibleToUser &&
+                node.isEnabled &&
+                (node.isClickable || node.parent?.isClickable == true) &&
+                (isPositiveConfirmButtonLabel(node.text?.toString()) ||
+                    isPositiveConfirmButtonLabel(node.contentDescription?.toString()))
+        }
+    }
+
+    private fun findFirstMatchingNode(
+        root: AccessibilityNodeInfo,
+        predicate: (AccessibilityNodeInfo) -> Boolean
+    ): AccessibilityNodeInfo? {
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        queue.add(root)
+        var visited = 0
+        while (queue.isNotEmpty() && visited < MAX_TRAVERSE_NODES) {
+            val current = queue.removeFirst()
+            visited++
+            if (predicate(current)) return current
+            val count = current.childCount
+            for (i in 0 until count) {
+                val child = current.getChild(i) ?: continue
+                queue.add(child)
+            }
+        }
+        return null
+    }
+
+    private fun clickNodeOrParent(node: AccessibilityNodeInfo): Boolean {
+        var target: AccessibilityNodeInfo? = node
+        var depth = 0
+        while (target != null && depth < 4) {
+            if (target.isClickable && target.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+                return true
+            }
+            target = target.parent
+            depth++
+        }
+        return false
+    }
+
+    private fun tapNodeBoundsFallback(node: AccessibilityNodeInfo): Boolean {
+        val rect = Rect()
+        node.getBoundsInScreen(rect)
+        if (rect.width() <= 0 || rect.height() <= 0) return false
+        return injectTap(
+            displayId = Display.DEFAULT_DISPLAY,
+            x = rect.exactCenterX(),
+            y = rect.exactCenterY(),
+            durationMs = DEFAULT_TAP_DURATION_MS
+        )
     }
 
     override fun onInterrupt() {
@@ -407,6 +551,84 @@ class CarLifeAccessibilityService : AccessibilityService() {
         const val EDGE_BACK_GUARD_PX = 14f
         private const val MAX_PATH_POINTS = 64
         private const val TAP_SLOP_PX_SQ = 256f // 16 px threshold
+        private const val MAX_TRAVERSE_NODES = 180
+        private const val AUTO_CONFIRM_DEBOUNCE_MS = 120L
+        const val DEFAULT_AUTO_CONFIRM_WINDOW_MS = 12_000L
+
+        private val POSITIVE_BUTTON_VIEW_IDS = listOf(
+            "android:id/button1",
+            "com.android.systemui:id/button1",
+            "com.android.systemui:id/screen_share_permission_dialog_start_btn"
+        )
+
+        private val autoConfirmDeadlineElapsedMs = AtomicLong(0L)
+
+        /**
+         * Arms a strictly time-bounded window during which [CarLifeAccessibilityService]
+         * will automatically confirm the `com.android.systemui` MediaProjection «Весь экран» dialog.
+         */
+        fun armAutoConfirmMediaProjection(timeoutMs: Long = DEFAULT_AUTO_CONFIRM_WINDOW_MS) {
+            val safeTimeout = timeoutMs.coerceIn(1_000L, 20_000L)
+            autoConfirmDeadlineElapsedMs.set(SystemClock.elapsedRealtime() + safeTimeout)
+        }
+
+        fun disarmAutoConfirmMediaProjection() {
+            autoConfirmDeadlineElapsedMs.set(0L)
+        }
+
+        fun isAutoConfirmMediaProjectionArmed(nowElapsedMs: Long = SystemClock.elapsedRealtime()): Boolean {
+            val deadline = autoConfirmDeadlineElapsedMs.get()
+            if (deadline <= 0L) return false
+            if (nowElapsedMs > deadline) {
+                autoConfirmDeadlineElapsedMs.compareAndSet(deadline, 0L)
+                return false
+            }
+            return true
+        }
+
+        internal fun isMediaProjectionDialogPackage(packageName: String?, className: String? = null): Boolean {
+            val pkg = packageName.orEmpty().lowercase()
+            val cls = className.orEmpty().lowercase()
+            if (pkg == "com.android.systemui") return true
+            if (pkg.contains("systemui") || cls.contains("mediaprojection")) return true
+            return false
+        }
+
+        internal fun isSingleAppSelectorLabel(raw: String?): Boolean {
+            val text = raw?.trim()?.lowercase().orEmpty()
+            if (text.isEmpty()) return false
+            return text == "одно приложение" ||
+                text == "a single app" ||
+                text == "single app" ||
+                text.contains("одно приложение") ||
+                text.contains("одним приложением") ||
+                text.contains("single app")
+        }
+
+        internal fun isEntireScreenOptionLabel(raw: String?): Boolean {
+            val text = raw?.trim()?.lowercase().orEmpty()
+            if (text.isEmpty()) return false
+            return text == "весь экран" ||
+                text == "entire screen" ||
+                text == "share entire screen" ||
+                text.contains("весь экран") ||
+                text.contains("всем экраном") ||
+                text.contains("entire screen")
+        }
+
+        internal fun isPositiveConfirmButtonLabel(raw: String?): Boolean {
+            val text = raw?.trim()?.lowercase().orEmpty()
+            if (text.isEmpty()) return false
+            return text == "начать" ||
+                text == "начать сейчас" ||
+                text == "разрешить" ||
+                text == "start now" ||
+                text == "start" ||
+                text == "allow" ||
+                text == "share screen" ||
+                text == "начать запись" ||
+                text == "начать трансляцию"
+        }
 
         @Volatile
         var instance: CarLifeAccessibilityService? = null

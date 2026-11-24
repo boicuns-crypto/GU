@@ -57,7 +57,13 @@ data class ScreenKeepAliveConfig(
      * Optional safety pulse: if the user accidentally presses the Power button during active
      * USB Mirroring, briefly wakes the screen so SurfaceFlinger continues rendering frames.
      */
-    val autoWakeOnScreenOff: Boolean = false
+    val autoWakeOnScreenOff: Boolean = false,
+    /**
+     * Automatically confirms Android's «Весь экран» (`MediaProjection`) consent dialog
+     * via `CarLifeAccessibilityService` during the armed request window so mirroring starts
+     * hands-free when the USB cable connects.
+     */
+    val autoConfirmMediaProjection: Boolean = true
 )
 
 /**
@@ -97,6 +103,7 @@ object ScreenKeepAlivePreferences {
     private const val KEY_DIM_PHONE_SCREEN_USB = "screen_auto_dim_1pct_on_usb_v2"
     private const val KEY_AUTO_ROTATE_LEFT_USB = "screen_auto_rotate_left_on_usb"
     private const val KEY_AUTO_WAKE_SCREEN_OFF = "screen_auto_wake_on_off"
+    private const val KEY_AUTO_CONFIRM_MP = "screen_auto_confirm_media_projection"
 
     private val _config = MutableStateFlow(ScreenKeepAliveConfig())
     val config: StateFlow<ScreenKeepAliveConfig> = _config.asStateFlow()
@@ -114,7 +121,8 @@ object ScreenKeepAlivePreferences {
             keepScreenAwakeOverlay = prefs.getBoolean(KEY_KEEP_AWAKE_OVERLAY, true),
             dimPhoneScreenDuringMirroring = prefs.getBoolean(KEY_DIM_PHONE_SCREEN_USB, true),
             autoRotateLeftOnUsb = prefs.getBoolean(KEY_AUTO_ROTATE_LEFT_USB, true),
-            autoWakeOnScreenOff = prefs.getBoolean(KEY_AUTO_WAKE_SCREEN_OFF, false)
+            autoWakeOnScreenOff = prefs.getBoolean(KEY_AUTO_WAKE_SCREEN_OFF, false),
+            autoConfirmMediaProjection = prefs.getBoolean(KEY_AUTO_CONFIRM_MP, true)
         )
     }
 
@@ -139,6 +147,7 @@ object ScreenKeepAlivePreferences {
             .remove(KEY_DIM_PHONE_SCREEN_USB)
             .remove(KEY_AUTO_ROTATE_LEFT_USB)
             .remove(KEY_AUTO_WAKE_SCREEN_OFF)
+            .remove(KEY_AUTO_CONFIRM_MP)
             .apply()
         _config.value = ScreenKeepAliveConfig()
     }
@@ -152,6 +161,7 @@ object ScreenKeepAlivePreferences {
             .putBoolean(KEY_DIM_PHONE_SCREEN_USB, cfg.dimPhoneScreenDuringMirroring)
             .putBoolean(KEY_AUTO_ROTATE_LEFT_USB, cfg.autoRotateLeftOnUsb)
             .putBoolean(KEY_AUTO_WAKE_SCREEN_OFF, cfg.autoWakeOnScreenOff)
+            .putBoolean(KEY_AUTO_CONFIRM_MP, cfg.autoConfirmMediaProjection)
             .apply()
     }
 }

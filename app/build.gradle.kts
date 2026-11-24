@@ -8,16 +8,26 @@ plugins {
   alias(libs.plugins.google.services)
 }
 
+val isMirrorOnlyEdition = project.findProperty("appEdition")
+  ?.toString()
+  ?.equals("mirror", ignoreCase = true) == true
+
 android {
   namespace = "com.example"
   compileSdk { version = release(36) { minorApiLevel = 1 } }
 
   defaultConfig {
-    applicationId = "com.aistudio.carlifebridge.s26uxk"
+    applicationId = if (isMirrorOnlyEdition) {
+      "com.aistudio.carlifebridge.s26uxk.mirror"
+    } else {
+      "com.aistudio.carlifebridge.s26uxk"
+    }
     minSdk = 24
     targetSdk = 36
     versionCode = 2
-    versionName = "1.1"
+    versionName = if (isMirrorOnlyEdition) "1.1-mirror" else "1.1"
+    buildConfigField("boolean", "MIRROR_ONLY_EDITION", isMirrorOnlyEdition.toString())
+    manifestPlaceholders["appLabel"] = if (isMirrorOnlyEdition) "Jetta Mirror" else "@string/app_name"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
