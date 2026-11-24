@@ -881,7 +881,11 @@ class BridgeForegroundService : Service() {
                 }
             }
         )
-        screenKeepAliveManager.start(isSessionActive = true, isMirroringOrUsbActive = false)
+        screenKeepAliveManager.start(
+            isSessionActive = true,
+            isUsbConnected = false,
+            isMirroringMode = activeAppMode == AppMode.MIRRORING
+        )
 
         audioCaptureManager = CarLifeAudioCaptureManager(
             context = applicationContext,
@@ -968,14 +972,7 @@ class BridgeForegroundService : Service() {
                 BridgeTelemetryBus.updateState { current ->
                     current.copy(projectionStats = projStats)
                 }
-                if (::screenKeepAliveManager.isInitialized) {
-                    val activeMirrorOrUsb = projStats.usingMediaProjection ||
-                        usbTransport.state.value is UsbTransportState.Connected
-                    screenKeepAliveManager.updateSessionState(
-                        isSessionActive = true,
-                        isMirroringOrUsbActive = activeMirrorOrUsb
-                    )
-                }
+                syncScreenKeepAliveState()
             }
         }
 
@@ -1081,14 +1078,7 @@ class BridgeForegroundService : Service() {
                     }
                 }
                 updateForegroundNotification(newState)
-                if (::screenKeepAliveManager.isInitialized) {
-                    val activeMirrorOrUsb = newState is UsbTransportState.Connected ||
-                        (::projectionManager.isInitialized && projectionManager.stats.value.usingMediaProjection)
-                    screenKeepAliveManager.updateSessionState(
-                        isSessionActive = true,
-                        isMirroringOrUsbActive = activeMirrorOrUsb
-                    )
-                }
+                syncScreenKeepAliveState(usbConnectedOverride = newState is UsbTransportState.Connected)
             }
         }
 
@@ -1361,6 +1351,7 @@ class BridgeForegroundService : Service() {
                 } else if (previousMode == AppMode.SHIZUKU_COCKPIT) {
                     CarLifeShizukuManager.unbindUserService(applicationContext)
                 }
+                syncScreenKeepAliveState()
 
                 serviceScope.launch {
                     val wasReady = isVideoChannelReadyForStreaming
@@ -1591,14 +1582,7 @@ class BridgeForegroundService : Service() {
 
             ACTION_UPDATE_SCREEN_KEEP_ALIVE -> {
                 ScreenKeepAlivePreferences.init(applicationContext)
-                if (::screenKeepAliveManager.isInitialized) {
-                    val activeMirrorOrUsb = usbTransport.state.value is UsbTransportState.Connected ||
-                        (::projectionManager.isInitialized && projectionManager.stats.value.usingMediaProjection)
-                    screenKeepAliveManager.updateSessionState(
-                        isSessionActive = true,
-                        isMirroringOrUsbActive = activeMirrorOrUsb
-                    )
-                }
+                syncScreenKeepAliveState()
             }
 
             ACTION_DISCONNECT_STOP -> {
@@ -1623,6 +1607,17 @@ class BridgeForegroundService : Service() {
         }
 
         return START_STICKY
+    }
+
+    private fun syncScreenKeepAliveState(usbConnectedOverride: Boolean? = null) {
+        if (!::screenKeepAliveManager.isInitialized) return
+        val usbConnected = usbConnectedOverride
+            ?: (::usbTransport.isInitialized && usbTransport.state.value is UsbTransportState.Connected)
+        screenKeepAliveManager.updateSessionState(
+            isSessionActive = true,
+            isUsbConnected = usbConnected,
+            isMirroringMode = activeAppMode == AppMode.MIRRORING
+        )
     }
 
     override fun onBind(intent: Intent?): IBinder = binder

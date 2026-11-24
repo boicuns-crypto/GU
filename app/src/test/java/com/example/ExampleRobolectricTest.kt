@@ -4,6 +4,7 @@ import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
 import android.content.Intent
+import android.content.pm.ActivityInfo
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.media.AudioManager
@@ -12,6 +13,7 @@ import android.media.MediaFormat
 import android.os.Bundle
 import android.view.KeyEvent
 import android.view.MotionEvent
+import android.view.WindowManager
 import androidx.test.core.app.ApplicationProvider
 import com.example.core.audio.AudioCapturePreferences
 import com.example.core.audio.CarLifeAudioCaptureManager
@@ -25,6 +27,7 @@ import com.example.core.projection.AppMode
 import com.example.core.projection.AppModePreferences
 import com.example.core.projection.CockpitProjectionManager
 import com.example.core.projection.MediaProjectionTokenStore
+import com.example.core.projection.ScreenKeepAliveManager
 import com.example.core.projection.ScreenKeepAlivePreferences
 import com.example.core.projection.VideoSourceMode
 import com.example.core.shizuku.CarLifeShizukuManager
@@ -1010,26 +1013,85 @@ class ExampleRobolectricTest {
   }
 
   @Test
-  fun `screen keep-alive preferences persist and BridgeForegroundService handles config updates cleanly`() {
+  fun `screen keep-alive preferences persist and USB mirroring enforces 1pct brightness and landscape-left policy`() {
     val context = ApplicationProvider.getApplicationContext<Context>()
     try {
       ScreenKeepAlivePreferences.clear(context)
       val initial = ScreenKeepAlivePreferences.init(context)
       assertTrue(initial.keepAliveOnScreenOff)
       assertTrue(initial.keepScreenAwakeOverlay)
-      assertFalse(initial.dimPhoneScreenDuringMirroring)
+      assertTrue(initial.dimPhoneScreenDuringMirroring)
+      assertTrue(initial.autoRotateLeftOnUsb)
       assertFalse(initial.autoWakeOnScreenOff)
 
+      // 1. USB disconnected in Mirroring -> normal screen brightness & orientation (overlay detached)
+      val disconnectedPolicy = ScreenKeepAliveManager.computeOverlayPolicy(
+        config = initial,
+        isSessionActive = true,
+        isUsbConnected = false,
+        isMirroringMode = true,
+        hasOverlayPermission = true
+      )
+      assertFalse(disconnectedPolicy.shouldAttachOverlay)
+      assertFalse(disconnectedPolicy.dimScreen)
+      assertFalse(disconnectedPolicy.rotateLeft)
+      assertEquals(WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE, disconnectedPolicy.targetBrightness, 0.0001f)
+      assertEquals(ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED, disconnectedPolicy.targetOrientation)
+
+      // 2. USB connected in Mirroring -> automatic 1% OLED brightness & rotate left (landscape)
+      val connectedMirrorPolicy = ScreenKeepAliveManager.computeOverlayPolicy(
+        config = initial,
+        isSessionActive = true,
+        isUsbConnected = true,
+        isMirroringMode = true,
+        hasOverlayPermission = true
+      )
+      assertTrue(connectedMirrorPolicy.shouldAttachOverlay)
+      assertTrue(connectedMirrorPolicy.keepScreenOn)
+      assertTrue(connectedMirrorPolicy.dimScreen)
+      assertTrue(connectedMirrorPolicy.rotateLeft)
+      assertEquals(ScreenKeepAliveManager.MIN_OLED_BRIGHTNESS, connectedMirrorPolicy.targetBrightness, 0.0001f)
+      assertEquals(ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE, connectedMirrorPolicy.targetOrientation)
+
+      // 3. USB connected in non-Mirroring mode (Cockpit / Shizuku) -> normal screen brightness & orientation
+      val nonMirrorPolicy = ScreenKeepAliveManager.computeOverlayPolicy(
+        config = initial,
+        isSessionActive = true,
+        isUsbConnected = true,
+        isMirroringMode = false,
+        hasOverlayPermission = true
+      )
+      assertFalse(nonMirrorPolicy.shouldAttachOverlay)
+      assertEquals(WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE, nonMirrorPolicy.targetBrightness, 0.0001f)
+      assertEquals(ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED, nonMirrorPolicy.targetOrientation)
+
+      // 4. Independent toggles persist across init() and update overlay policy cleanly
       ScreenKeepAlivePreferences.updateConfig(context) {
         it.copy(
-          dimPhoneScreenDuringMirroring = true,
+          dimPhoneScreenDuringMirroring = false,
+          autoRotateLeftOnUsb = false,
           autoWakeOnScreenOff = true
         )
       }
       val reloaded = ScreenKeepAlivePreferences.init(context)
-      assertTrue(reloaded.dimPhoneScreenDuringMirroring)
+      assertFalse(reloaded.dimPhoneScreenDuringMirroring)
+      assertFalse(reloaded.autoRotateLeftOnUsb)
       assertTrue(reloaded.autoWakeOnScreenOff)
 
+      val disabledPolicy = ScreenKeepAliveManager.computeOverlayPolicy(
+        config = reloaded,
+        isSessionActive = true,
+        isUsbConnected = true,
+        isMirroringMode = true,
+        hasOverlayPermission = true
+      )
+      assertTrue(disabledPolicy.shouldAttachOverlay) // keepScreenAwakeOverlay still true
+      assertFalse(disabledPolicy.dimScreen)
+      assertFalse(disabledPolicy.rotateLeft)
+      assertEquals(WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE, disabledPolicy.targetBrightness, 0.0001f)
+      assertEquals(ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED, disabledPolicy.targetOrientation)
+
+      // 5. BridgeForegroundService handles config updates & screen-off transitions cleanly
       val updateIntent = Intent(context, BridgeForegroundService::class.java).apply {
         action = BridgeForegroundService.ACTION_UPDATE_SCREEN_KEEP_ALIVE
       }

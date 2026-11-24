@@ -307,7 +307,10 @@ fun TouchSensitivitySettingsCard(
 }
 
 /**
- * VW MIB3 styled card for screen-off survival (Mirroring + 0x0003 Audio) and AMOLED-safe 1% phone dimming.
+ * VW MIB3 styled card for Mirroring USB screen automation:
+ * - Automatic 1% OLED brightness on USB connect (restores normal screen on USB disconnect)
+ * - Automatic landscape-left screen rotation on USB connect (restores normal orientation on USB disconnect)
+ * - Screen-off survival (Mirroring + 0x0003 Audio) and keep-awake
  */
 @Composable
 fun ScreenKeepAliveSettingsCard(
@@ -324,10 +327,12 @@ fun ScreenKeepAliveSettingsCard(
 
     val badgeLabel = when {
         keepAliveState.isPhoneScreenOff -> "ПОГАШЕН • LIVE"
-        keepAliveState.isDimmingActive -> "OLED 1%"
-        keepAliveState.isKeepAwakeOverlayActive -> "KEEP AWAKE"
-        config.keepAliveOnScreenOff -> "ЗАЩИТА ВКЛ"
-        else -> "СТАНДАРТ"
+        keepAliveState.isDimmingActive && keepAliveState.isAutoRotateLeftActive -> "1% • ВЛЕВО"
+        keepAliveState.isDimmingActive -> "ЯРКОСТЬ 1%"
+        keepAliveState.isAutoRotateLeftActive -> "ВЛЕВО"
+        keepAliveState.isKeepAwakeOverlayActive -> "USB АКТИВЕН"
+        keepAliveState.isUsbConnected && !keepAliveState.isMirroringMode -> "НЕ ЗЕРКАЛО"
+        else -> "ОБЫЧНЫЙ"
     }
 
     Card(
@@ -352,13 +357,13 @@ fun ScreenKeepAliveSettingsCard(
             ) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = "Экран и питание",
+                        text = "Экран при Зеркалировании (USB)",
                         style = MaterialTheme.typography.titleMedium,
                         color = colorScheme.onSurface
                     )
                     Spacer(modifier = Modifier.height(2.dp))
                     Text(
-                        text = "Удержание Зеркалирования и звука 0x0003 при погашенном экране",
+                        text = "Яркость 1%, переворот влево и возврат в обычный режим по USB",
                         style = MaterialTheme.typography.labelSmall,
                         color = colorScheme.onSurfaceVariant
                     )
@@ -366,7 +371,9 @@ fun ScreenKeepAliveSettingsCard(
                 Spacer(modifier = Modifier.width(8.dp))
                 CompactPillBadge(
                     label = badgeLabel,
-                    active = config.keepAliveOnScreenOff || keepAliveState.isKeepAwakeOverlayActive
+                    active = keepAliveState.isDimmingActive ||
+                        keepAliveState.isAutoRotateLeftActive ||
+                        keepAliveState.isKeepAwakeOverlayActive
                 )
             }
 
@@ -388,6 +395,32 @@ fun ScreenKeepAliveSettingsCard(
             }
 
             SettingsSwitchRow(
+                title = "Яркость 1% при подключении USB",
+                subtitle = "Автоматически снижает подсветку смартфона до 1% по USB (на ГУ 100%) и возвращает обычный режим экрана при отключении кабеля",
+                checked = config.dimPhoneScreenDuringMirroring,
+                testTag = "screen_dim_phone_switch",
+                onCheckedChange = { enabled ->
+                    ScreenKeepAlivePreferences.updateConfig(context) {
+                        it.copy(dimPhoneScreenDuringMirroring = enabled)
+                    }
+                    onNotifyServiceConfigChanged()
+                }
+            )
+
+            SettingsSwitchRow(
+                title = "Автоповорот экрана влево по USB",
+                subtitle = "Автоматически переворачивает экран влево (альбомно) при подключении USB-кабеля и возвращает обычное положение при отключении",
+                checked = config.autoRotateLeftOnUsb,
+                testTag = "screen_auto_rotate_left_switch",
+                onCheckedChange = { enabled ->
+                    ScreenKeepAlivePreferences.updateConfig(context) {
+                        it.copy(autoRotateLeftOnUsb = enabled)
+                    }
+                    onNotifyServiceConfigChanged()
+                }
+            )
+
+            SettingsSwitchRow(
                 title = "Не отключать Зеркалирование и звук при гашении",
                 subtitle = "Удерживает MediaProjection, H.264 и аудио 0x0003 в фоне (PARTIAL_WAKE_LOCK + Heartbeat) и мгновенно восстанавливает кадр",
                 checked = config.keepAliveOnScreenOff,
@@ -401,26 +434,13 @@ fun ScreenKeepAliveSettingsCard(
             )
 
             SettingsSwitchRow(
-                title = "Не давать экрану уснуть поверх приложений",
-                subtitle = "Невидимое окно 1×1 px (FLAG_KEEP_SCREEN_ON) не даёт экрану гаснуть в Навигаторе, 2ГИС и YouTube",
+                title = "Не давать экрану уснуть по USB",
+                subtitle = "Удерживает экран активным (FLAG_KEEP_SCREEN_ON) во время поездки по USB в Навигаторе, 2ГИС и YouTube",
                 checked = config.keepScreenAwakeOverlay,
                 testTag = "screen_keep_awake_overlay_switch",
                 onCheckedChange = { enabled ->
                     ScreenKeepAlivePreferences.updateConfig(context) {
                         it.copy(keepScreenAwakeOverlay = enabled)
-                    }
-                    onNotifyServiceConfigChanged()
-                }
-            )
-
-            SettingsSwitchRow(
-                title = "Минимальная яркость телефона (1% OLED)",
-                subtitle = "Гасит подсветку смартфона до 1% во время поездки, а на экране ГУ остаётся 100% яркая картинка без выгорания",
-                checked = config.dimPhoneScreenDuringMirroring,
-                testTag = "screen_dim_phone_switch",
-                onCheckedChange = { enabled ->
-                    ScreenKeepAlivePreferences.updateConfig(context) {
-                        it.copy(dimPhoneScreenDuringMirroring = enabled)
                     }
                     onNotifyServiceConfigChanged()
                 }
@@ -439,7 +459,10 @@ fun ScreenKeepAliveSettingsCard(
                 }
             )
 
-            if (!hasOverlayPermission && (config.keepScreenAwakeOverlay || config.dimPhoneScreenDuringMirroring)) {
+            val needsOverlayPerm = config.keepScreenAwakeOverlay ||
+                config.dimPhoneScreenDuringMirroring ||
+                config.autoRotateLeftOnUsb
+            if (!hasOverlayPermission && needsOverlayPerm) {
                 FilledTonalButton(
                     onClick = onOpenOverlaySettings,
                     modifier = Modifier
@@ -453,7 +476,7 @@ fun ScreenKeepAliveSettingsCard(
                     )
                 ) {
                     Text(
-                        text = "Выдать разрешение Overlay для удержания экрана",
+                        text = "Выдать разрешение Overlay для яркости 1% и автоповорота",
                         fontWeight = FontWeight.SemiBold
                     )
                 }
