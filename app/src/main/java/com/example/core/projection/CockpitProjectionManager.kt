@@ -2431,46 +2431,183 @@ class CockpitProjectionManager(
     }
 
     suspend fun injectHardKeyPacket(packet: CarLifeHardKeyPacket): Boolean {
-        if (packet.androidKeyCode == KeyEvent.KEYCODE_UNKNOWN) return false
+        val code = packet.carLifeKeyCode
+        val androidKey = packet.androidKeyCode
+
         return withContext(Dispatchers.Main.immediate) {
-            when (packet.androidKeyCode) {
-                KeyEvent.KEYCODE_MEDIA_NEXT -> MediaControllerRepository.skipNext()
-                KeyEvent.KEYCODE_MEDIA_PREVIOUS -> MediaControllerRepository.skipPrevious()
-                KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> MediaControllerRepository.togglePlayPause()
-                KeyEvent.KEYCODE_HOME -> {
-                    if (appMode == AppMode.SHIZUKU_COCKPIT) {
-                        showShizukuLauncherGrid()
-                    } else if (appMode == AppMode.COCKPIT) {
-                        CockpitUiStateController.showGrid()
-                        runCatching { cockpitPresentation?.show() }
+            // 1. Media & Tracks (works across ALL 3 modes via MediaPlayerController + AudioManager fallback)
+            when {
+                code == 16 || code == 0x15 || androidKey == KeyEvent.KEYCODE_MEDIA_PREVIOUS -> {
+                    MediaPlayerController.previous()
+                    _stats.update {
+                        it.copy(statusMessage = "HardKey PREV (code=$code) -> MediaPlayerController.previous()")
+                    }
+                    return@withContext true
+                }
+
+                code == 17 || code == 0x16 || androidKey == KeyEvent.KEYCODE_MEDIA_NEXT -> {
+                    MediaPlayerController.next()
+                    _stats.update {
+                        it.copy(statusMessage = "HardKey NEXT (code=$code) -> MediaPlayerController.next()")
+                    }
+                    return@withContext true
+                }
+
+                code == 23 || code == 24 || androidKey == KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> {
+                    MediaPlayerController.playPause()
+                    _stats.update {
+                        it.copy(statusMessage = "HardKey PLAY_PAUSE (code=$code) -> MediaPlayerController.playPause()")
+                    }
+                    return@withContext true
+                }
+
+                // 2. Voice Assistant (19 / 0x13 / legacy 0x09)
+                code == 19 || code == 0x09 || androidKey == KeyEvent.KEYCODE_VOICE_ASSIST -> {
+                    val launched = runCatching {
+                        val voiceIntent = Intent(Intent.ACTION_VOICE_COMMAND).apply {
+                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        }
+                        appContext.startActivity(voiceIntent)
+                        true
+                    }.getOrDefault(false)
+                    _stats.update {
+                        it.copy(
+                            statusMessage = if (launched) {
+                                "HardKey VR_START (code=$code) -> Voice Assistant"
+                            } else {
+                                "HardKey VR_START (code=$code) -> Voice Assistant не найден"
+                            }
+                        )
+                    }
+                    return@withContext launched
+                }
+
+                // 3. NAVI (13 / 0x0D)
+                code == 13 || androidKey == KeyEvent.KEYCODE_NAVIGATE_IN -> {
+                    val handled = when (appMode) {
+                        AppMode.COCKPIT -> {
+                            CockpitUiStateController.showMap()
+                            runCatching { cockpitPresentation?.show() }
+                            cockpitPresentation?.window?.decorView?.postInvalidate()
+                            true
+                        }
+                        AppMode.SHIZUKU_COCKPIT -> {
+                            val vDisplayId = virtualDisplay?.display?.displayId ?: _stats.value.virtualDisplayId
+                            openShizukuNavigatorOrFallbackMap(vDisplayId)
+                            true
+                        }
+                        AppMode.MIRRORING -> {
+                            CarLifeLauncherRepository.launchPreferredNavigatorOnDefaultDisplay(appContext)
+                        }
+                    }
+                    _stats.update {
+                        it.copy(statusMessage = "HardKey NAVI (code=$code) -> ${appMode.title}")
+                    }
+                    return@withContext handled
+                }
+
+                // 4. HOME (1 / 0x01)
+                code == 1 || androidKey == KeyEvent.KEYCODE_HOME -> {
+                    return@withContext when (appMode) {
+                        AppMode.MIRRORING -> {
+                            val ok = CarLifeAccessibilityService.instance?.performHomeAction() == true
+                            _stats.update {
+                                it.copy(statusMessage = "Mirror HardKey -> HOME (KeyCode=${KeyEvent.KEYCODE_HOME})")
+                            }
+                            ok
+                        }
+                        AppMode.SHIZUKU_COCKPIT -> {
+                            val vDisplayId = virtualDisplay?.display?.displayId ?: _stats.value.virtualDisplayId
+                            showShizukuLauncherGrid()
+                            val sent = CarLifeShizukuManager.sendKeyEvent(KeyEvent.KEYCODE_HOME, vDisplayId)
+                            _stats.update {
+                                it.copy(statusMessage = "Shizuku HardKey -> HOME KeyCode=${KeyEvent.KEYCODE_HOME} (VD #$vDisplayId)")
+                            }
+                            sent || isShizukuLauncherGridVisible
+                        }
+                        AppMode.COCKPIT -> {
+                            CockpitUiStateController.showGrid()
+                            runCatching { cockpitPresentation?.show() }
+                            cockpitPresentation?.window?.decorView?.postInvalidate()
+                            _stats.update {
+                                it.copy(statusMessage = "Cockpit HardKey -> HOME (сетка приложений)")
+                            }
+                            true
+                        }
+                    }
+                }
+
+                // 5. BACK (14 / 0x0E)
+                code == 14 || androidKey == KeyEvent.KEYCODE_BACK -> {
+                    return@withContext when (appMode) {
+                        AppMode.MIRRORING -> {
+                            val ok = CarLifeAccessibilityService.instance?.performBackAction() == true
+                            _stats.update {
+                                it.copy(statusMessage = "Mirror HardKey -> BACK (GLOBAL_ACTION_BACK)")
+                            }
+                            ok
+                        }
+                        AppMode.SHIZUKU_COCKPIT -> {
+                            val vDisplayId = virtualDisplay?.display?.displayId ?: _stats.value.virtualDisplayId
+                            val sent = CarLifeShizukuManager.sendKeyEvent(KeyEvent.KEYCODE_BACK, vDisplayId)
+                            _stats.update {
+                                it.copy(statusMessage = "Shizuku HardKey -> BACK KeyCode=${KeyEvent.KEYCODE_BACK} (VD #$vDisplayId)")
+                            }
+                            sent
+                        }
+                        AppMode.COCKPIT -> {
+                            val handledInCockpit = CockpitUiStateController.handleCockpitBack()
+                            val decorHandled = if (!handledInCockpit) {
+                                val decorView = cockpitPresentation?.window?.decorView
+                                if (decorView != null) {
+                                    val now = SystemClock.uptimeMillis()
+                                    val downEvent = KeyEvent(now, now, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_BACK, 0)
+                                    val upEvent = KeyEvent(now, now + 15L, KeyEvent.ACTION_UP, KeyEvent.KEYCODE_BACK, 0)
+                                    decorView.dispatchKeyEvent(downEvent) || decorView.dispatchKeyEvent(upEvent)
+                                } else {
+                                    false
+                                }
+                            } else {
+                                true
+                            }
+                            _stats.update {
+                                it.copy(statusMessage = "Cockpit HardKey -> BACK")
+                            }
+                            decorHandled
+                        }
                     }
                 }
             }
+
+            if (androidKey == KeyEvent.KEYCODE_UNKNOWN) {
+                return@withContext false
+            }
+
             if (appMode == AppMode.MIRRORING) {
                 val a11yHandled = CarLifeAccessibilityService.instance
-                    ?.handleSystemHardKey(packet.androidKeyCode) ?: false
+                    ?.handleSystemHardKey(androidKey) ?: false
                 _stats.update {
-                    it.copy(statusMessage = "Mirror HardKey -> KeyCode=${packet.androidKeyCode}")
+                    it.copy(statusMessage = "Mirror HardKey -> KeyCode=$androidKey")
                 }
                 return@withContext a11yHandled
             }
             if (appMode == AppMode.SHIZUKU_COCKPIT) {
                 val vDisplayId = virtualDisplay?.display?.displayId ?: _stats.value.virtualDisplayId
-                val sent = CarLifeShizukuManager.sendKeyEvent(packet.androidKeyCode, vDisplayId)
+                val sent = CarLifeShizukuManager.sendKeyEvent(androidKey, vDisplayId)
                 _stats.update {
-                    it.copy(statusMessage = "Shizuku HardKey -> KeyCode=${packet.androidKeyCode} (VD #$vDisplayId)")
+                    it.copy(statusMessage = "Shizuku HardKey -> KeyCode=$androidKey (VD #$vDisplayId)")
                 }
                 return@withContext sent
             }
             val decorView = cockpitPresentation?.window?.decorView ?: return@withContext false
             val now = SystemClock.uptimeMillis()
-            val downEvent = KeyEvent(now, now, KeyEvent.ACTION_DOWN, packet.androidKeyCode, 0)
-            val upEvent = KeyEvent(now, now + 15L, KeyEvent.ACTION_UP, packet.androidKeyCode, 0)
+            val downEvent = KeyEvent(now, now, KeyEvent.ACTION_DOWN, androidKey, 0)
+            val upEvent = KeyEvent(now, now + 15L, KeyEvent.ACTION_UP, androidKey, 0)
             val downHandled = decorView.dispatchKeyEvent(downEvent)
             val upHandled = decorView.dispatchKeyEvent(upEvent)
             _stats.update {
                 it.copy(
-                    statusMessage = "Cockpit HardKey -> KeyCode=${packet.androidKeyCode}"
+                    statusMessage = "Cockpit HardKey -> KeyCode=$androidKey"
                 )
             }
             downHandled || upHandled

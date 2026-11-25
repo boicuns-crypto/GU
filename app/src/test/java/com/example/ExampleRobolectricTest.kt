@@ -39,6 +39,10 @@ import com.example.core.usb.BridgeTelemetryBus
 import com.example.core.usb.CarLifeUsbWriteQueue
 import com.example.core.usb.UsbAccessoryTransport
 import com.example.protocol.carlife.CarLifeFrameCodec
+import com.example.protocol.carlife.CarLifeHardKey
+import com.example.protocol.carlife.CarLifeInputEvent
+import com.example.protocol.carlife.CarLifeMsgType
+import com.example.protocol.carlife.CarLifeTouchDecoder
 import androidx.compose.ui.graphics.Color
 import com.example.feature.cockpit.AppLaunchMode
 import com.example.feature.cockpit.CarLifeLauncherRepository
@@ -442,6 +446,8 @@ class ExampleRobolectricTest {
       override fun sendKeyEvent(keyCode: Int, displayId: Int) {
         keys.add(RecordedKey(keyCode, displayId))
       }
+
+      override fun setNoCutoutOverlayEnabled(enabled: Boolean): Boolean = true
 
       override fun destroy() = Unit
     }
@@ -1318,6 +1324,7 @@ class ExampleRobolectricTest {
       }
 
       override fun sendKeyEvent(keyCode: Int, displayId: Int) = Unit
+      override fun setNoCutoutOverlayEnabled(enabled: Boolean): Boolean = false
       override fun destroy() = Unit
     }
 
@@ -1449,6 +1456,150 @@ class ExampleRobolectricTest {
       assertFalse(ScreenKeepAlivePreferences.init(context).autoConfirmMediaProjection)
     } finally {
       AppEditionConfig.setMirrorOnlyOverrideForTesting(null)
+      ScreenKeepAlivePreferences.clear(context)
+    }
+  }
+
+  @Test
+  fun `steering wheel 0x00060008 hardkeys decode protobuf tag 0x08 and route across modes`() {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+
+    val expectedCodes = listOf(
+      1 to CarLifeHardKey.HOME,
+      13 to CarLifeHardKey.NAVI,
+      14 to CarLifeHardKey.BACK,
+      16 to CarLifeHardKey.SEEK_SUB,
+      17 to CarLifeHardKey.SEEK_ADD,
+      19 to CarLifeHardKey.VR_START,
+      23 to CarLifeHardKey.PLAY_PAUSE_ALT,
+      24 to CarLifeHardKey.PLAY_PAUSE
+    )
+
+    for ((code, expectedKey) in expectedCodes) {
+      val frame = CarLifeTouchDecoder.createRawHardKeyFrame(
+        rawCode = code,
+        serviceType = CarLifeMsgType.MSG_TOUCH_CAR_HARD_KEY_CODE_ALT
+      )
+      val decoded = CarLifeTouchDecoder.decodeTouchChannelFrame(frame)
+      assertTrue("Expected HardKey event for code=$code", decoded is CarLifeInputEvent.HardKey)
+      val hardKey = decoded as CarLifeInputEvent.HardKey
+      assertEquals(code, hardKey.rawKeyCode)
+      assertEquals(expectedKey, hardKey.mappedKey)
+    }
+
+    // Custom non-standard wheel code should still extract keycode cleanly for HARD_KEY logging
+    val customFrame = CarLifeTouchDecoder.createRawHardKeyFrame(
+      rawCode = 42,
+      serviceType = CarLifeMsgType.MSG_TOUCH_CAR_HARD_KEY_CODE_ALT
+    )
+    val customDecoded = CarLifeTouchDecoder.decodeTouchChannelFrame(customFrame) as CarLifeInputEvent.HardKey
+    assertEquals(42, customDecoded.rawKeyCode)
+    assertEquals(null, customDecoded.mappedKey)
+
+    // Cockpit routing: 13 -> EMBEDDED_MAP, 14 -> APP_GRID, 1 -> APP_GRID, 16/17/23/24 -> MediaPlayerController
+    MediaPlayerController.initialize(context)
+    val manager = CockpitProjectionManager(
+      context = context,
+      onEncodedVideoNal = { _, _, _ -> }
+    )
+    try {
+      manager.appMode = AppMode.COCKPIT
+      CockpitUiStateController.showGrid()
+      kotlinx.coroutines.runBlocking {
+        assertTrue(manager.injectHardKeyPacket(CarLifeHardKeyPacket(13, KeyEvent.KEYCODE_NAVIGATE_IN)))
+        assertEquals(CockpitRightPane.EMBEDDED_MAP, CockpitUiStateController.activeRightPane.value)
+
+        assertTrue(manager.injectHardKeyPacket(CarLifeHardKeyPacket(14, KeyEvent.KEYCODE_BACK)))
+        assertEquals(CockpitRightPane.APP_GRID, CockpitUiStateController.activeRightPane.value)
+
+        CockpitUiStateController.showMap()
+        assertTrue(manager.injectHardKeyPacket(CarLifeHardKeyPacket(1, KeyEvent.KEYCODE_HOME)))
+        assertEquals(CockpitRightPane.APP_GRID, CockpitUiStateController.activeRightPane.value)
+
+        assertTrue(manager.injectHardKeyPacket(CarLifeHardKeyPacket(16, KeyEvent.KEYCODE_MEDIA_PREVIOUS)))
+        assertTrue(manager.injectHardKeyPacket(CarLifeHardKeyPacket(17, KeyEvent.KEYCODE_MEDIA_NEXT)))
+        assertTrue(manager.injectHardKeyPacket(CarLifeHardKeyPacket(23, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE)))
+        assertTrue(manager.injectHardKeyPacket(CarLifeHardKeyPacket(24, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE)))
+        manager.stopProjection()
+      }
+    } finally {
+      CockpitUiStateController.registerMapBackHandler(null)
+      CockpitUiStateController.showGrid()
+    }
+  }
+
+  @Test
+  fun `display cutout fill preference and Shizuku noCutout overlay policy toggle cleanly on USB state`() {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    try {
+      ScreenKeepAlivePreferences.clear(context)
+      val defaults = ScreenKeepAlivePreferences.init(context)
+      assertTrue(defaults.fillCameraCutoutOnUsb)
+
+      ScreenKeepAlivePreferences.updateConfig(context) { it.copy(fillCameraCutoutOnUsb = false) }
+      assertFalse(ScreenKeepAlivePreferences.init(context).fillCameraCutoutOnUsb)
+
+      assertTrue(
+        ScreenKeepAliveManager.shouldApplyDisplayCutoutFill(
+          fillCameraCutoutOnUsb = true,
+          isUsbConnected = true,
+          isStreamingOrProjecting = true
+        )
+      )
+      assertFalse(
+        ScreenKeepAliveManager.shouldApplyDisplayCutoutFill(
+          fillCameraCutoutOnUsb = true,
+          isUsbConnected = false,
+          isStreamingOrProjecting = true
+        )
+      )
+      assertFalse(
+        ScreenKeepAliveManager.shouldApplyDisplayCutoutFill(
+          fillCameraCutoutOnUsb = false,
+          isUsbConnected = true,
+          isStreamingOrProjecting = true
+        )
+      )
+
+      assertTrue(
+        ScreenKeepAliveManager.shouldApplyShizukuNoCutoutOverlay(
+          fillCameraCutoutOnUsb = true,
+          isUsbConnected = true,
+          isStreamingOrProjecting = true,
+          isMirroringMode = true,
+          isShizukuReady = true
+        )
+      )
+      assertFalse(
+        ScreenKeepAliveManager.shouldApplyShizukuNoCutoutOverlay(
+          fillCameraCutoutOnUsb = true,
+          isUsbConnected = true,
+          isStreamingOrProjecting = true,
+          isMirroringMode = false,
+          isShizukuReady = true
+        )
+      )
+      assertFalse(
+        ScreenKeepAliveManager.shouldApplyShizukuNoCutoutOverlay(
+          fillCameraCutoutOnUsb = true,
+          isUsbConnected = false,
+          isStreamingOrProjecting = true,
+          isMirroringMode = true,
+          isShizukuReady = true
+        )
+      )
+
+      val enableCmd = CarLifeShizukuService.buildNoCutoutOverlayCommand(enable = true).toList()
+      val disableCmd = CarLifeShizukuService.buildNoCutoutOverlayCommand(enable = false).toList()
+      assertEquals(
+        listOf("cmd", "overlay", "enable", CarLifeShizukuService.NO_CUTOUT_OVERLAY_PACKAGE),
+        enableCmd
+      )
+      assertEquals(
+        listOf("cmd", "overlay", "disable", CarLifeShizukuService.NO_CUTOUT_OVERLAY_PACKAGE),
+        disableCmd
+      )
+    } finally {
       ScreenKeepAlivePreferences.clear(context)
     }
   }

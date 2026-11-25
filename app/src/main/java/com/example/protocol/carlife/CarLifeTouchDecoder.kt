@@ -18,7 +18,8 @@ enum class CarLifeTouchEventType(val androidMotionAction: Int, val label: String
 }
 
 /**
- * Steering wheel & MIB rotary knob hardkeys sent by Jetta VS7 (MQB) over `MSG_TOUCH_CAR_HARD_KEY_CODE (0x00068008)`.
+ * Steering wheel & MIB rotary knob hardkeys sent by Jetta VS7 (MQB) over
+ * `MSG_TOUCH_CAR_HARD_KEY_CODE (0x00060008 / 0x00068008)`.
  */
 enum class CarLifeHardKey(
     val carLifeCode: Int,
@@ -28,19 +29,24 @@ enum class CarLifeHardKey(
     HOME(0x00000001, KeyEvent.KEYCODE_HOME, "HOME"),
     PHONE_CALL(0x00000002, KeyEvent.KEYCODE_CALL, "PHONE_CALL"),
     PHONE_END(0x00000003, KeyEvent.KEYCODE_ENDCALL, "PHONE_END"),
-    VR_START(0x00000009, KeyEvent.KEYCODE_VOICE_ASSIST, "VR_START (Voice)"),
     VR_STOP(0x0000000A, KeyEvent.KEYCODE_ESCAPE, "VR_STOP"),
     SELECTOR_NEXT(0x0000000B, KeyEvent.KEYCODE_DPAD_RIGHT, "ROTARY_NEXT (CW)"),
     SELECTOR_PREVIOUS(0x0000000C, KeyEvent.KEYCODE_DPAD_LEFT, "ROTARY_PREV (CCW)"),
-    SELECTOR_OK(0x0000000D, KeyEvent.KEYCODE_DPAD_CENTER, "ROTARY_OK"),
-    BACK(0x0000000E, KeyEvent.KEYCODE_BACK, "BACK"),
-    SEEK_SUB(0x00000015, KeyEvent.KEYCODE_MEDIA_PREVIOUS, "PREV_TRACK (<<)"),
-    SEEK_ADD(0x00000016, KeyEvent.KEYCODE_MEDIA_NEXT, "NEXT_TRACK (>>)"),
-    VOLUME_MUTE(0x00000017, KeyEvent.KEYCODE_VOLUME_MUTE, "MUTE"),
-    PLAY_PAUSE(0x00000018, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, "PLAY_PAUSE");
+    NAVI(0x0000000D, KeyEvent.KEYCODE_NAVIGATE_IN, "NAVI (13)"),
+    BACK(0x0000000E, KeyEvent.KEYCODE_BACK, "BACK (14)"),
+    SEEK_SUB(0x00000010, KeyEvent.KEYCODE_MEDIA_PREVIOUS, "SEEK_SUB (16)"),
+    SEEK_ADD(0x00000011, KeyEvent.KEYCODE_MEDIA_NEXT, "SEEK_ADD (17)"),
+    VR_START(0x00000013, KeyEvent.KEYCODE_VOICE_ASSIST, "VR_START (19)"),
+    PLAY_PAUSE_ALT(0x00000017, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, "PLAY_PAUSE (23)"),
+    PLAY_PAUSE(0x00000018, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, "PLAY_PAUSE (24)");
 
     companion object {
-        fun fromCode(code: Int): CarLifeHardKey? = entries.firstOrNull { it.carLifeCode == code }
+        fun fromCode(code: Int): CarLifeHardKey? = when (code) {
+            0x00000009 -> VR_START
+            0x00000015 -> SEEK_SUB
+            0x00000016 -> SEEK_ADD
+            else -> entries.firstOrNull { it.carLifeCode == code }
+        }
     }
 }
 
@@ -184,7 +190,8 @@ object CarLifeTouchDecoder {
                 huHeight = defaultHuHeight
             )
 
-            CarLifeMsgType.MSG_TOUCH_CAR_HARD_KEY_CODE -> decodeHardKeyCode(cmd.body)
+            CarLifeMsgType.MSG_TOUCH_CAR_HARD_KEY_CODE,
+            CarLifeMsgType.MSG_TOUCH_CAR_HARD_KEY_CODE_ALT -> decodeHardKeyCode(cmd.body)
 
             else -> null
         }
@@ -223,16 +230,37 @@ object CarLifeTouchDecoder {
     }
 
     /**
-     * Encodes a steering wheel hardkey (`MSG_TOUCH_CAR_HARD_KEY_CODE = 0x00068008`) frame.
+     * Encodes a steering wheel hardkey (`MSG_TOUCH_CAR_HARD_KEY_CODE = 0x00068008` / `0x00060008`) frame.
      */
-    fun createHardKeyFrame(key: CarLifeHardKey): CarLifeFrame {
+    fun createHardKeyFrame(
+        key: CarLifeHardKey,
+        serviceType: Int = CarLifeMsgType.MSG_TOUCH_CAR_HARD_KEY_CODE
+    ): CarLifeFrame {
         val protoBytes = CarLifeWireProtobuf.Writer(12)
             .writeVarintField(1, key.carLifeCode)
             .toByteArray()
 
         return CarLifeFrameCodec.createCommandFrame(
             channel = CarLifeChannel.TOUCH,
-            serviceType = CarLifeMsgType.MSG_TOUCH_CAR_HARD_KEY_CODE,
+            serviceType = serviceType,
+            commandBody = protoBytes
+        )
+    }
+
+    /**
+     * Encodes an arbitrary integer hardkey code for diagnostics / unit testing.
+     */
+    fun createRawHardKeyFrame(
+        rawCode: Int,
+        serviceType: Int = CarLifeMsgType.MSG_TOUCH_CAR_HARD_KEY_CODE_ALT
+    ): CarLifeFrame {
+        val protoBytes = CarLifeWireProtobuf.Writer(12)
+            .writeVarintField(1, rawCode)
+            .toByteArray()
+
+        return CarLifeFrameCodec.createCommandFrame(
+            channel = CarLifeChannel.TOUCH,
+            serviceType = serviceType,
             commandBody = protoBytes
         )
     }
@@ -325,16 +353,24 @@ object CarLifeTouchDecoder {
 
     private fun decodeHardKeyCode(body: ByteArray): CarLifeInputEvent.HardKey {
         var keyCode = 0
-        if (body.isNotEmpty() && body[0].toInt() == 0x08) {
-            val reader = CarLifeWireProtobuf.Reader(body)
-            while (reader.readTag()) {
-                when (reader.lastFieldNumber) {
-                    1 -> keyCode = reader.readVarint32()
-                    else -> reader.skipField()
+        var parsedProto = false
+        if (body.isNotEmpty()) {
+            // Try Protobuf field #1 (tag 0x08, varint) even if another tag precedes it
+            if ((body[0].toInt() and 0xFF) == 0x08 || body.any { (it.toInt() and 0xFF) == 0x08 }) {
+                val reader = CarLifeWireProtobuf.Reader(body)
+                while (reader.readTag()) {
+                    when (reader.lastFieldNumber) {
+                        1 -> {
+                            keyCode = reader.readVarint32()
+                            parsedProto = true
+                        }
+                        else -> reader.skipField()
+                    }
                 }
             }
-        } else if (body.size >= 4) {
-            keyCode = ByteBuffer.wrap(body).order(ByteOrder.BIG_ENDIAN).int
+            if (!parsedProto && body.size >= 4) {
+                keyCode = ByteBuffer.wrap(body).order(ByteOrder.BIG_ENDIAN).int
+            }
         }
         val mapped = CarLifeHardKey.fromCode(keyCode)
         return CarLifeInputEvent.HardKey(

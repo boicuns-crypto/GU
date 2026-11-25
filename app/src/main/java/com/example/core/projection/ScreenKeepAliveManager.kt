@@ -63,7 +63,13 @@ data class ScreenKeepAliveConfig(
      * via `CarLifeAccessibilityService` during the armed request window so mirroring starts
      * hands-free when the USB cable connects.
      */
-    val autoConfirmMediaProjection: Boolean = true
+    val autoConfirmMediaProjection: Boolean = true,
+    /**
+     * Automatically extends the app window into the display camera cutout area (`LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS` / `SHORT_EDGES`),
+     * hides system bars while USB streaming is active (plus optional Shizuku `noCutout` overlay in Mirroring mode),
+     * and restores default cutout/system bars cleanly upon USB disconnect or service shutdown.
+     */
+    val fillCameraCutoutOnUsb: Boolean = true
 )
 
 /**
@@ -104,6 +110,7 @@ object ScreenKeepAlivePreferences {
     private const val KEY_AUTO_ROTATE_LEFT_USB = "screen_auto_rotate_left_on_usb"
     private const val KEY_AUTO_WAKE_SCREEN_OFF = "screen_auto_wake_on_off"
     private const val KEY_AUTO_CONFIRM_MP = "screen_auto_confirm_media_projection"
+    private const val KEY_FILL_CAMERA_CUTOUT_USB = "screen_fill_camera_cutout_on_usb"
 
     private val _config = MutableStateFlow(ScreenKeepAliveConfig())
     val config: StateFlow<ScreenKeepAliveConfig> = _config.asStateFlow()
@@ -122,7 +129,8 @@ object ScreenKeepAlivePreferences {
             dimPhoneScreenDuringMirroring = prefs.getBoolean(KEY_DIM_PHONE_SCREEN_USB, true),
             autoRotateLeftOnUsb = prefs.getBoolean(KEY_AUTO_ROTATE_LEFT_USB, true),
             autoWakeOnScreenOff = prefs.getBoolean(KEY_AUTO_WAKE_SCREEN_OFF, false),
-            autoConfirmMediaProjection = prefs.getBoolean(KEY_AUTO_CONFIRM_MP, true)
+            autoConfirmMediaProjection = prefs.getBoolean(KEY_AUTO_CONFIRM_MP, true),
+            fillCameraCutoutOnUsb = prefs.getBoolean(KEY_FILL_CAMERA_CUTOUT_USB, true)
         )
     }
 
@@ -148,6 +156,7 @@ object ScreenKeepAlivePreferences {
             .remove(KEY_AUTO_ROTATE_LEFT_USB)
             .remove(KEY_AUTO_WAKE_SCREEN_OFF)
             .remove(KEY_AUTO_CONFIRM_MP)
+            .remove(KEY_FILL_CAMERA_CUTOUT_USB)
             .apply()
         _config.value = ScreenKeepAliveConfig()
     }
@@ -162,6 +171,7 @@ object ScreenKeepAlivePreferences {
             .putBoolean(KEY_AUTO_ROTATE_LEFT_USB, cfg.autoRotateLeftOnUsb)
             .putBoolean(KEY_AUTO_WAKE_SCREEN_OFF, cfg.autoWakeOnScreenOff)
             .putBoolean(KEY_AUTO_CONFIRM_MP, cfg.autoConfirmMediaProjection)
+            .putBoolean(KEY_FILL_CAMERA_CUTOUT_USB, cfg.fillCameraCutoutOnUsb)
             .apply()
     }
 }
@@ -545,5 +555,23 @@ class ScreenKeepAliveManager(
                 }
             )
         }
+
+        fun shouldApplyDisplayCutoutFill(
+            fillCameraCutoutOnUsb: Boolean,
+            isUsbConnected: Boolean,
+            isStreamingOrProjecting: Boolean
+        ): Boolean = fillCameraCutoutOnUsb && isUsbConnected && isStreamingOrProjecting
+
+        fun shouldApplyShizukuNoCutoutOverlay(
+            fillCameraCutoutOnUsb: Boolean,
+            isUsbConnected: Boolean,
+            isStreamingOrProjecting: Boolean,
+            isMirroringMode: Boolean,
+            isShizukuReady: Boolean
+        ): Boolean = fillCameraCutoutOnUsb &&
+            isUsbConnected &&
+            isStreamingOrProjecting &&
+            isMirroringMode &&
+            isShizukuReady
     }
 }

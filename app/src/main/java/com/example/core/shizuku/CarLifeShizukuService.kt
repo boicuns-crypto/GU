@@ -36,6 +36,9 @@ class CarLifeShizukuService : ICarLifeShizukuService.Stub {
         Thread(runnable, "CarLifeShizukuCmd").apply { isDaemon = true }
     }
 
+    @Volatile
+    private var noCutoutOverlayEnabledByService: Boolean = false
+
     override fun launchAppOnDisplay(
         packageName: String?,
         activityName: String?,
@@ -171,7 +174,34 @@ class CarLifeShizukuService : ICarLifeShizukuService.Stub {
         }
     }
 
+    override fun setNoCutoutOverlayEnabled(enabled: Boolean): Boolean {
+        return runCatching {
+            if (enabled) {
+                val res = execShellCommandDetailed(buildNoCutoutOverlayCommand(enable = true))
+                if (res.isSuccess) {
+                    noCutoutOverlayEnabledByService = true
+                }
+                res.isSuccess
+            } else {
+                val res = execShellCommandDetailed(buildNoCutoutOverlayCommand(enable = false))
+                noCutoutOverlayEnabledByService = false
+                res.isSuccess
+            }
+        }.onFailure { e ->
+            Log.w(TAG, "setNoCutoutOverlayEnabled($enabled) failed: ${e.message}")
+            if (!enabled) {
+                noCutoutOverlayEnabledByService = false
+            }
+        }.getOrDefault(false)
+    }
+
     override fun destroy() {
+        if (noCutoutOverlayEnabledByService) {
+            runCatching {
+                execShellCommandDetailed(buildNoCutoutOverlayCommand(enable = false))
+            }
+            noCutoutOverlayEnabledByService = false
+        }
         runCatching { commandExecutor.shutdownNow() }
         exitProcess(0)
     }
@@ -211,10 +241,18 @@ class CarLifeShizukuService : ICarLifeShizukuService.Stub {
     companion object {
         private const val TAG = "CarLifeShizukuSvc"
         private const val INJECT_INPUT_EVENT_MODE_ASYNC = 0
+        const val NO_CUTOUT_OVERLAY_PACKAGE = "com.android.internal.display.cutout.emulation.noCutout"
         const val WINDOWING_MODE_FREEFORM = 5
         const val RIGHT_PANE_LEFT_PX = 250
         const val RIGHT_PANE_RIGHT_PX = 1280
         const val RIGHT_PANE_BOTTOM_PX = 720
+
+        internal fun buildNoCutoutOverlayCommand(enable: Boolean): Array<String> = arrayOf(
+            "cmd",
+            "overlay",
+            if (enable) "enable" else "disable",
+            NO_CUTOUT_OVERLAY_PACKAGE
+        )
 
         internal fun buildStartCommand(
             packageName: String,

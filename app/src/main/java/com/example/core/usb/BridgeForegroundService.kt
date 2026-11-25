@@ -40,6 +40,7 @@ import com.example.core.projection.VideoSourceMode
 import com.example.core.shizuku.CarLifeShizukuManager
 import com.example.feature.cockpit.AppLaunchMode
 import com.example.feature.cockpit.CarLifeLauncherRepository
+import com.example.feature.cockpit.MediaPlayerController
 import com.example.protocol.carlife.CarLifeChannel
 import com.example.protocol.carlife.CarLifeControlSessionState
 import com.example.protocol.carlife.CarLifeControlStateMachine
@@ -134,6 +135,7 @@ data class BridgeRuntimeState(
     val configuredBitrateBps: Int = 2_000_000,
     val autoTestState: AutoTestState = AutoTestState(),
     val lastTouchOrKeyEvent: String = "None — Waiting for Touch/Hardkey Channel (0x0006)",
+    val lastSteeringWheelKeyEvent: String = "Ожидание нажатия кнопки на руле (0x00060008)",
     val rxBytes: Long = 0L,
     val txBytes: Long = 0L,
     val rxFrames: Long = 0L,
@@ -518,6 +520,7 @@ class BridgeForegroundService : Service() {
         BridgeTelemetryBus.updateState {
             it.copy(isVideoChannelReadyForStreaming = ready)
         }
+        syncScreenKeepAliveState(force = true)
     }
 
     private fun resetVideoLogFlags() {
@@ -803,9 +806,16 @@ class BridgeForegroundService : Service() {
         CarLifeFrameCodec.useNestedVideoMsgHeader = currentNestedMode
         isVideoChannelReadyForStreaming = false
 
+        MediaPlayerController.initialize(applicationContext)
         if (!AppEditionConfig.isMirrorOnly) {
             CarLifeShizukuManager.init(applicationContext)
-            if (activeAppMode == AppMode.SHIZUKU_COCKPIT) {
+            val shizukuSnap = CarLifeShizukuManager.refreshStatus(applicationContext)
+            if (activeAppMode == AppMode.SHIZUKU_COCKPIT ||
+                (activeAppMode == AppMode.MIRRORING &&
+                    ScreenKeepAlivePreferences.config.value.fillCameraCutoutOnUsb &&
+                    shizukuSnap.isBinderAlive &&
+                    shizukuSnap.hasPermission)
+            ) {
                 CarLifeShizukuManager.bindUserServiceIfReady(applicationContext)
             }
         }
@@ -1364,14 +1374,23 @@ class BridgeForegroundService : Service() {
                 }
 
                 if (!AppEditionConfig.isMirrorOnly) {
-                    if (mode == AppMode.SHIZUKU_COCKPIT) {
+                    val shizukuSnap = CarLifeShizukuManager.refreshStatus(applicationContext)
+                    val needShizukuForCutout = mode == AppMode.MIRRORING &&
+                        ScreenKeepAlivePreferences.config.value.fillCameraCutoutOnUsb &&
+                        shizukuSnap.isBinderAlive &&
+                        shizukuSnap.hasPermission
+                    if (mode == AppMode.SHIZUKU_COCKPIT || needShizukuForCutout) {
                         CarLifeShizukuManager.init(applicationContext)
                         CarLifeShizukuManager.bindUserServiceIfReady(applicationContext)
-                    } else if (previousMode == AppMode.SHIZUKU_COCKPIT) {
+                    } else if (previousMode == AppMode.SHIZUKU_COCKPIT || previousMode == AppMode.MIRRORING) {
+                        CarLifeShizukuManager.setNoCutoutOverlayEnabledAsync(false)
                         CarLifeShizukuManager.unbindUserService(applicationContext)
                     }
+                    if (mode != AppMode.MIRRORING && CarLifeShizukuManager.noCutoutOverlayEnabledByBridge) {
+                        CarLifeShizukuManager.setNoCutoutOverlayEnabledAsync(false)
+                    }
                 }
-                syncScreenKeepAliveState()
+                syncScreenKeepAliveState(force = true)
 
                 serviceScope.launch {
                     val wasReady = isVideoChannelReadyForStreaming
@@ -1614,6 +1633,7 @@ class BridgeForegroundService : Service() {
                     screenKeepAliveManager.stop()
                 }
                 serviceScope.launch {
+                    runCatching { CarLifeShizukuManager.setNoCutoutOverlayEnabled(false) }
                     audioCaptureManager.stopCapture(
                         sendMediaStop = usbTransport.state.value is UsbTransportState.Connected
                     )
@@ -1638,6 +1658,28 @@ class BridgeForegroundService : Service() {
         val usbConnected = usbConnectedOverride
             ?: (::usbTransport.isInitialized && usbTransport.state.value is UsbTransportState.Connected)
         val mirroringMode = activeAppMode == AppMode.MIRRORING
+        val cfg = ScreenKeepAlivePreferences.config.value
+        val isStreamingOrProjecting = isVideoChannelReadyForStreaming ||
+            (::projectionManager.isInitialized && projectionManager.stats.value.isRunning)
+
+        val shizukuStatus = CarLifeShizukuManager.status.value
+        val shouldApplyShizukuCutout = ScreenKeepAliveManager.shouldApplyShizukuNoCutoutOverlay(
+            fillCameraCutoutOnUsb = cfg.fillCameraCutoutOnUsb,
+            isUsbConnected = usbConnected,
+            isStreamingOrProjecting = isStreamingOrProjecting,
+            isMirroringMode = mirroringMode,
+            isShizukuReady = shizukuStatus.isBinderAlive && shizukuStatus.hasPermission
+        )
+        if (shouldApplyShizukuCutout) {
+            if (CarLifeShizukuManager.userService == null) {
+                CarLifeShizukuManager.bindUserServiceIfReady(applicationContext)
+            } else if (!CarLifeShizukuManager.noCutoutOverlayEnabledByBridge) {
+                CarLifeShizukuManager.setNoCutoutOverlayEnabledAsync(true)
+            }
+        } else if (CarLifeShizukuManager.noCutoutOverlayEnabledByBridge) {
+            CarLifeShizukuManager.setNoCutoutOverlayEnabledAsync(false)
+        }
+
         val currentTuple = Triple(true, usbConnected, mirroringMode)
         if (!force && lastSyncedKeepAliveTuple == currentTuple) {
             return
@@ -1683,6 +1725,7 @@ class BridgeForegroundService : Service() {
                 lastProtocolEvent = "BridgeForegroundService stopped"
             )
         }
+        runCatching { CarLifeShizukuManager.setNoCutoutOverlayEnabled(false) }
         if (!AppEditionConfig.isMirrorOnly) {
             runCatching { CarLifeShizukuManager.unbindUserService(applicationContext) }
         }
@@ -1938,12 +1981,23 @@ class BridgeForegroundService : Service() {
                         AppMode.COCKPIT ->
                             "Touch ${decodedEvent.type.label}: HU(${decodedEvent.rawX},${decodedEvent.rawY}) -> Cockpit VD(${decodedEvent.scaledX.toInt()},${decodedEvent.scaledY.toInt()})"
                     }
-                    is CarLifeInputEvent.HardKey ->
-                        "HardKey: ${decodedEvent.mappedKey?.label ?: "0x${decodedEvent.rawKeyCode.toString(16)}"} (Android KeyCode=${decodedEvent.androidKeyCode})"
+                    is CarLifeInputEvent.HardKey -> {
+                        val hardKeyLog = "HARD_KEY: code=${decodedEvent.rawKeyCode} (0x${decodedEvent.rawKeyCode.toString(16)})"
+                        Log.i(TAG, hardKeyLog)
+                        hardKeyLog
+                    }
                     null -> "Raw Touch Frame (${frame.payload.size}B)"
                 }
                 BridgeTelemetryBus.updateState {
-                    it.copy(lastTouchOrKeyEvent = eventSummary)
+                    if (decodedEvent is CarLifeInputEvent.HardKey) {
+                        val mappedSuffix = decodedEvent.mappedKey?.let { k -> " • ${k.label}" }.orEmpty()
+                        it.copy(
+                            lastTouchOrKeyEvent = eventSummary,
+                            lastSteeringWheelKeyEvent = "$eventSummary$mappedSuffix"
+                        )
+                    } else {
+                        it.copy(lastTouchOrKeyEvent = eventSummary)
+                    }
                 }
                 BridgeTelemetryBus.recordFrame(
                     direction = "RX (HU -> S26U)",
@@ -1952,7 +2006,8 @@ class BridgeForegroundService : Service() {
                     txBytesTotal = usbTransport.txBytes,
                     rxFramesTotal = usbTransport.rxFrames,
                     txFramesTotal = usbTransport.txFrames,
-                    protocolNote = eventSummary
+                    protocolNote = eventSummary,
+                    forceLog = decodedEvent is CarLifeInputEvent.HardKey
                 )
             }
 

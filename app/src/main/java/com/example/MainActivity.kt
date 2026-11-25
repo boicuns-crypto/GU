@@ -2,9 +2,11 @@ package com.example
 
 import android.Manifest
 import android.app.Activity
+import android.content.BroadcastReceiver
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.content.res.Configuration
 import android.hardware.usb.UsbAccessory
@@ -106,6 +108,8 @@ import androidx.compose.ui.unit.sp
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -119,6 +123,7 @@ import com.example.core.input.CarLifeAccessibilityService
 import com.example.core.input.TouchSettingsPreferences
 import com.example.core.projection.AppMode
 import com.example.core.projection.MediaProjectionTokenStore
+import com.example.core.projection.ScreenKeepAliveManager
 import com.example.core.projection.ScreenKeepAlivePreferences
 import com.example.core.shizuku.CarLifeShizukuManager
 import com.example.core.usb.BridgeForegroundService
@@ -150,6 +155,19 @@ class MainActivity : ComponentActivity() {
     private lateinit var recordAudioPermissionLauncher: ActivityResultLauncher<String>
     private lateinit var locationPermissionLauncher: ActivityResultLauncher<String>
 
+    private var originalCutoutMode: Int? = null
+    private var isCutoutFillApplied: Boolean = false
+    private var usbDetachReceiverRegistered: Boolean = false
+
+    private val usbDetachReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            if (intent.action == UsbManager.ACTION_USB_ACCESSORY_DETACHED) {
+                restoreDefaultWindowCutoutAndBars()
+                CarLifeShizukuManager.setNoCutoutOverlayEnabledAsync(false)
+            }
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -159,6 +177,7 @@ class MainActivity : ComponentActivity() {
         TouchSettingsPreferences.init(this)
         ScreenKeepAlivePreferences.init(this)
         BridgeTelemetryBus.restoreSavedAppMode(this)
+        registerUsbDetachReceiver()
 
         recordAudioPermissionLauncher = registerForActivityResult(
             ActivityResultContracts.RequestPermission()
@@ -212,7 +231,20 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             val activeThemeMode by ThemePreferences.themeMode.collectAsState()
+            val runtimeState by BridgeTelemetryBus.runtimeState.collectAsStateWithLifecycle()
+            val keepAliveConfig by ScreenKeepAlivePreferences.config.collectAsStateWithLifecycle()
             val isDarkTheme = resolveIsDarkTheme(activeThemeMode)
+            val shouldFillCutout = ScreenKeepAliveManager.shouldApplyDisplayCutoutFill(
+                fillCameraCutoutOnUsb = keepAliveConfig.fillCameraCutoutOnUsb,
+                isUsbConnected = runtimeState.transportState is UsbTransportState.Connected,
+                isStreamingOrProjecting = runtimeState.isVideoChannelReadyForStreaming ||
+                    runtimeState.projectionStats.isRunning
+            )
+
+            LaunchedEffect(shouldFillCutout) {
+                applyDisplayCutoutOnUsbState(shouldFillCutout)
+            }
+
             SideEffect {
                 val insetsController = WindowCompat.getInsetsController(window, window.decorView)
                 insetsController.isAppearanceLightStatusBars = !isDarkTheme
@@ -278,10 +310,81 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onDestroy() {
+        restoreDefaultWindowCutoutAndBars()
+        if (usbDetachReceiverRegistered) {
+            runCatching { unregisterReceiver(usbDetachReceiver) }
+            usbDetachReceiverRegistered = false
+        }
+        super.onDestroy()
+    }
+
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
         handleUsbAccessoryIntent(intent)
+    }
+
+    private fun registerUsbDetachReceiver() {
+        if (usbDetachReceiverRegistered) return
+        runCatching {
+            ContextCompat.registerReceiver(
+                this,
+                usbDetachReceiver,
+                IntentFilter(UsbManager.ACTION_USB_ACCESSORY_DETACHED),
+                ContextCompat.RECEIVER_NOT_EXPORTED
+            )
+            usbDetachReceiverRegistered = true
+        }
+    }
+
+    private fun applyDisplayCutoutOnUsbState(enableFullCutout: Boolean) {
+        if (enableFullCutout) {
+            runCatching {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    val attrs = window.attributes
+                    if (originalCutoutMode == null) {
+                        originalCutoutMode = attrs.layoutInDisplayCutoutMode
+                    }
+                    val targetMode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                        WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+                    } else {
+                        WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                    }
+                    if (attrs.layoutInDisplayCutoutMode != targetMode) {
+                        attrs.layoutInDisplayCutoutMode = targetMode
+                        window.attributes = attrs
+                    }
+                }
+                WindowCompat.setDecorFitsSystemWindows(window, false)
+                WindowInsetsControllerCompat(window, window.decorView).apply {
+                    hide(WindowInsetsCompat.Type.systemBars())
+                    systemBarsBehavior =
+                        WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+                }
+                isCutoutFillApplied = true
+            }
+        } else if (isCutoutFillApplied) {
+            restoreDefaultWindowCutoutAndBars()
+        }
+    }
+
+    private fun restoreDefaultWindowCutoutAndBars() {
+        runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                val attrs = window.attributes
+                val restoreMode =
+                    originalCutoutMode ?: WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_DEFAULT
+                if (attrs.layoutInDisplayCutoutMode != restoreMode) {
+                    attrs.layoutInDisplayCutoutMode = restoreMode
+                    window.attributes = attrs
+                }
+            }
+            WindowCompat.setDecorFitsSystemWindows(window, true)
+            WindowInsetsControllerCompat(window, window.decorView)
+                .show(WindowInsetsCompat.Type.systemBars())
+            isCutoutFillApplied = false
+        }
     }
 
     private fun requestScreenCapturePermission() {
@@ -1575,6 +1678,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
     val vw = MaterialTheme.vwColors
     val isMirrorOnly = AppEditionConfig.isMirrorOnly
     val activeThemeMode by ThemePreferences.themeMode.collectAsState()
+    val keepAliveConfig by ScreenKeepAlivePreferences.config.collectAsStateWithLifecycle()
     var diagnosticsExpanded by rememberSaveable { mutableStateOf(false) }
     var mirroringDiagExpanded by rememberSaveable { mutableStateOf(false) }
     // Tab 0 (default): «Команды 0x0001 & 0x0006 (RX/TX)»
@@ -1836,6 +1940,62 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                 }
                             }
                         }
+                    }
+
+                    // Тумблер «Заполнять область выреза камеры при подключении USB»
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 48.dp)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(colorScheme.background)
+                            .border(1.dp, colorScheme.outline, RoundedCornerShape(10.dp))
+                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .weight(1f)
+                                .padding(end = 12.dp),
+                            verticalArrangement = Arrangement.spacedBy(2.dp)
+                        ) {
+                            Text(
+                                text = "Заполнять область выреза камеры при подключении USB",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = colorScheme.onSurface
+                            )
+                            Text(
+                                text = if (keepAliveConfig.fillCameraCutoutOnUsb) {
+                                    "Вкл — скрывает системные панели, расширяет окно на вырез (а в «Зеркале» включает оверлей Shizuku) и полностью возвращает штатный экран после отключения USB"
+                                } else {
+                                    "Выкл — окно и системные панели сохраняют стандартный отступ у камеры"
+                                },
+                                style = MaterialTheme.typography.labelSmall,
+                                color = colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Switch(
+                            checked = keepAliveConfig.fillCameraCutoutOnUsb,
+                            onCheckedChange = { enabled ->
+                                ScreenKeepAlivePreferences.updateConfig(context) {
+                                    it.copy(fillCameraCutoutOnUsb = enabled)
+                                }
+                                if (state.isServiceRunning) {
+                                    val updateIntent = Intent(context, BridgeForegroundService::class.java).apply {
+                                        action = BridgeForegroundService.ACTION_UPDATE_SCREEN_KEEP_ALIVE
+                                    }
+                                    safeStartService(context, updateIntent)
+                                }
+                            },
+                            modifier = Modifier.testTag("fill_camera_cutout_usb_switch"),
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = colorScheme.onPrimary,
+                                checkedTrackColor = colorScheme.primary,
+                                uncheckedThumbColor = colorScheme.onSurfaceVariant,
+                                uncheckedTrackColor = colorScheme.surfaceVariant
+                            )
+                        )
                     }
                 }
             }
@@ -2869,6 +3029,25 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                 style = MaterialTheme.typography.labelSmall,
                                 color = colorScheme.onSurfaceVariant
                             )
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Surface(
+                                color = colorScheme.surfaceVariant,
+                                shape = RoundedCornerShape(8.dp),
+                                border = BorderStroke(1.dp, colorScheme.outline.copy(alpha = 0.7f))
+                            ) {
+                                Text(
+                                    text = "Последняя клавиша руля: ${state.lastSteeringWheelKeyEvent}",
+                                    style = MaterialTheme.typography.labelSmall.tabular(),
+                                    fontFamily = JetBrainsMonoFamily,
+                                    color = vw.accentBlue,
+                                    maxLines = 2,
+                                    overflow = TextOverflow.Ellipsis,
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 10.dp, vertical = 6.dp)
+                                        .testTag("last_steering_wheel_key_text")
+                                )
+                            }
                         }
                         Icon(
                             imageVector = if (diagnosticsExpanded) {

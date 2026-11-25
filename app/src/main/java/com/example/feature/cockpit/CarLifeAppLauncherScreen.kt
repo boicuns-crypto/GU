@@ -52,6 +52,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -151,12 +152,30 @@ object CockpitUiStateController {
     private val _activeRightPane = MutableStateFlow(CockpitRightPane.APP_GRID)
     val activeRightPane: StateFlow<CockpitRightPane> = _activeRightPane.asStateFlow()
 
+    @Volatile
+    private var embeddedMapBackHandler: (() -> Boolean)? = null
+
+    fun registerMapBackHandler(handler: (() -> Boolean)?) {
+        embeddedMapBackHandler = handler
+    }
+
     fun showGrid() {
         _activeRightPane.value = CockpitRightPane.APP_GRID
     }
 
     fun showMap() {
         _activeRightPane.value = CockpitRightPane.EMBEDDED_MAP
+    }
+
+    fun handleCockpitBack(): Boolean {
+        if (_activeRightPane.value != CockpitRightPane.EMBEDDED_MAP) {
+            return false
+        }
+        val navigatedInsideMap = runCatching { embeddedMapBackHandler?.invoke() == true }.getOrDefault(false)
+        if (!navigatedInsideMap) {
+            _activeRightPane.value = CockpitRightPane.APP_GRID
+        }
+        return true
     }
 
     fun toggleMap() {
@@ -255,6 +274,32 @@ object CarLifeLauncherRepository {
                     }
                     _lastLaunchStatus.value = "Shizuku Карта: $label ($pkg) -> VD #$targetDisplayId"
                     onShizukuAppLaunchedOnVirtualDisplay?.invoke(targetDisplayId)
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    /**
+     * Best-effort launch of Яндекс Навигатор / 2ГИС / Яндекс Карты on the default phone display
+     * (used when pressing the steering-wheel NAVI button in `MIRRORING` mode).
+     */
+    fun launchPreferredNavigatorOnDefaultDisplay(context: Context): Boolean {
+        val appCtx = context.applicationContext ?: context
+        val pm = appCtx.packageManager
+        for (pkg in PREFERRED_NAV_PACKAGES) {
+            val launchIntent = runCatching { pm.getLaunchIntentForPackage(pkg) }.getOrNull()
+            if (launchIntent != null) {
+                launchIntent.addFlags(
+                    Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED
+                )
+                val started = runCatching {
+                    appCtx.startActivity(launchIntent)
+                    true
+                }.getOrDefault(false)
+                if (started) {
+                    _lastLaunchStatus.value = "Навигация ($pkg) открыта на экране телефона"
                     return true
                 }
             }
@@ -575,6 +620,13 @@ fun CarLifeAppLauncherScreen(
     LaunchedEffect(activeRightPane) {
         if (activeRightPane == CockpitRightPane.EMBEDDED_MAP) {
             hasEverOpenedEmbeddedMap = true
+        }
+    }
+
+    DisposableEffect(mapController) {
+        CockpitUiStateController.registerMapBackHandler { mapController.goBack() }
+        onDispose {
+            CockpitUiStateController.registerMapBackHandler(null)
         }
     }
 

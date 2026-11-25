@@ -126,6 +126,7 @@ object CarLifeProtocolConstants {
     const val MSG_TOUCH_DOUBLE_CLICK: Int = 0x00068006
     const val MSG_TOUCH_LONG_PRESS: Int = 0x00068007
     const val MSG_TOUCH_CAR_HARD_KEY_CODE: Int = 0x00068008
+    const val MSG_TOUCH_CAR_HARD_KEY_CODE_ALT: Int = 0x00060008
     const val MSG_TOUCH_UI_ACTION_SOUND: Int = 0x00060009
 
     // =========================================================================
@@ -134,16 +135,21 @@ object CarLifeProtocolConstants {
     const val KEYCODE_CARLIFE_HOME: Int = 0x00000001
     const val KEYCODE_CARLIFE_PHONE_CALL: Int = 0x00000002
     const val KEYCODE_CARLIFE_PHONE_END: Int = 0x00000003
-    const val KEYCODE_CARLIFE_VR_START: Int = 0x00000009
+    const val KEYCODE_CARLIFE_VR_START_LEGACY: Int = 0x00000009
     const val KEYCODE_CARLIFE_VR_STOP: Int = 0x0000000A
     const val KEYCODE_CARLIFE_SELECTOR_NEXT: Int = 0x0000000B
     const val KEYCODE_CARLIFE_SELECTOR_PREVIOUS: Int = 0x0000000C
+    const val KEYCODE_CARLIFE_NAVI: Int = 0x0000000D // 13
     const val KEYCODE_CARLIFE_SELECTOR_OK: Int = 0x0000000D
-    const val KEYCODE_CARLIFE_BACK: Int = 0x0000000E
-    const val KEYCODE_CARLIFE_SEEK_SUB: Int = 0x00000015
-    const val KEYCODE_CARLIFE_SEEK_ADD: Int = 0x00000016
+    const val KEYCODE_CARLIFE_BACK: Int = 0x0000000E // 14
+    const val KEYCODE_CARLIFE_SEEK_SUB: Int = 0x00000010 // 16
+    const val KEYCODE_CARLIFE_SEEK_ADD: Int = 0x00000011 // 17
+    const val KEYCODE_CARLIFE_VR_START: Int = 0x00000013 // 19
+    const val KEYCODE_CARLIFE_SEEK_SUB_LEGACY: Int = 0x00000015
+    const val KEYCODE_CARLIFE_SEEK_ADD_LEGACY: Int = 0x00000016
+    const val KEYCODE_CARLIFE_PLAY_PAUSE_ALT: Int = 0x00000017 // 23
     const val KEYCODE_CARLIFE_MUTE: Int = 0x00000017
-    const val KEYCODE_CARLIFE_PLAY_PAUSE: Int = 0x00000018
+    const val KEYCODE_CARLIFE_PLAY_PAUSE: Int = 0x00000018 // 24
 
     // Protocol Match Status
     const val PROTOCOL_MATCH_SUCCESS: Int = 1
@@ -167,15 +173,18 @@ object CarLifeProtocolConstants {
         KEYCODE_CARLIFE_HOME -> KeyEvent.KEYCODE_HOME
         KEYCODE_CARLIFE_PHONE_CALL -> KeyEvent.KEYCODE_CALL
         KEYCODE_CARLIFE_PHONE_END -> KeyEvent.KEYCODE_ENDCALL
-        KEYCODE_CARLIFE_VR_START -> KeyEvent.KEYCODE_VOICE_ASSIST
+        KEYCODE_CARLIFE_VR_START,
+        KEYCODE_CARLIFE_VR_START_LEGACY -> KeyEvent.KEYCODE_VOICE_ASSIST
         KEYCODE_CARLIFE_VR_STOP -> KeyEvent.KEYCODE_ESCAPE
         KEYCODE_CARLIFE_SELECTOR_NEXT -> KeyEvent.KEYCODE_DPAD_RIGHT
         KEYCODE_CARLIFE_SELECTOR_PREVIOUS -> KeyEvent.KEYCODE_DPAD_LEFT
-        KEYCODE_CARLIFE_SELECTOR_OK -> KeyEvent.KEYCODE_DPAD_CENTER
+        KEYCODE_CARLIFE_NAVI -> KeyEvent.KEYCODE_NAVIGATE_IN
         KEYCODE_CARLIFE_BACK -> KeyEvent.KEYCODE_BACK
-        KEYCODE_CARLIFE_SEEK_SUB -> KeyEvent.KEYCODE_MEDIA_PREVIOUS
-        KEYCODE_CARLIFE_SEEK_ADD -> KeyEvent.KEYCODE_MEDIA_NEXT
-        KEYCODE_CARLIFE_MUTE -> KeyEvent.KEYCODE_VOLUME_MUTE
+        KEYCODE_CARLIFE_SEEK_SUB,
+        KEYCODE_CARLIFE_SEEK_SUB_LEGACY -> KeyEvent.KEYCODE_MEDIA_PREVIOUS
+        KEYCODE_CARLIFE_SEEK_ADD,
+        KEYCODE_CARLIFE_SEEK_ADD_LEGACY -> KeyEvent.KEYCODE_MEDIA_NEXT
+        KEYCODE_CARLIFE_PLAY_PAUSE_ALT,
         KEYCODE_CARLIFE_PLAY_PAUSE -> KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE
         else -> KeyEvent.KEYCODE_UNKNOWN
     }
@@ -507,9 +516,10 @@ object CarLifePacketBuilder {
                 )
             }
 
-            CarLifeProtocolConstants.MSG_TOUCH_CAR_HARD_KEY_CODE -> {
+            CarLifeProtocolConstants.MSG_TOUCH_CAR_HARD_KEY_CODE,
+            CarLifeProtocolConstants.MSG_TOUCH_CAR_HARD_KEY_CODE_ALT -> {
                 var keyCode = 0
-                if (body.isNotEmpty() && body[0].toInt() == 0x08) {
+                if (body.isNotEmpty() && (body[0].toInt() and 0xFF) == 0x08) {
                     val reader = ProtoWireReader(body)
                     while (reader.readTag()) {
                         if (reader.fieldNumber == 1) keyCode = reader.readVarint32()

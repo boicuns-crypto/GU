@@ -145,6 +145,7 @@ object CarLifeMsgType {
     const val MSG_TOUCH_DOUBLE_CLICK = 0x00068006
     const val MSG_TOUCH_LONG_PRESS = 0x00068007
     const val MSG_TOUCH_CAR_HARD_KEY_CODE = 0x00068008
+    const val MSG_TOUCH_CAR_HARD_KEY_CODE_ALT = 0x00060008
     const val MSG_TOUCH_UI_ACTION_SOUND = 0x00060009
 
     fun isCarLifeServiceId(candidate: Int): Boolean {
@@ -223,7 +224,8 @@ object CarLifeMsgType {
         MSG_TOUCH_SINGLE_CLICK -> "MSG_TOUCH_SINGLE_CLICK"
         MSG_TOUCH_DOUBLE_CLICK -> "MSG_TOUCH_DOUBLE_CLICK"
         MSG_TOUCH_LONG_PRESS -> "MSG_TOUCH_LONG_PRESS"
-        MSG_TOUCH_CAR_HARD_KEY_CODE -> "MSG_TOUCH_CAR_HARD_KEY_CODE"
+        MSG_TOUCH_CAR_HARD_KEY_CODE,
+        MSG_TOUCH_CAR_HARD_KEY_CODE_ALT -> "MSG_TOUCH_CAR_HARD_KEY_CODE"
         else -> "AUTH / UNKNOWN (0x${serviceType.toUInt().toString(16).uppercase().padStart(8, '0')})"
     }
 }

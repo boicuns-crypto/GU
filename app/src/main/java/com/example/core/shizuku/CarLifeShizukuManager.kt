@@ -53,6 +53,10 @@ object CarLifeShizukuManager {
     @Volatile
     private var testingOverrideActive: Boolean = false
 
+    @Volatile
+    var noCutoutOverlayEnabledByBridge: Boolean = false
+        private set
+
     private val listenersInitialized = AtomicBoolean(false)
     private val bindingInProgress = AtomicBoolean(false)
     private val asyncExecutor = Executors.newSingleThreadExecutor { runnable ->
@@ -325,6 +329,40 @@ object CarLifeShizukuManager {
         }
     }
 
+    fun setNoCutoutOverlayEnabled(enabled: Boolean): Boolean {
+        if (!enabled && !noCutoutOverlayEnabledByBridge) {
+            return true
+        }
+        val service = userService ?: run {
+            if (!enabled) {
+                noCutoutOverlayEnabledByBridge = false
+            }
+            return false
+        }
+        return runCatching {
+            val ok = service.setNoCutoutOverlayEnabled(enabled)
+            noCutoutOverlayEnabledByBridge = if (enabled) ok else false
+            ok
+        }.onFailure { e ->
+            Log.w(TAG, "setNoCutoutOverlayEnabled($enabled) IPC failed: ${e.message}")
+            if (!enabled) {
+                noCutoutOverlayEnabledByBridge = false
+            }
+            handleIpcFailure()
+        }.getOrDefault(false)
+    }
+
+    fun setNoCutoutOverlayEnabledAsync(enabled: Boolean) {
+        if (!enabled && !noCutoutOverlayEnabledByBridge) return
+        if (userService == null) {
+            if (!enabled) noCutoutOverlayEnabledByBridge = false
+            return
+        }
+        asyncExecutor.execute {
+            setNoCutoutOverlayEnabled(enabled)
+        }
+    }
+
     private fun handleIpcFailure() {
         val ctx = appContext
         val binder = runCatching { userService?.asBinder() }.getOrNull()
@@ -385,6 +423,7 @@ object CarLifeShizukuManager {
         testingOverrideActive = false
         userService = null
         autoBindWhenReady = false
+        noCutoutOverlayEnabledByBridge = false
         bindingInProgress.set(false)
         _status.value = ShizukuStatusState()
     }
