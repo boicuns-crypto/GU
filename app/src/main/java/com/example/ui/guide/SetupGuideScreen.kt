@@ -135,7 +135,7 @@ object SetupGuideCatalog {
             summary = "Выберите удобный сценарий работы под вашу поездку: встроенный Кокпит с картой, прямое Зеркалирование смартфона или Второй экран через Shizuku.",
             highlights = listOf(
                 "Кокпит: левая панель VW (250 px) + сетка приложений и встроенная Яндекс Карта.",
-                "Зеркалирование: полный экран смартфона на ГУ (с опцией 16:9 через Shizuku).",
+                "Зеркалирование: полный экран смартфона на ГУ с поддержкой 1% OLED и удержания экрана.",
                 "Кокпит + Shizuku: Навигатор или 2ГИС на втором виртуальном экране с панелью VW."
             ),
             drawableName = "guide_step_4"
@@ -153,9 +153,9 @@ object SetupGuideCatalog {
         ),
         GuideStepSpec(
             stepNumber = 6,
-            badge = "ШАГ 6 • SHIZUKU 16:9 И VD",
-            title = "Настройка Shizuku (второй экран и 16:9)",
-            summary = "Shizuku не требует root-прав и запускается за 1 минуту по «Отладке по Wi-Fi». Это открывает режим «Кокпит + Shizuku» и зеркалирование 16:9 без чёрных рамок.",
+            badge = "ШАГ 6 • SHIZUKU И VD",
+            title = "Настройка Shizuku (второй экран)",
+            summary = "Shizuku не требует root-прав и запускается за 1 минуту по «Отладке по Wi-Fi». Это открывает режим «Кокпит + Shizuku» и оверлей скрытия выреза камеры.",
             highlights = listOf(
                 "Включите «Для разработчиков» → «Отладка по Wi-Fi» и нажмите «Подключение по коду» в Shizuku.",
                 "После запуска службы вернитесь в JETTA Connect и выдайте разрешение Shizuku во вкладке «Подключение»."
@@ -233,7 +233,7 @@ fun SetupGuideScreen(
                 // Top Bar inside Guide
                 Surface(
                     modifier = Modifier.fillMaxWidth(),
-                    color = colorScheme.surface
+                    color = vw.topBarContainer
                 ) {
                     Column(modifier = Modifier.fillMaxWidth()) {
                         Row(

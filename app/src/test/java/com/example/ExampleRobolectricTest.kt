@@ -933,6 +933,13 @@ class ExampleRobolectricTest {
     assertEquals(Color(0xFF0D1522), VwLightColorScheme.onBackground)
     assertEquals(Color(0xFF0D1522), VwLightColorScheme.onSurface)
     assertEquals(Color(0xFF56657A), VwLightColorScheme.onSurfaceVariant)
+
+    // TopBar high-contrast container & compact landscape height (44..48.dp)
+    assertEquals(Color(0xFF0D1626), VwDarkColorScheme.surfaceContainer)
+    assertEquals(Color(0xFFFFFFFF), VwLightColorScheme.surfaceContainer)
+    assertEquals(52f, resolveTopBarContentHeightDp(isLandscape = false).value, 0.01f)
+    val landscapeTopBarDp = resolveTopBarContentHeightDp(isLandscape = true).value
+    assertTrue("Expected landscape TopBar height in 44..48.dp, got $landscapeTopBarDp", landscapeTopBarDp in 44f..48f)
   }
 
   @Test

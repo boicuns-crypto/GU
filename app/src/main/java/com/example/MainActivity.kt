@@ -38,15 +38,20 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.WindowInsetsSides
+import androidx.compose.foundation.layout.consumeWindowInsets
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.navigationBars
+import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBars
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.windowInsetsPadding
@@ -67,6 +72,7 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -835,26 +841,29 @@ fun CarLifeBridgeApp(
         topBar = {
             VwPhoneTopBar(
                 isUsbConnected = runtimeState.transportState is UsbTransportState.Connected,
-                isMirrorOnly = isMirrorOnly
+                isMirrorOnly = isMirrorOnly,
+                isLandscape = isLandscape
             )
         },
         bottomBar = {
             if (!isLandscape) {
                 Surface(
                     modifier = Modifier.fillMaxWidth(),
-                    color = colorScheme.surface,
+                    color = vw.topBarContainer,
                     shadowElevation = 0.dp
                 ) {
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .windowInsetsPadding(WindowInsets.navigationBars)
+                            .windowInsetsPadding(
+                                WindowInsets.safeDrawing.only(
+                                    WindowInsetsSides.Horizontal + WindowInsetsSides.Bottom
+                                )
+                            )
                     ) {
-                        Box(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(1.dp)
-                                .background(colorScheme.outline)
+                        HorizontalDivider(
+                            thickness = 1.dp,
+                            color = vw.topBarDivider
                         )
                         Row(
                             modifier = Modifier
@@ -899,13 +908,23 @@ fun CarLifeBridgeApp(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding)
+                .consumeWindowInsets(innerPadding)
+                .windowInsetsPadding(
+                    WindowInsets.safeDrawing.only(
+                        if (isLandscape) {
+                            WindowInsetsSides.Horizontal + WindowInsetsSides.Bottom
+                        } else {
+                            WindowInsetsSides.Horizontal
+                        }
+                    )
+                )
         ) {
             if (isLandscape) {
                 Surface(
                     modifier = Modifier
                         .width(76.dp)
                         .fillMaxHeight(),
-                    color = colorScheme.surface,
+                    color = vw.topBarContainer,
                     shadowElevation = 0.dp
                 ) {
                     Row(modifier = Modifier.fillMaxSize()) {
@@ -913,7 +932,7 @@ fun CarLifeBridgeApp(
                             modifier = Modifier
                                 .weight(1f)
                                 .fillMaxHeight()
-                                .padding(vertical = 12.dp, horizontal = 4.dp),
+                                .padding(vertical = 8.dp, horizontal = 4.dp),
                             verticalArrangement = Arrangement.Center,
                             horizontalAlignment = Alignment.CenterHorizontally
                         ) {
@@ -925,7 +944,7 @@ fun CarLifeBridgeApp(
                                     testTag = "nav_app_launcher",
                                     onClick = { selectedTab = 0 }
                                 )
-                                Spacer(modifier = Modifier.height(10.dp))
+                                Spacer(modifier = Modifier.height(8.dp))
                             }
                             VwRailNavItem(
                                 label = "Подключ.",
@@ -934,7 +953,7 @@ fun CarLifeBridgeApp(
                                 testTag = "nav_setup_checklist",
                                 onClick = { selectedTab = 1 }
                             )
-                            Spacer(modifier = Modifier.height(10.dp))
+                            Spacer(modifier = Modifier.height(8.dp))
                             VwRailNavItem(
                                 label = "Настройки",
                                 icon = Icons.Default.Settings,
@@ -947,7 +966,7 @@ fun CarLifeBridgeApp(
                             modifier = Modifier
                                 .width(1.dp)
                                 .fillMaxHeight()
-                                .background(colorScheme.outline)
+                                .background(vw.topBarDivider)
                         )
                     }
                 }
@@ -1242,27 +1261,40 @@ private fun openDeveloperSettings(context: Context) {
     }
 }
 
+internal val TOP_BAR_HEIGHT_PORTRAIT_DP = 52.dp
+internal val TOP_BAR_HEIGHT_LANDSCAPE_DP = 46.dp
+
+internal fun resolveTopBarContentHeightDp(isLandscape: Boolean) =
+    if (isLandscape) TOP_BAR_HEIGHT_LANDSCAPE_DP else TOP_BAR_HEIGHT_PORTRAIT_DP
+
 @Composable
 private fun VwPhoneTopBar(
     isUsbConnected: Boolean,
-    isMirrorOnly: Boolean
+    isMirrorOnly: Boolean,
+    isLandscape: Boolean = false
 ) {
     val colorScheme = MaterialTheme.colorScheme
     val vw = MaterialTheme.vwColors
+    val contentHeight = resolveTopBarContentHeightDp(isLandscape)
 
     Surface(
         modifier = Modifier
             .fillMaxWidth()
             .testTag("vw_phone_top_bar"),
-        color = colorScheme.surface,
+        color = vw.topBarContainer,
         shadowElevation = 0.dp
     ) {
-        Column(modifier = Modifier.fillMaxWidth()) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .statusBarsPadding()
+        ) {
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .heightIn(min = 52.dp)
-                    .padding(horizontal = 16.dp, vertical = 6.dp),
+                    .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal))
+                    .height(contentHeight)
+                    .padding(horizontal = 16.dp),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
@@ -1297,11 +1329,12 @@ private fun VwPhoneTopBar(
                 }
             }
 
-            Box(
+            HorizontalDivider(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(1.dp)
-                    .background(colorScheme.outline)
+                    .testTag("vw_phone_top_bar_divider"),
+                thickness = 1.dp,
+                color = vw.topBarDivider
             )
         }
     }

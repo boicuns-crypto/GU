@@ -19,6 +19,8 @@ val VwNightOnErrorContainer = Color(0xFFFFC9C7)
 val VwNightOnBackground = Color(0xFFF2F6FA)
 val VwNightOnSurfaceVariant = Color(0xFF8C9BB0)
 val VwNightTextMuted = Color(0xFF64748B)
+val VwNightTopBarContainer = Color(0xFF0D1626)
+val VwNightTopBarDivider = Color(0xFF283A54)
 
 // =========================================================================
 // Volkswagen Silver Day Palette (Light Theme)
@@ -38,6 +40,8 @@ val VwDayOnErrorContainer = Color(0xFF9B1C1C)
 val VwDayOnBackground = Color(0xFF0D1522)
 val VwDayOnSurfaceVariant = Color(0xFF56657A)
 val VwDayTextMuted = Color(0xFF6B7A90)
+val VwDayTopBarContainer = Color(0xFFFFFFFF)
+val VwDayTopBarDivider = Color(0xFFC5D3E6)
 
 // =========================================================================
 // Semantic Status Indicator Dots & Soft Capsules (VW MIB3)

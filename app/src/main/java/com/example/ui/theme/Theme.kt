@@ -93,7 +93,9 @@ data class VwExtendedColors(
     val onWarningContainer: Color,
     val errorContainerSoft: Color,
     val onErrorContainerSoft: Color,
-    val textMuted: Color
+    val textMuted: Color,
+    val topBarContainer: Color,
+    val topBarDivider: Color
 )
 
 private val VwDarkExtendedColors = VwExtendedColors(
@@ -111,7 +113,9 @@ private val VwDarkExtendedColors = VwExtendedColors(
     onWarningContainer = VwNightOnWarningContainer,
     errorContainerSoft = VwNightErrorContainer,
     onErrorContainerSoft = VwNightOnErrorContainer,
-    textMuted = VwNightTextMuted
+    textMuted = VwNightTextMuted,
+    topBarContainer = VwNightTopBarContainer,
+    topBarDivider = VwNightTopBarDivider
 )
 
 private val VwLightExtendedColors = VwExtendedColors(
@@ -129,7 +133,9 @@ private val VwLightExtendedColors = VwExtendedColors(
     onWarningContainer = VwDayOnWarningContainer,
     errorContainerSoft = VwDayErrorContainer,
     onErrorContainerSoft = VwDayOnErrorContainer,
-    textMuted = VwDayTextMuted
+    textMuted = VwDayTextMuted,
+    topBarContainer = VwDayTopBarContainer,
+    topBarDivider = VwDayTopBarDivider
 )
 
 val LocalVwColors = staticCompositionLocalOf { VwDarkExtendedColors }
@@ -156,6 +162,7 @@ val VwDarkColorScheme = darkColorScheme(
     onSurface = VwNightOnBackground,
     surfaceVariant = VwNightSurfaceVariant,
     onSurfaceVariant = VwNightOnSurfaceVariant,
+    surfaceContainer = VwNightTopBarContainer,
     outline = VwNightOutline,
     outlineVariant = VwNightOutline,
     error = VwNightError,
@@ -181,6 +188,7 @@ val VwLightColorScheme = lightColorScheme(
     onSurface = VwDayOnBackground,
     surfaceVariant = VwDaySurfaceVariant,
     onSurfaceVariant = VwDayOnSurfaceVariant,
+    surfaceContainer = VwDayTopBarContainer,
     outline = VwDayOutline,
     outlineVariant = VwDayOutline,
     error = VwDayError,
