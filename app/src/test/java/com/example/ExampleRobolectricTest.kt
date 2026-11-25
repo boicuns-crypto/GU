@@ -20,6 +20,9 @@ import com.example.core.audio.CarLifeAudioCaptureManager
 import com.example.core.carlife.CarLifeHardKeyPacket
 import com.example.core.carlife.CarLifeTouchPacket
 import com.example.core.config.AppEditionConfig
+import com.example.core.config.AppPermissionKey
+import com.example.core.config.ConnectionModeRequirements
+import com.example.core.config.RequirementRelevance
 import com.example.core.input.CarLifeAccessibilityService
 import com.example.core.input.TouchSensitivityConfig
 import com.example.core.input.TouchSensitivityPreset
@@ -1799,6 +1802,108 @@ class ExampleRobolectricTest {
     assertEquals(0, SetupGuideCatalog.resolveOptionalGuideDrawableId(context, 0))
     assertEquals(0, SetupGuideCatalog.resolveOptionalGuideDrawableId(context, 1))
     assertEquals(0, SetupGuideCatalog.resolveOptionalGuideDrawableId(context, 7))
+  }
+
+  @Test
+  fun `ConnectionModeRequirements separates mandatory, optional, and not-needed permissions per AppMode`() {
+    val cockpitSpec = ConnectionModeRequirements.specFor(AppMode.COCKPIT)
+    assertEquals(RequirementRelevance.OPTIONAL_FEATURE, cockpitSpec.mediaProjectionRelevance)
+    assertTrue(cockpitSpec.notNeededPermissions.any { it.key == AppPermissionKey.ACCESSIBILITY })
+    assertTrue(cockpitSpec.notNeededPermissions.any { it.key == AppPermissionKey.SHIZUKU })
+    assertTrue(cockpitSpec.notNeededPermissions.any { it.key == AppPermissionKey.OVERLAY })
+
+    val mirroringSpec = ConnectionModeRequirements.specFor(AppMode.MIRRORING)
+    assertEquals(RequirementRelevance.REQUIRED, mirroringSpec.mediaProjectionRelevance)
+    assertEquals(
+      RequirementRelevance.REQUIRED,
+      mirroringSpec.permissions.first { it.key == AppPermissionKey.ACCESSIBILITY }.relevance
+    )
+    assertTrue(mirroringSpec.notNeededPermissions.any { it.key == AppPermissionKey.FINE_LOCATION })
+
+    val shizukuSpec = ConnectionModeRequirements.specFor(AppMode.SHIZUKU_COCKPIT)
+    assertEquals(RequirementRelevance.OPTIONAL_FEATURE, shizukuSpec.mediaProjectionRelevance)
+    assertEquals(
+      RequirementRelevance.REQUIRED,
+      shizukuSpec.permissions.first { it.key == AppPermissionKey.SHIZUKU }.relevance
+    )
+    assertEquals(
+      RequirementRelevance.REQUIRED,
+      shizukuSpec.permissions.first { it.key == AppPermissionKey.OVERLAY }.relevance
+    )
+    assertTrue(shizukuSpec.notNeededPermissions.any { it.key == AppPermissionKey.ACCESSIBILITY })
+
+    // Cockpit readiness succeeds without Accessibility, Shizuku, Overlay, or MediaProjection
+    val cockpitSnapshot = AppPermissionsSnapshot(
+      postNotificationsGranted = true,
+      batteryOptimizationIgnored = true,
+      notificationListenerGranted = true,
+      fineLocationGranted = true
+    )
+    val cockpitReadiness = ConnectionModeRequirements.evaluateReadiness(
+      mode = AppMode.COCKPIT,
+      grantedMap = cockpitSnapshot.toGrantedMap(),
+      hasMediaProjectionToken = false
+    )
+    assertTrue(cockpitReadiness.allMandatoryReady)
+    assertEquals(4, cockpitReadiness.totalRequiredCount)
+    assertEquals(4, cockpitReadiness.grantedRequiredCount)
+    assertEquals(
+      listOf(android.Manifest.permission.RECORD_AUDIO),
+      cockpitSnapshot.missingRuntimePermissionsFor(cockpitSpec, sdkInt = 35)
+    )
+
+    // Mirroring readiness requires BOTH Accessibility and MediaProjection
+    val mirrorSnapshotWithoutMp = AppPermissionsSnapshot(
+      postNotificationsGranted = true,
+      batteryOptimizationIgnored = true,
+      accessibilityEnabled = true
+    )
+    val mirrorMissingMp = ConnectionModeRequirements.evaluateReadiness(
+      mode = AppMode.MIRRORING,
+      grantedMap = mirrorSnapshotWithoutMp.toGrantedMap(),
+      hasMediaProjectionToken = false
+    )
+    assertFalse(mirrorMissingMp.allMandatoryReady)
+    assertEquals(4, mirrorMissingMp.totalRequiredCount)
+    assertEquals(3, mirrorMissingMp.grantedRequiredCount)
+    assertTrue(mirrorMissingMp.missingRequiredLabels.any { it.contains("Весь экран") })
+    // Location is NOT requested in Mirroring runtime batch
+    assertEquals(
+      listOf(android.Manifest.permission.RECORD_AUDIO),
+      mirrorSnapshotWithoutMp.missingRuntimePermissionsFor(mirroringSpec, sdkInt = 35)
+    )
+
+    val mirrorReady = ConnectionModeRequirements.evaluateReadiness(
+      mode = AppMode.MIRRORING,
+      grantedMap = mirrorSnapshotWithoutMp.toGrantedMap(),
+      hasMediaProjectionToken = true
+    )
+    assertTrue(mirrorReady.allMandatoryReady)
+
+    // Shizuku Cockpit readiness requires Shizuku + Overlay + NotificationListener + Battery + Notifications
+    val shizukuMissing = AppPermissionsSnapshot(
+      postNotificationsGranted = true,
+      batteryOptimizationIgnored = true,
+      notificationListenerGranted = true,
+      overlayGranted = true,
+      shizukuBinderAlive = false,
+      shizukuPermissionGranted = false
+    )
+    val shizukuNotReady = ConnectionModeRequirements.evaluateReadiness(
+      mode = AppMode.SHIZUKU_COCKPIT,
+      grantedMap = shizukuMissing.toGrantedMap(),
+      hasMediaProjectionToken = false
+    )
+    assertFalse(shizukuNotReady.allMandatoryReady)
+    assertEquals(5, shizukuNotReady.totalRequiredCount)
+    assertEquals(4, shizukuNotReady.grantedRequiredCount)
+
+    val shizukuReady = ConnectionModeRequirements.evaluateReadiness(
+      mode = AppMode.SHIZUKU_COCKPIT,
+      grantedMap = shizukuMissing.copy(shizukuBinderAlive = true, shizukuPermissionGranted = true).toGrantedMap(),
+      hasMediaProjectionToken = false
+    )
+    assertTrue(shizukuReady.allMandatoryReady)
   }
 }
 
