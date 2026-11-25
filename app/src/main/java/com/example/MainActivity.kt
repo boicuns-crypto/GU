@@ -799,8 +799,7 @@ fun CarLifeBridgeApp(
         topBar = {
             VwPhoneTopBar(
                 isUsbConnected = runtimeState.transportState is UsbTransportState.Connected,
-                isMirrorOnly = isMirrorOnly,
-                onOpenGuide = { showSetupGuide = true }
+                isMirrorOnly = isMirrorOnly
             )
         },
         bottomBar = {
@@ -996,7 +995,8 @@ fun CarLifeBridgeApp(
                         },
                         onRequestMediaProjection = onRequestMediaProjection,
                         onScanAndAttachUsb = onStartOrScanBridge,
-                        onOpenLauncherTab = { selectedTab = 0 }
+                        onOpenLauncherTab = { selectedTab = 0 },
+                        onOpenSetupGuide = { showSetupGuide = true }
                     )
 
                     2 -> UnifiedSettingsAndDiagnosticsScreen(
@@ -1057,23 +1057,15 @@ fun CarLifeBridgeApp(
                             }
                             safeStartService(context, cfgIntent)
                         },
-                        onOpenAccessibilitySettings = {
-                            CarLifeAccessibilityService.openAccessibilitySettings(context)
-                        },
                         onOpenOverlaySettings = {
                             openOverlayPermissionSettings(context)
                         },
-                        onOpenNotificationListenerSettings = {
-                            MediaPlayerController.openNotificationListenerSettings(context)
-                        },
-                        onRequestLocationPermission = onRequestLocationPermission,
                         onStartOrScanBridge = onStartOrScanBridge,
                         onStopBridge = onStopBridge,
                         onStartProjection = onStartProjection,
                         onStopProjection = onStopProjection,
                         onRequestMediaProjection = onRequestMediaProjection,
-                        onRequestRecordAudioPermission = onRequestRecordAudioPermission,
-                        onOpenSetupGuide = { showSetupGuide = true }
+                        onOpenConnectionTab = { selectedTab = 1 }
                     )
                 }
             }
@@ -1200,8 +1192,7 @@ private fun openDeveloperSettings(context: Context) {
 @Composable
 private fun VwPhoneTopBar(
     isUsbConnected: Boolean,
-    isMirrorOnly: Boolean,
-    onOpenGuide: () -> Unit
+    isMirrorOnly: Boolean
 ) {
     val colorScheme = MaterialTheme.colorScheme
     val vw = MaterialTheme.vwColors
@@ -1250,35 +1241,6 @@ private fun VwPhoneTopBar(
                             tone = VwBadgeTone.WAITING
                         )
                     }
-                }
-
-                Spacer(modifier = Modifier.width(8.dp))
-
-                FilledTonalButton(
-                    onClick = onOpenGuide,
-                    modifier = Modifier
-                        .heightIn(min = 48.dp)
-                        .testTag("topbar_guide_btn"),
-                    shape = RoundedCornerShape(10.dp),
-                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
-                    colors = ButtonDefaults.filledTonalButtonColors(
-                        containerColor = colorScheme.primaryContainer,
-                        contentColor = colorScheme.onPrimaryContainer
-                    )
-                ) {
-                    Icon(
-                        imageVector = CockpitIcons.HelpOutline,
-                        contentDescription = "Открыть инструкцию",
-                        modifier = Modifier.size(18.dp)
-                    )
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text(
-                        text = "Инструкция",
-                        style = MaterialTheme.typography.labelLarge.copy(
-                            fontWeight = FontWeight.SemiBold
-                        ),
-                        maxLines = 1
-                    )
                 }
             }
 
@@ -1478,7 +1440,8 @@ private fun OnboardingChecklistScreen(
     onRequestOrOpenShizuku: () -> Unit,
     onRequestMediaProjection: () -> Unit,
     onScanAndAttachUsb: () -> Unit,
-    onOpenLauncherTab: () -> Unit
+    onOpenLauncherTab: () -> Unit,
+    onOpenSetupGuide: () -> Unit = {}
 ) {
     val colorScheme = MaterialTheme.colorScheme
     val vw = MaterialTheme.vwColors
@@ -1560,6 +1523,34 @@ private fun OnboardingChecklistScreen(
                         color = colorScheme.primary,
                         trackColor = colorScheme.surfaceVariant
                     )
+
+                    FilledTonalButton(
+                        onClick = onOpenSetupGuide,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 48.dp)
+                            .testTag("connection_guide_btn"),
+                        shape = RoundedCornerShape(10.dp),
+                        colors = ButtonDefaults.filledTonalButtonColors(
+                            containerColor = colorScheme.primaryContainer,
+                            contentColor = colorScheme.onPrimaryContainer
+                        )
+                    ) {
+                        Icon(
+                            imageVector = CockpitIcons.MenuBook,
+                            contentDescription = "Инструкция по подключению и настройке",
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "Инструкция по подключению и настройке (6 шагов)",
+                            style = MaterialTheme.typography.labelLarge.copy(
+                                fontWeight = FontWeight.SemiBold
+                            ),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
                 }
             }
         }
@@ -2172,15 +2163,14 @@ private fun StatusBadgePill(isCompleted: Boolean) {
 }
 
 /**
- * Tab 3 («Настройки») — очищенный, структурированный экран настроек Jetta VS7:
- * 1. Общие настройки (Оформление Авто/Светлая/Тёмная, Доступ к медиаплееру, GPS для Яндекс Карт).
- * 2. Режим работы (Кокпит | Зеркало | Shizuku + условный блок Shizuku и диагностика Зеркалирования).
+ * Tab 3 («Настройки») — только рабочие настройки при использовании приложения:
+ * 1. Общие настройки (Оформление Авто/Светлая/Тёмная, заполнение выреза камеры по USB).
+ * 2. Режим работы (Кокпит | Зеркало | Shizuku + диагностика трансляции).
  * 3. Чувствительность тача (0x0006).
- * 4. Экран и питание при Зеркалировании (KeepAlive + 1% OLED).
+ * 4. Экран и питание при Зеркалировании (KeepAlive + 1% OLED + 16:9 Shizuku).
  * 5. Звук по USB AOA (0x0003 PCM + приглушение динамика).
  * 6. Параметры видеопотока H.264 (разрешение и битрейт).
- * 7. Служба тача (Спец. возможности).
- * 8. Сворачиваемый раздел «Лог пакетов и диагностика USB AOA» (без тестовых генераторов).
+ * 7. Сворачиваемый раздел «Лог пакетов и диагностика USB AOA» (без тестовых генераторов).
  */
 @Composable
 private fun UnifiedSettingsAndDiagnosticsScreen(
@@ -2192,17 +2182,13 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
     configuredBitrateKbps: Int,
     onSelectResolution: (Int, Int) -> Unit,
     onSelectBitrate: (Int) -> Unit,
-    onOpenAccessibilitySettings: () -> Unit,
     onOpenOverlaySettings: () -> Unit,
-    onOpenNotificationListenerSettings: () -> Unit,
-    onRequestLocationPermission: () -> Unit,
     onStartOrScanBridge: () -> Unit,
     onStopBridge: () -> Unit,
     onStartProjection: (Int, Int, Int) -> Unit,
     onStopProjection: () -> Unit,
     onRequestMediaProjection: () -> Unit = {},
-    onRequestRecordAudioPermission: () -> Unit = {},
-    onOpenSetupGuide: () -> Unit = {}
+    onOpenConnectionTab: () -> Unit = {}
 ) {
     val context = LocalContext.current
     val colorScheme = MaterialTheme.colorScheme
@@ -2215,13 +2201,6 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
     // Tab 0 (default): «Команды 0x0001 & 0x0006 (RX/TX)»
     // Tab 1: «Видеопоток 0x0002»
     var selectedLogTab by rememberSaveable { mutableIntStateOf(0) }
-
-    val hasLocationPermission = remember(checklistStatus) {
-        ContextCompat.checkSelfPermission(
-            context,
-            Manifest.permission.ACCESS_FINE_LOCATION
-        ) == PackageManager.PERMISSION_GRANTED
-    }
 
     LazyColumn(
         modifier = Modifier
@@ -2260,9 +2239,9 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                             )
                             Text(
                                 text = if (isMirrorOnly) {
-                                    "Оформление VW MIB3 • Редакция Mirror Only"
+                                    "Оформление VW MIB3 и область камеры • Mirror Only"
                                 } else {
-                                    "Оформление VW MIB3, медиаплеер и GPS для встроенной карты"
+                                    "Оформление VW MIB3 и отображение области выреза камеры"
                                 },
                                 style = MaterialTheme.typography.labelSmall,
                                 color = colorScheme.onSurfaceVariant
@@ -2272,32 +2251,6 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                         VwStatusBadge(
                             label = activeThemeMode.label,
                             tone = VwBadgeTone.WAITING
-                        )
-                    }
-
-                    // Быстрый переход к встроенной инструкции из раздела «Настройки»
-                    OutlinedButton(
-                        onClick = onOpenSetupGuide,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(min = 48.dp)
-                            .testTag("settings_guide_btn"),
-                        shape = RoundedCornerShape(10.dp),
-                        border = BorderStroke(1.dp, vw.accentBlue.copy(alpha = 0.5f))
-                    ) {
-                        Icon(
-                            imageVector = CockpitIcons.MenuBook,
-                            contentDescription = "Инструкция по подключению и настройке",
-                            tint = vw.accentBlue,
-                            modifier = Modifier.size(18.dp)
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = "Инструкция по подключению и настройке (6 шагов)",
-                            color = colorScheme.primary,
-                            fontWeight = FontWeight.SemiBold,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis
                         )
                     }
 
@@ -2368,133 +2321,6 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                         .clip(RoundedCornerShape(1.dp))
                                         .background(indicatorColor)
                                 )
-                            }
-                        }
-                    }
-
-                    if (!isMirrorOnly) {
-                        // Доступ к медиаплееру (NotificationListenerService / MediaSessionManager)
-                        val mediaAccessOk = checklistStatus.step4NotificationAccessGranted || mediaState.hasNotificationAccess
-                        Surface(
-                            color = colorScheme.background,
-                            shape = RoundedCornerShape(10.dp),
-                            border = BorderStroke(1.dp, colorScheme.outline)
-                        ) {
-                            Column(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(12.dp),
-                                verticalArrangement = Arrangement.spacedBy(8.dp)
-                            ) {
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.SpaceBetween,
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Column(modifier = Modifier.weight(1f)) {
-                                        Text(
-                                            text = "Доступ к медиаплееру (Уведомления)",
-                                            style = MaterialTheme.typography.labelLarge,
-                                            color = colorScheme.onSurface
-                                        )
-                                        val mediaSubtitle = when {
-                                            !mediaAccessOk ->
-                                                "Разрешите доступ к уведомлениям для виджета ⏮ ⏯ ⏭ в левой панели VW"
-                                            mediaState.title.isNotBlank() && mediaState.packageName.isNotBlank() ->
-                                                "${mediaState.playerAppTitle}: ${mediaState.title}" +
-                                                    if (mediaState.artist.isNotBlank()) " — ${mediaState.artist}" else ""
-                                            else ->
-                                                "Подключено • Ожидание активного плеера (Я.Музыка, Spotify, VK, Poweramp)"
-                                        }
-                                        Text(
-                                            text = mediaSubtitle,
-                                            style = MaterialTheme.typography.labelSmall,
-                                            color = if (mediaAccessOk) vw.onSuccessContainer else colorScheme.onSurfaceVariant,
-                                            maxLines = 2,
-                                            overflow = TextOverflow.Ellipsis
-                                        )
-                                    }
-                                    Spacer(modifier = Modifier.width(8.dp))
-                                    VwStatusBadge(
-                                        label = if (mediaAccessOk) "Вкл" else "Настроить",
-                                        tone = if (mediaAccessOk) VwBadgeTone.ACTIVE else VwBadgeTone.WARNING
-                                    )
-                                }
-
-                                FilledTonalButton(
-                                    onClick = onOpenNotificationListenerSettings,
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .heightIn(min = 48.dp)
-                                        .testTag("open_media_notification_access_btn"),
-                                    shape = RoundedCornerShape(10.dp),
-                                    colors = ButtonDefaults.filledTonalButtonColors(
-                                        containerColor = if (mediaAccessOk) colorScheme.surfaceVariant else colorScheme.primaryContainer,
-                                        contentColor = if (mediaAccessOk) colorScheme.onSurface else colorScheme.onPrimaryContainer
-                                    )
-                                ) {
-                                    Icon(
-                                        imageVector = CockpitIcons.MusicNote,
-                                        contentDescription = "Доступ к медиаплееру",
-                                        modifier = Modifier.size(18.dp)
-                                    )
-                                    Spacer(modifier = Modifier.width(8.dp))
-                                    Text(
-                                        text = if (mediaAccessOk) {
-                                            "Доступ к медиаплееру открыт (Настройки)"
-                                        } else {
-                                            "Доступ к медиаплееру (Уведомления)"
-                                        },
-                                        fontWeight = FontWeight.SemiBold
-                                    )
-                                }
-                            }
-                        }
-
-                        // Геолокация (GPS) для встроенных Яндекс Карт в режиме Кокпит
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clip(RoundedCornerShape(10.dp))
-                                .background(colorScheme.background)
-                                .border(1.dp, colorScheme.outline, RoundedCornerShape(10.dp))
-                                .padding(horizontal = 12.dp, vertical = 10.dp),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Column(
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .padding(end = 8.dp),
-                                verticalArrangement = Arrangement.spacedBy(2.dp)
-                            ) {
-                                Text(
-                                    text = "Геолокация (GPS) для Яндекс Карт",
-                                    style = MaterialTheme.typography.labelLarge,
-                                    color = colorScheme.onSurface
-                                )
-                                Text(
-                                    text = if (hasLocationPermission) {
-                                        "Активна — встроенная карта Кокпита определяет текущую позицию"
-                                    } else {
-                                        "Нужна для автоцентрирования встроенных Яндекс Карт в Кокпите"
-                                    },
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = colorScheme.onSurfaceVariant
-                                )
-                            }
-                            if (hasLocationPermission) {
-                                VwStatusBadge(label = "GPS ОК", tone = VwBadgeTone.ACTIVE)
-                            } else {
-                                FilledTonalButton(
-                                    onClick = onRequestLocationPermission,
-                                    modifier = Modifier
-                                        .heightIn(min = 48.dp)
-                                        .testTag("request_location_permission_btn"),
-                                    shape = RoundedCornerShape(10.dp)
-                                ) {
-                                    Text("Разрешить", fontWeight = FontWeight.SemiBold)
-                                }
                             }
                         }
                     }
@@ -2826,7 +2652,11 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                     )
                                     FilledTonalButton(
                                         onClick = {
-                                            CarLifeShizukuManager.requestPermission(context)
+                                            if (shizukuOk) {
+                                                CarLifeShizukuManager.bindUserServiceIfReady(context)
+                                            } else {
+                                                onOpenConnectionTab()
+                                            }
                                         },
                                         modifier = Modifier
                                             .fillMaxWidth()
@@ -2840,12 +2670,12 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                     ) {
                                         Text(
                                             text = when {
-                                                shizukuStatus.isBinderAlive && shizukuStatus.hasPermission && shizukuStatus.isUserServiceBound ->
+                                                shizukuOk && shizukuStatus.isUserServiceBound ->
                                                     "Shizuku подключён (Обновить)"
-                                                shizukuStatus.isBinderAlive && shizukuStatus.hasPermission ->
+                                                shizukuOk ->
                                                     "Подключить Shizuku UserService"
                                                 else ->
-                                                    "Запросить права Shizuku"
+                                                    "Настроить Shizuku во вкладке «Подключение»"
                                             },
                                             fontWeight = FontWeight.SemiBold
                                         )
@@ -3088,15 +2918,16 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                         }
                                     }
 
-                                    if (activeAppMode != AppMode.COCKPIT &&
-                                        (!projStats.usingMediaProjection || !effectiveDiagnosticError.isNullOrBlank())
-                                    ) {
+                                    val needsConnectionSetup =
+                                        (activeAppMode != AppMode.COCKPIT && (!projStats.usingMediaProjection || !effectiveDiagnosticError.isNullOrBlank())) ||
+                                            (activeAppMode == AppMode.MIRRORING && !a11yOk)
+                                    if (needsConnectionSetup) {
                                         FilledTonalButton(
-                                            onClick = onRequestMediaProjection,
+                                            onClick = onOpenConnectionTab,
                                             modifier = Modifier
                                                 .fillMaxWidth()
                                                 .heightIn(min = 48.dp)
-                                                .testTag("request_mediaprojection_diag_btn"),
+                                                .testTag("settings_open_connection_tab_btn"),
                                             shape = RoundedCornerShape(10.dp),
                                             colors = ButtonDefaults.filledTonalButtonColors(
                                                 containerColor = colorScheme.primaryContainer,
@@ -3104,25 +2935,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                             )
                                         ) {
                                             Text(
-                                                text = "Выдать MediaProjection («Весь экран»)",
-                                                fontWeight = FontWeight.SemiBold
-                                            )
-                                        }
-                                    }
-
-                                    if (activeAppMode == AppMode.MIRRORING && !a11yOk) {
-                                        OutlinedButton(
-                                            onClick = onOpenAccessibilitySettings,
-                                            modifier = Modifier
-                                                .fillMaxWidth()
-                                                .heightIn(min = 48.dp)
-                                                .testTag("mirroring_open_a11y_btn"),
-                                            shape = RoundedCornerShape(10.dp),
-                                            border = BorderStroke(1.dp, vw.statusWarningDot.copy(alpha = 0.7f)),
-                                            colors = ButtonDefaults.outlinedButtonColors(contentColor = vw.onWarningContainer)
-                                        ) {
-                                            Text(
-                                                text = "Включить службу тача (Спец. возможности)",
+                                                text = "Настроить доступы во вкладке «Подключение»",
                                                 fontWeight = FontWeight.SemiBold
                                             )
                                         }
@@ -3364,8 +3177,8 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                     Button(
                         onClick = {
                             when {
-                                !hasRecordAudioPerm -> onRequestRecordAudioPermission()
-                                !checklistStatus.step5MediaProjectionGranted -> onRequestMediaProjection()
+                                !hasRecordAudioPerm || !checklistStatus.step5MediaProjectionGranted ->
+                                    onOpenConnectionTab()
                                 audioStats.isCapturing -> {
                                     val stopAudioIntent = Intent(context, BridgeForegroundService::class.java).apply {
                                         action = BridgeForegroundService.ACTION_STOP_AUDIO_CAPTURE
@@ -3392,8 +3205,8 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                     ) {
                         Text(
                             text = when {
-                                !hasRecordAudioPerm -> "Разрешить захват звука (RECORD_AUDIO)"
-                                !checklistStatus.step5MediaProjectionGranted -> "Выдать MediaProjection («Весь экран»)"
+                                !hasRecordAudioPerm || !checklistStatus.step5MediaProjectionGranted ->
+                                    "Настроить доступ во вкладке «Подключение»"
                                 audioStats.isCapturing -> "Остановить звук 0x0003"
                                 else -> "Запустить захват звука 0x0003"
                             },
@@ -3506,81 +3319,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
             }
         }
 
-        // 7. Служба тача (Спец. возможности) — CarLifeAccessibilityService для канала 0x0006
-        item {
-            val isTouchServiceOn = checklistStatus.step3AccessibilityEnabled
-            Card(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .testTag("accessibility_touch_service_card"),
-                shape = RoundedCornerShape(14.dp),
-                colors = CardDefaults.cardColors(containerColor = colorScheme.surface),
-                elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
-                border = BorderStroke(1.dp, colorScheme.outline)
-            ) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = "Служба тача (Спец. возможности)",
-                                style = MaterialTheme.typography.titleMedium,
-                                color = colorScheme.onSurface
-                            )
-                            Spacer(modifier = Modifier.height(2.dp))
-                            Text(
-                                text = "CarLifeAccessibilityService • Тапы и свайпы в режиме Зеркалирования (0x0006)",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = colorScheme.onSurfaceVariant
-                            )
-                        }
-                        Spacer(modifier = Modifier.width(8.dp))
-                        VwStatusBadge(
-                            label = if (isTouchServiceOn) "Вкл" else "Выкл",
-                            tone = if (isTouchServiceOn) VwBadgeTone.ACTIVE else VwBadgeTone.WARNING
-                        )
-                    }
-
-                    Button(
-                        onClick = onOpenAccessibilitySettings,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(min = 48.dp)
-                            .testTag("enable_accessibility_touch_btn"),
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = if (isTouchServiceOn) colorScheme.surfaceVariant else colorScheme.primary,
-                            contentColor = if (isTouchServiceOn) colorScheme.onSurface else colorScheme.onPrimary
-                        ),
-                        shape = RoundedCornerShape(10.dp)
-                    ) {
-                        Icon(
-                            imageVector = CockpitIcons.TouchApp,
-                            contentDescription = "Включить службу тача",
-                            modifier = Modifier.size(18.dp)
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = if (isTouchServiceOn) {
-                                "Служба тача включена (Открыть Спец. возможности)"
-                            } else {
-                                "Включить службу тача (Спец. возможности)"
-                            },
-                            fontWeight = FontWeight.SemiBold
-                        )
-                    }
-                }
-            }
-        }
-
-        // 8. Сворачиваемый раздел «Лог пакетов и диагностика USB AOA» (живой лог без тестовых кнопок)
+        // 7. Сворачиваемый раздел «Лог пакетов и диагностика USB AOA» (живой лог без тестовых кнопок)
         item {
             Card(
                 modifier = Modifier.fillMaxWidth(),
