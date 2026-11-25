@@ -18,34 +18,92 @@ enum class CarLifeTouchEventType(val androidMotionAction: Int, val label: String
 }
 
 /**
+ * High-level steering wheel action resolved from `MSG_TOUCH_CAR_HARD_KEY_CODE (0x00060008)`,
+ * supporting runtime track button inversion (`15`/`7` <-> `16`/`6`).
+ */
+enum class SteeringWheelAction(
+    val actionName: String,
+    val androidKeyCode: Int
+) {
+    PREVIOUS_TRACK("Пред. трек", KeyEvent.KEYCODE_MEDIA_PREVIOUS),
+    NEXT_TRACK("След. трек", KeyEvent.KEYCODE_MEDIA_NEXT),
+    PLAY_PAUSE("Пауза / Воспр.", KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE),
+    BACK("Назад", KeyEvent.KEYCODE_BACK),
+    HOME("Домой", KeyEvent.KEYCODE_HOME),
+    VOICE_ASSISTANT("Голосовой ассистент", KeyEvent.KEYCODE_VOICE_ASSIST),
+    NAVIGATION("Навигация", KeyEvent.KEYCODE_NAVIGATE_IN),
+    UNASSIGNED("Не назначено", KeyEvent.KEYCODE_UNKNOWN)
+}
+
+/**
  * Steering wheel & MIB rotary knob hardkeys sent by Jetta VS7 (MQB) over
  * `MSG_TOUCH_CAR_HARD_KEY_CODE (0x00060008 / 0x00068008)`.
+ *
+ * Code mapping table:
+ * - Previous track (`previous()`): `15` (`0x0F`, `KEYCODE_SEEK_SUB`), `7` (`0x07`, `KEYCODE_SELECTOR_PREVIOUS`)
+ * - Next track (`next()`): `16` (`0x10`, `KEYCODE_SEEK_ADD`), `6` (`0x06`, `KEYCODE_SELECTOR_NEXT`)
+ * - Play / Pause (`playPause()`): `20` (`0x14`, `KEYCODE_OK`), `31` (`0x1F`, `KEYCODE_MEDIA_START`),
+ *   `32` (`0x20`, `KEYCODE_MEDIA_STOP`), `19` (`0x13`, `KEYCODE_MUTE`), `22` (`0x16`), `23` (`0x17`), `24` (`0x18`)
+ * - Back: `14` (`0x0E`, `KEYCODE_BACK`)
+ * - Home: `1` (`0x01`, `KEYCODE_HOME`)
+ * - Voice Assistant: `33` (`0x21`, `KEYCODE_VR_START`)
  */
 enum class CarLifeHardKey(
     val carLifeCode: Int,
     val androidKeyCode: Int,
     val label: String
 ) {
-    HOME(0x00000001, KeyEvent.KEYCODE_HOME, "HOME"),
-    PHONE_CALL(0x00000002, KeyEvent.KEYCODE_CALL, "PHONE_CALL"),
-    PHONE_END(0x00000003, KeyEvent.KEYCODE_ENDCALL, "PHONE_END"),
-    VR_STOP(0x0000000A, KeyEvent.KEYCODE_ESCAPE, "VR_STOP"),
-    SELECTOR_NEXT(0x0000000B, KeyEvent.KEYCODE_DPAD_RIGHT, "ROTARY_NEXT (CW)"),
-    SELECTOR_PREVIOUS(0x0000000C, KeyEvent.KEYCODE_DPAD_LEFT, "ROTARY_PREV (CCW)"),
-    NAVI(0x0000000D, KeyEvent.KEYCODE_NAVIGATE_IN, "NAVI (13)"),
-    BACK(0x0000000E, KeyEvent.KEYCODE_BACK, "BACK (14)"),
-    SEEK_SUB(0x00000010, KeyEvent.KEYCODE_MEDIA_PREVIOUS, "SEEK_SUB (16)"),
-    SEEK_ADD(0x00000011, KeyEvent.KEYCODE_MEDIA_NEXT, "SEEK_ADD (17)"),
-    VR_START(0x00000013, KeyEvent.KEYCODE_VOICE_ASSIST, "VR_START (19)"),
+    HOME(0x00000001, KeyEvent.KEYCODE_HOME, "HOME (1)"),
+    PHONE_CALL(0x00000002, KeyEvent.KEYCODE_CALL, "PHONE_CALL (2)"),
+    PHONE_END(0x00000003, KeyEvent.KEYCODE_ENDCALL, "PHONE_END (3)"),
+    SELECTOR_NEXT(0x00000006, KeyEvent.KEYCODE_MEDIA_NEXT, "KEYCODE_SELECTOR_NEXT (6)"),
+    SELECTOR_PREVIOUS(0x00000007, KeyEvent.KEYCODE_MEDIA_PREVIOUS, "KEYCODE_SELECTOR_PREVIOUS (7)"),
+    VR_STOP(0x0000000A, KeyEvent.KEYCODE_ESCAPE, "VR_STOP (10)"),
+    NAVI(0x0000000D, KeyEvent.KEYCODE_NAVIGATE_IN, "KEYCODE_NAVI (13)"),
+    BACK(0x0000000E, KeyEvent.KEYCODE_BACK, "KEYCODE_BACK (14)"),
+    SEEK_SUB(0x0000000F, KeyEvent.KEYCODE_MEDIA_PREVIOUS, "KEYCODE_SEEK_SUB (15)"),
+    SEEK_ADD(0x00000010, KeyEvent.KEYCODE_MEDIA_NEXT, "KEYCODE_SEEK_ADD (16)"),
+    MUTE(0x00000013, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, "KEYCODE_MUTE (19)"),
+    OK(0x00000014, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, "KEYCODE_OK (20)"),
+    PLAY_PAUSE_22(0x00000016, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, "PLAY_PAUSE (22)"),
     PLAY_PAUSE_ALT(0x00000017, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, "PLAY_PAUSE (23)"),
-    PLAY_PAUSE(0x00000018, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, "PLAY_PAUSE (24)");
+    PLAY_PAUSE(0x00000018, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, "PLAY_PAUSE (24)"),
+    MEDIA_START(0x0000001F, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, "KEYCODE_MEDIA_START (31)"),
+    MEDIA_STOP(0x00000020, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, "KEYCODE_MEDIA_STOP (32)"),
+    VR_START(0x00000021, KeyEvent.KEYCODE_VOICE_ASSIST, "KEYCODE_VR_START (33)");
 
     companion object {
-        fun fromCode(code: Int): CarLifeHardKey? = when (code) {
-            0x00000009 -> VR_START
-            0x00000015 -> SEEK_SUB
-            0x00000016 -> SEEK_ADD
-            else -> entries.firstOrNull { it.carLifeCode == code }
+        fun fromCode(code: Int): CarLifeHardKey? =
+            entries.firstOrNull { it.carLifeCode == code }
+
+        fun resolveAction(
+            code: Int,
+            swapTrackButtons: Boolean = false
+        ): SteeringWheelAction = when (code) {
+            15, 7 -> if (swapTrackButtons) {
+                SteeringWheelAction.NEXT_TRACK
+            } else {
+                SteeringWheelAction.PREVIOUS_TRACK
+            }
+            16, 6 -> if (swapTrackButtons) {
+                SteeringWheelAction.PREVIOUS_TRACK
+            } else {
+                SteeringWheelAction.NEXT_TRACK
+            }
+            20, 31, 32, 19, 22, 23, 24 -> SteeringWheelAction.PLAY_PAUSE
+            14 -> SteeringWheelAction.BACK
+            1 -> SteeringWheelAction.HOME
+            33 -> SteeringWheelAction.VOICE_ASSISTANT
+            13 -> SteeringWheelAction.NAVIGATION
+            else -> SteeringWheelAction.UNASSIGNED
+        }
+
+        fun formatDiagnosticToast(
+            keycode: Int,
+            swapTrackButtons: Boolean = false
+        ): String {
+            val actionName = resolveAction(keycode, swapTrackButtons).actionName
+            return "Руль: code=$keycode (0x${keycode.toString(16)}) → $actionName"
         }
     }
 }

@@ -161,14 +161,60 @@ object TouchSettingsPreferences {
     private const val KEY_MOVE_DEADZONE_PX = "touch_move_deadzone_px"
     private const val KEY_LONG_PRESS_MS = "touch_long_press_ms"
     private const val KEY_EDGE_GUARD = "touch_edge_back_guard"
+    private const val KEY_SWAP_STEERING_WHEEL_TRACKS = "steering_wheel_swap_track_buttons"
+    private const val KEY_SHOW_STEERING_WHEEL_TOAST = "steering_wheel_show_key_codes_toast"
 
     private val _config = MutableStateFlow(TouchSensitivityConfig())
     val config: StateFlow<TouchSensitivityConfig> = _config.asStateFlow()
 
+    private val _steeringWheelConfig = MutableStateFlow(SteeringWheelConfig())
+    val steeringWheelConfig: StateFlow<SteeringWheelConfig> = _steeringWheelConfig.asStateFlow()
+
     fun init(context: Context): TouchSensitivityConfig {
         val loaded = load(context)
         _config.value = loaded
+        _steeringWheelConfig.value = loadSteeringWheelConfig(context)
         return loaded
+    }
+
+    fun loadSteeringWheelConfig(context: Context): SteeringWheelConfig {
+        val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        return SteeringWheelConfig(
+            swapTrackButtons = prefs.getBoolean(KEY_SWAP_STEERING_WHEEL_TRACKS, false),
+            showKeyCodesToast = prefs.getBoolean(KEY_SHOW_STEERING_WHEEL_TOAST, true)
+        )
+    }
+
+    fun setSwapSteeringWheelTrackButtons(
+        swap: Boolean,
+        context: Context? = null
+    ): SteeringWheelConfig {
+        val next = _steeringWheelConfig.value.copy(swapTrackButtons = swap)
+        _steeringWheelConfig.value = next
+        if (context != null) {
+            context.applicationContext
+                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putBoolean(KEY_SWAP_STEERING_WHEEL_TRACKS, swap)
+                .apply()
+        }
+        return next
+    }
+
+    fun setShowSteeringWheelKeyCodesToast(
+        showToast: Boolean,
+        context: Context? = null
+    ): SteeringWheelConfig {
+        val next = _steeringWheelConfig.value.copy(showKeyCodesToast = showToast)
+        _steeringWheelConfig.value = next
+        if (context != null) {
+            context.applicationContext
+                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putBoolean(KEY_SHOW_STEERING_WHEEL_TOAST, showToast)
+                .apply()
+        }
+        return next
     }
 
     fun load(context: Context): TouchSensitivityConfig {
@@ -249,8 +295,11 @@ object TouchSettingsPreferences {
             .remove(KEY_MOVE_DEADZONE_PX)
             .remove(KEY_LONG_PRESS_MS)
             .remove(KEY_EDGE_GUARD)
+            .remove(KEY_SWAP_STEERING_WHEEL_TRACKS)
+            .remove(KEY_SHOW_STEERING_WHEEL_TOAST)
             .apply()
         _config.value = TouchSensitivityConfig()
+        _steeringWheelConfig.value = SteeringWheelConfig()
     }
 
     private fun save(context: Context, cfg: TouchSensitivityConfig) {
@@ -267,3 +316,13 @@ object TouchSettingsPreferences {
             .apply()
     }
 }
+
+/**
+ * Steering wheel (`0x00060008`) runtime configuration:
+ * - [swapTrackButtons]: swaps `15`/`7` (`previous()`) and `16`/`6` (`next()`) without rebuilding (default `false`).
+ * - [showKeyCodesToast]: displays a short diagnostic `Toast` upon receiving any `0x00060008` packet (default `true`).
+ */
+data class SteeringWheelConfig(
+    val swapTrackButtons: Boolean = false,
+    val showKeyCodesToast: Boolean = true
+)

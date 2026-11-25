@@ -78,7 +78,9 @@ import com.example.feature.cockpit.MediaControllerRepository
 import com.example.feature.cockpit.MediaPlayerController
 import com.example.feature.cockpit.VW_LEFT_PANEL_WIDTH_PX
 import com.example.protocol.carlife.CarLifeFrameCodec
+import com.example.protocol.carlife.CarLifeHardKey
 import com.example.protocol.carlife.CarLifeTouchDecoder
+import com.example.protocol.carlife.SteeringWheelAction
 import com.example.ui.theme.MyApplicationTheme
 import com.example.ui.theme.ThemePreferences
 import java.io.ByteArrayOutputStream
@@ -2438,27 +2440,46 @@ class CockpitProjectionManager(
     suspend fun injectHardKeyPacket(packet: CarLifeHardKeyPacket): Boolean {
         val code = packet.carLifeKeyCode
         val androidKey = packet.androidKeyCode
+        val swapTracks = TouchSettingsPreferences.steeringWheelConfig.value.swapTrackButtons
+        val resolvedAction = CarLifeHardKey.resolveAction(code, swapTrackButtons = swapTracks).let { action ->
+            if (action != SteeringWheelAction.UNASSIGNED) {
+                action
+            } else {
+                when (androidKey) {
+                    KeyEvent.KEYCODE_MEDIA_PREVIOUS ->
+                        if (swapTracks) SteeringWheelAction.NEXT_TRACK else SteeringWheelAction.PREVIOUS_TRACK
+                    KeyEvent.KEYCODE_MEDIA_NEXT ->
+                        if (swapTracks) SteeringWheelAction.PREVIOUS_TRACK else SteeringWheelAction.NEXT_TRACK
+                    KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> SteeringWheelAction.PLAY_PAUSE
+                    KeyEvent.KEYCODE_VOICE_ASSIST -> SteeringWheelAction.VOICE_ASSISTANT
+                    KeyEvent.KEYCODE_NAVIGATE_IN -> SteeringWheelAction.NAVIGATION
+                    KeyEvent.KEYCODE_HOME -> SteeringWheelAction.HOME
+                    KeyEvent.KEYCODE_BACK -> SteeringWheelAction.BACK
+                    else -> SteeringWheelAction.UNASSIGNED
+                }
+            }
+        }
 
         return withContext(Dispatchers.Main.immediate) {
             // 1. Media & Tracks (works across ALL 3 modes via MediaPlayerController + AudioManager fallback)
-            when {
-                code == 16 || code == 0x15 || androidKey == KeyEvent.KEYCODE_MEDIA_PREVIOUS -> {
+            when (resolvedAction) {
+                SteeringWheelAction.PREVIOUS_TRACK -> {
                     MediaPlayerController.previous()
                     _stats.update {
-                        it.copy(statusMessage = "HardKey PREV (code=$code) -> MediaPlayerController.previous()")
+                        it.copy(statusMessage = "HardKey PREV (code=$code, swap=$swapTracks) -> MediaPlayerController.previous()")
                     }
                     return@withContext true
                 }
 
-                code == 17 || code == 0x16 || androidKey == KeyEvent.KEYCODE_MEDIA_NEXT -> {
+                SteeringWheelAction.NEXT_TRACK -> {
                     MediaPlayerController.next()
                     _stats.update {
-                        it.copy(statusMessage = "HardKey NEXT (code=$code) -> MediaPlayerController.next()")
+                        it.copy(statusMessage = "HardKey NEXT (code=$code, swap=$swapTracks) -> MediaPlayerController.next()")
                     }
                     return@withContext true
                 }
 
-                code == 23 || code == 24 || androidKey == KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> {
+                SteeringWheelAction.PLAY_PAUSE -> {
                     MediaPlayerController.playPause()
                     _stats.update {
                         it.copy(statusMessage = "HardKey PLAY_PAUSE (code=$code) -> MediaPlayerController.playPause()")
@@ -2466,8 +2487,8 @@ class CockpitProjectionManager(
                     return@withContext true
                 }
 
-                // 2. Voice Assistant (19 / 0x13 / legacy 0x09)
-                code == 19 || code == 0x09 || androidKey == KeyEvent.KEYCODE_VOICE_ASSIST -> {
+                // 2. Voice Assistant (33 / 0x21 KEYCODE_VR_START)
+                SteeringWheelAction.VOICE_ASSISTANT -> {
                     val launched = runCatching {
                         val voiceIntent = Intent(Intent.ACTION_VOICE_COMMAND).apply {
                             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -2488,7 +2509,7 @@ class CockpitProjectionManager(
                 }
 
                 // 3. NAVI (13 / 0x0D)
-                code == 13 || androidKey == KeyEvent.KEYCODE_NAVIGATE_IN -> {
+                SteeringWheelAction.NAVIGATION -> {
                     val handled = when (appMode) {
                         AppMode.COCKPIT -> {
                             CockpitUiStateController.showMap()
@@ -2512,7 +2533,7 @@ class CockpitProjectionManager(
                 }
 
                 // 4. HOME (1 / 0x01)
-                code == 1 || androidKey == KeyEvent.KEYCODE_HOME -> {
+                SteeringWheelAction.HOME -> {
                     return@withContext when (appMode) {
                         AppMode.MIRRORING -> {
                             val ok = CarLifeAccessibilityService.instance?.performHomeAction() == true
@@ -2543,7 +2564,7 @@ class CockpitProjectionManager(
                 }
 
                 // 5. BACK (14 / 0x0E)
-                code == 14 || androidKey == KeyEvent.KEYCODE_BACK -> {
+                SteeringWheelAction.BACK -> {
                     return@withContext when (appMode) {
                         AppMode.MIRRORING -> {
                             val ok = CarLifeAccessibilityService.instance?.performBackAction() == true
@@ -2582,6 +2603,8 @@ class CockpitProjectionManager(
                         }
                     }
                 }
+
+                SteeringWheelAction.UNASSIGNED -> Unit
             }
 
             if (androidKey == KeyEvent.KEYCODE_UNKNOWN) {

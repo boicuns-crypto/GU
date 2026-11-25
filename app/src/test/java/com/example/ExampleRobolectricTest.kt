@@ -453,10 +453,6 @@ class ExampleRobolectricTest {
 
       override fun setNoCutoutOverlayEnabled(enabled: Boolean): Boolean = true
 
-      override fun setMirroringAspect16by9() = Unit
-
-      override fun resetDisplaySize() = Unit
-
       override fun destroy() = Unit
     }
 
@@ -1336,8 +1332,6 @@ class ExampleRobolectricTest {
 
       override fun sendKeyEvent(keyCode: Int, displayId: Int) = Unit
       override fun setNoCutoutOverlayEnabled(enabled: Boolean): Boolean = false
-      override fun setMirroringAspect16by9() = Unit
-      override fun resetDisplaySize() = Unit
       override fun destroy() = Unit
     }
 
@@ -1474,18 +1468,26 @@ class ExampleRobolectricTest {
   }
 
   @Test
-  fun `steering wheel 0x00060008 hardkeys decode protobuf tag 0x08 and route across modes`() {
+  fun `steering wheel 0x00060008 hardkeys decode protobuf tag 0x08, support OK 20, track inversion, AudioManager fallback, and Toast diagnostics`() {
     val context = ApplicationProvider.getApplicationContext<Context>()
+    TouchSettingsPreferences.clear(context)
 
     val expectedCodes = listOf(
       1 to CarLifeHardKey.HOME,
       13 to CarLifeHardKey.NAVI,
       14 to CarLifeHardKey.BACK,
-      16 to CarLifeHardKey.SEEK_SUB,
-      17 to CarLifeHardKey.SEEK_ADD,
-      19 to CarLifeHardKey.VR_START,
+      15 to CarLifeHardKey.SEEK_SUB,
+      7 to CarLifeHardKey.SELECTOR_PREVIOUS,
+      16 to CarLifeHardKey.SEEK_ADD,
+      6 to CarLifeHardKey.SELECTOR_NEXT,
+      20 to CarLifeHardKey.OK,
+      31 to CarLifeHardKey.MEDIA_START,
+      32 to CarLifeHardKey.MEDIA_STOP,
+      19 to CarLifeHardKey.MUTE,
+      22 to CarLifeHardKey.PLAY_PAUSE_22,
       23 to CarLifeHardKey.PLAY_PAUSE_ALT,
-      24 to CarLifeHardKey.PLAY_PAUSE
+      24 to CarLifeHardKey.PLAY_PAUSE,
+      33 to CarLifeHardKey.VR_START
     )
 
     for ((code, expectedKey) in expectedCodes) {
@@ -1500,7 +1502,7 @@ class ExampleRobolectricTest {
       assertEquals(expectedKey, hardKey.mappedKey)
     }
 
-    // Custom non-standard wheel code should still extract keycode cleanly for HARD_KEY logging
+    // Custom non-standard wheel code should still extract keycode cleanly and format as "Не назначено"
     val customFrame = CarLifeTouchDecoder.createRawHardKeyFrame(
       rawCode = 42,
       serviceType = CarLifeMsgType.MSG_TOUCH_CAR_HARD_KEY_CODE_ALT
@@ -1508,8 +1510,35 @@ class ExampleRobolectricTest {
     val customDecoded = CarLifeTouchDecoder.decodeTouchChannelFrame(customFrame) as CarLifeInputEvent.HardKey
     assertEquals(42, customDecoded.rawKeyCode)
     assertEquals(null, customDecoded.mappedKey)
+    assertEquals(
+      "Руль: code=42 (0x2a) → Не назначено",
+      CarLifeHardKey.formatDiagnosticToast(42, swapTrackButtons = false)
+    )
+    assertEquals(
+      "Руль: code=16 (0x10) → След. трек",
+      CarLifeHardKey.formatDiagnosticToast(16, swapTrackButtons = false)
+    )
+    assertEquals(
+      "Руль: code=20 (0x14) → Пауза / Воспр.",
+      CarLifeHardKey.formatDiagnosticToast(20, swapTrackButtons = false)
+    )
+    assertEquals(
+      "Руль: code=33 (0x21) → Голосовой ассистент",
+      CarLifeHardKey.formatDiagnosticToast(33, swapTrackButtons = false)
+    )
 
-    // Cockpit routing: 13 -> EMBEDDED_MAP, 14 -> APP_GRID, 1 -> APP_GRID, 16/17/23/24 -> MediaPlayerController
+    // Verify SteeringWheelConfig persistence (swapTrackButtons default false, showKeyCodesToast default true)
+    assertFalse(TouchSettingsPreferences.steeringWheelConfig.value.swapTrackButtons)
+    assertTrue(TouchSettingsPreferences.steeringWheelConfig.value.showKeyCodesToast)
+    TouchSettingsPreferences.setSwapSteeringWheelTrackButtons(true, context)
+    TouchSettingsPreferences.setShowSteeringWheelKeyCodesToast(false, context)
+    assertTrue(TouchSettingsPreferences.loadSteeringWheelConfig(context).swapTrackButtons)
+    assertFalse(TouchSettingsPreferences.loadSteeringWheelConfig(context).showKeyCodesToast)
+    TouchSettingsPreferences.setSwapSteeringWheelTrackButtons(false, context)
+    TouchSettingsPreferences.setShowSteeringWheelKeyCodesToast(true, context)
+
+    // Verify Cockpit routing + track button swap + AudioManager fallback when no MediaSession is active
+    MediaPlayerController.resetForTesting()
     MediaPlayerController.initialize(context)
     val manager = CockpitProjectionManager(
       context = context,
@@ -1529,13 +1558,48 @@ class ExampleRobolectricTest {
         assertTrue(manager.injectHardKeyPacket(CarLifeHardKeyPacket(1, KeyEvent.KEYCODE_HOME)))
         assertEquals(CockpitRightPane.APP_GRID, CockpitUiStateController.activeRightPane.value)
 
-        assertTrue(manager.injectHardKeyPacket(CarLifeHardKeyPacket(16, KeyEvent.KEYCODE_MEDIA_PREVIOUS)))
-        assertTrue(manager.injectHardKeyPacket(CarLifeHardKeyPacket(17, KeyEvent.KEYCODE_MEDIA_NEXT)))
-        assertTrue(manager.injectHardKeyPacket(CarLifeHardKeyPacket(23, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE)))
-        assertTrue(manager.injectHardKeyPacket(CarLifeHardKeyPacket(24, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE)))
+        // Default track direction (swap = false): 15/7 -> previous(), 16/6 -> next()
+        assertTrue(manager.injectHardKeyPacket(CarLifeHardKeyPacket(15, KeyEvent.KEYCODE_MEDIA_PREVIOUS)))
+        assertEquals("AUDIO_MANAGER_PREVIOUS", MediaPlayerController.lastTransportAction)
+        assertEquals(KeyEvent.KEYCODE_MEDIA_PREVIOUS, MediaPlayerController.lastDispatchedSystemKeyCode)
+
+        assertTrue(manager.injectHardKeyPacket(CarLifeHardKeyPacket(7, KeyEvent.KEYCODE_MEDIA_PREVIOUS)))
+        assertEquals(KeyEvent.KEYCODE_MEDIA_PREVIOUS, MediaPlayerController.lastDispatchedSystemKeyCode)
+
+        assertTrue(manager.injectHardKeyPacket(CarLifeHardKeyPacket(16, KeyEvent.KEYCODE_MEDIA_NEXT)))
+        assertEquals("AUDIO_MANAGER_NEXT", MediaPlayerController.lastTransportAction)
+        assertEquals(KeyEvent.KEYCODE_MEDIA_NEXT, MediaPlayerController.lastDispatchedSystemKeyCode)
+
+        assertTrue(manager.injectHardKeyPacket(CarLifeHardKeyPacket(6, KeyEvent.KEYCODE_MEDIA_NEXT)))
+        assertEquals(KeyEvent.KEYCODE_MEDIA_NEXT, MediaPlayerController.lastDispatchedSystemKeyCode)
+
+        // Inverted track direction (swap = true): 15/7 -> next(), 16/6 -> previous()
+        TouchSettingsPreferences.setSwapSteeringWheelTrackButtons(true, context)
+        assertTrue(manager.injectHardKeyPacket(CarLifeHardKeyPacket(15, KeyEvent.KEYCODE_MEDIA_PREVIOUS)))
+        assertEquals("AUDIO_MANAGER_NEXT", MediaPlayerController.lastTransportAction)
+        assertEquals(KeyEvent.KEYCODE_MEDIA_NEXT, MediaPlayerController.lastDispatchedSystemKeyCode)
+
+        assertTrue(manager.injectHardKeyPacket(CarLifeHardKeyPacket(16, KeyEvent.KEYCODE_MEDIA_NEXT)))
+        assertEquals("AUDIO_MANAGER_PREVIOUS", MediaPlayerController.lastTransportAction)
+        assertEquals(KeyEvent.KEYCODE_MEDIA_PREVIOUS, MediaPlayerController.lastDispatchedSystemKeyCode)
+
+        // All Play/Pause codes (20 OK, 31 MEDIA_START, 32 MEDIA_STOP, 19 MUTE, 22, 23, 24)
+        for (playPauseCode in listOf(20, 31, 32, 19, 22, 23, 24)) {
+          val pairsBefore = MediaPlayerController.dispatchedSystemKeyPairCount
+          assertTrue(manager.injectHardKeyPacket(CarLifeHardKeyPacket(playPauseCode, KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE)))
+          assertEquals("AUDIO_MANAGER_PLAY_PAUSE", MediaPlayerController.lastTransportAction)
+          assertEquals(KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE, MediaPlayerController.lastDispatchedSystemKeyCode)
+          assertEquals(pairsBefore + 1, MediaPlayerController.dispatchedSystemKeyPairCount)
+        }
+
+        // Voice assistant code 33 (0x21)
+        assertTrue(manager.injectHardKeyPacket(CarLifeHardKeyPacket(33, KeyEvent.KEYCODE_VOICE_ASSIST)))
+
         manager.stopProjection()
       }
     } finally {
+      TouchSettingsPreferences.clear(context)
+      MediaPlayerController.resetForTesting()
       CockpitUiStateController.registerMapBackHandler(null)
       CockpitUiStateController.showGrid()
     }
@@ -1618,96 +1682,20 @@ class ExampleRobolectricTest {
   }
 
   @Test
-  fun `shizuku 16by9 mirroring commands, preference defaults, manager lifecycle, and bounds refresh behave cleanly`() {
+  fun `mirroring mode uses native phone screen resolution bounds and never invokes wm size commands`() {
     val context = ApplicationProvider.getApplicationContext<Context>()
-    var set16by9Calls = 0
-    var resetDisplayCalls = 0
-    var onAppliedInvoked = 0
-    var onResetInvoked = 0
-
-    val fakeStub = object : ICarLifeShizukuService.Stub() {
-      override fun launchAppOnDisplay(packageName: String?, activityName: String?, displayId: Int) = Unit
-      override fun injectTouch(action: Int, x: Float, y: Float, downTime: Long, eventTime: Long, displayId: Int) = Unit
-      override fun sendKeyEvent(keyCode: Int, displayId: Int) = Unit
-      override fun setNoCutoutOverlayEnabled(enabled: Boolean): Boolean = true
-      override fun setMirroringAspect16by9() {
-        set16by9Calls++
-      }
-      override fun resetDisplaySize() {
-        resetDisplayCalls++
-      }
-      override fun destroy() = Unit
-    }
-
     try {
       ScreenKeepAlivePreferences.clear(context)
-      assertFalse(ScreenKeepAlivePreferences.init(context).mirroringAspect16by9Shizuku)
+      val cfg = ScreenKeepAlivePreferences.init(context)
+      assertTrue(cfg.keepAliveOnScreenOff)
+      assertTrue(cfg.fillCameraCutoutOnUsb)
 
-      ScreenKeepAlivePreferences.updateConfig(context) { it.copy(mirroringAspect16by9Shizuku = true) }
-      assertTrue(ScreenKeepAlivePreferences.init(context).mirroringAspect16by9Shizuku)
+      // Ensure ICarLifeShizukuService has no setMirroringAspect16by9 or resetDisplaySize methods
+      val aidlMethodNames = ICarLifeShizukuService::class.java.declaredMethods.map { it.name }
+      assertFalse(aidlMethodNames.contains("setMirroringAspect16by9"))
+      assertFalse(aidlMethodNames.contains("resetDisplaySize"))
 
-      assertEquals(listOf("wm", "size", "1080x1920"), CarLifeShizukuService.buildWmSize16by9Command().toList())
-      assertEquals(listOf("wm", "size", "reset"), CarLifeShizukuService.buildWmSizeResetCommand().toList())
-      assertEquals(listOf("wm", "density", "reset"), CarLifeShizukuService.buildWmDensityResetCommand().toList())
-
-      assertTrue(
-        ScreenKeepAliveManager.shouldApplyShizukuMirroring16by9(
-          mirroringAspect16by9Shizuku = true,
-          isUsbConnected = true,
-          isStreamingOrProjecting = true,
-          isMirroringMode = true,
-          isShizukuReady = true
-        )
-      )
-      assertFalse(
-        ScreenKeepAliveManager.shouldApplyShizukuMirroring16by9(
-          mirroringAspect16by9Shizuku = true,
-          isUsbConnected = true,
-          isStreamingOrProjecting = true,
-          isMirroringMode = false,
-          isShizukuReady = true
-        )
-      )
-      assertFalse(
-        ScreenKeepAliveManager.shouldApplyShizukuMirroring16by9(
-          mirroringAspect16by9Shizuku = true,
-          isUsbConnected = true,
-          isStreamingOrProjecting = true,
-          isMirroringMode = true,
-          isShizukuReady = false
-        )
-      )
-
-      CarLifeShizukuManager.setServiceForTesting(fakeStub)
-      assertFalse(CarLifeShizukuManager.mirroringAspect16by9ModifiedByBridge)
-
-      // Reset when not modified and force=false should be a no-op
-      assertTrue(CarLifeShizukuManager.resetDisplaySize(force = false))
-      assertEquals(0, resetDisplayCalls)
-
-      // Apply 16:9 via Shizuku stub
-      assertTrue(CarLifeShizukuManager.setMirroringAspect16by9 { onAppliedInvoked++ })
-      assertEquals(1, set16by9Calls)
-      assertEquals(1, onAppliedInvoked)
-      assertTrue(CarLifeShizukuManager.mirroringAspect16by9ModifiedByBridge)
-
-      // Duplicate call avoids repeating IPC
-      assertTrue(CarLifeShizukuManager.setMirroringAspect16by9 { onAppliedInvoked++ })
-      assertEquals(1, set16by9Calls)
-      assertEquals(2, onAppliedInvoked)
-
-      // Reset now executes AIDL resetDisplaySize() and clears tracking flag
-      assertTrue(CarLifeShizukuManager.resetDisplaySize(force = false) { onResetInvoked++ })
-      assertEquals(1, resetDisplayCalls)
-      assertEquals(1, onResetInvoked)
-      assertFalse(CarLifeShizukuManager.mirroringAspect16by9ModifiedByBridge)
-
-      // Manual force reset runs even when not marked modified
-      assertTrue(CarLifeShizukuManager.resetDisplaySize(force = true) { onResetInvoked++ })
-      assertEquals(2, resetDisplayCalls)
-      assertEquals(2, onResetInvoked)
-
-      // CockpitProjectionManager bounds recalculation populates phoneScreenWidth / Height cleanly
+      // CockpitProjectionManager calculates physical screen bounds strictly from native phone metrics
       val projManager = CockpitProjectionManager(context = context, onEncodedVideoNal = { _, _, _ -> })
       projManager.recalculatePhysicalScreenBounds(requestSyncOnChange = false)
       assertTrue(projManager.stats.value.phoneScreenWidth > 0)

@@ -154,15 +154,33 @@ object MediaPlayerController {
         }
     }
 
+    @Volatile
+    var lastTransportAction: String = "NONE"
+        private set
+
+    @Volatile
+    var lastDispatchedSystemKeyCode: Int = KeyEvent.KEYCODE_UNKNOWN
+        private set
+
+    @Volatile
+    var dispatchedSystemKeyPairCount: Int = 0
+        private set
+
     fun playPause() {
-        val controller = activeController
+        var controller = activeController
+        if (controller == null && hasNotificationListenerAccess()) {
+            refreshSessions()
+            controller = activeController
+        }
         if (controller != null) {
             runCatching {
                 val pbState = controller.playbackState?.state
                 if (pbState == PlaybackState.STATE_PLAYING) {
                     controller.transportControls.pause()
+                    lastTransportAction = "SESSION_PAUSE"
                 } else {
                     controller.transportControls.play()
+                    lastTransportAction = "SESSION_PLAY"
                 }
                 syncFromController(controller)
             }.onFailure {
@@ -175,10 +193,15 @@ object MediaPlayerController {
     }
 
     fun next() {
-        val controller = activeController
+        var controller = activeController
+        if (controller == null && hasNotificationListenerAccess()) {
+            refreshSessions()
+            controller = activeController
+        }
         if (controller != null) {
             runCatching {
                 controller.transportControls.skipToNext()
+                lastTransportAction = "SESSION_NEXT"
                 syncFromController(controller)
             }.onFailure {
                 dispatchSystemMediaKey(KeyEvent.KEYCODE_MEDIA_NEXT)
@@ -190,10 +213,15 @@ object MediaPlayerController {
     }
 
     fun previous() {
-        val controller = activeController
+        var controller = activeController
+        if (controller == null && hasNotificationListenerAccess()) {
+            refreshSessions()
+            controller = activeController
+        }
         if (controller != null) {
             runCatching {
                 controller.transportControls.skipToPrevious()
+                lastTransportAction = "SESSION_PREVIOUS"
                 syncFromController(controller)
             }.onFailure {
                 dispatchSystemMediaKey(KeyEvent.KEYCODE_MEDIA_PREVIOUS)
@@ -290,11 +318,19 @@ object MediaPlayerController {
     }
 
     private fun dispatchSystemMediaKey(keyCode: Int) {
+        lastDispatchedSystemKeyCode = keyCode
+        lastTransportAction = when (keyCode) {
+            KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> "AUDIO_MANAGER_PLAY_PAUSE"
+            KeyEvent.KEYCODE_MEDIA_NEXT -> "AUDIO_MANAGER_NEXT"
+            KeyEvent.KEYCODE_MEDIA_PREVIOUS -> "AUDIO_MANAGER_PREVIOUS"
+            else -> "AUDIO_MANAGER_$keyCode"
+        }
         val ctx = appContext ?: return
         val audioManager = ctx.getSystemService(Context.AUDIO_SERVICE) as? AudioManager ?: return
         runCatching {
             audioManager.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, keyCode))
             audioManager.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, keyCode))
+            dispatchedSystemKeyPairCount++
         }
     }
 
@@ -307,6 +343,9 @@ object MediaPlayerController {
     internal fun resetForTesting() {
         isListenerConnected = false
         activeController = null
+        lastTransportAction = "NONE"
+        lastDispatchedSystemKeyCode = KeyEvent.KEYCODE_UNKNOWN
+        dispatchedSystemKeyPairCount = 0
         _mediaState.value = MediaState()
     }
 }

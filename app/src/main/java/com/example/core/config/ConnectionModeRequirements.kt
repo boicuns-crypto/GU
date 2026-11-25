@@ -131,7 +131,7 @@ object ConnectionModeRequirements {
                 PermissionRequirementSpec(
                     key = AppPermissionKey.SHIZUKU,
                     title = "Доступ Shizuku",
-                    reason = "Нужен только для «Кокпит + Shizuku» (второй экран) или 16:9 в «Зеркало».",
+                    reason = "Нужен только для режима «Кокпит + Shizuku» (второй экран).",
                     relevance = RequirementRelevance.NOT_NEEDED,
                     roleBadge = "Не требуется"
                 )
@@ -185,9 +185,9 @@ object ConnectionModeRequirements {
                 PermissionRequirementSpec(
                     key = AppPermissionKey.SHIZUKU,
                     title = "Доступ Shizuku",
-                    reason = "Опция: экран 16:9 без чёрных полос по бокам и скрытие области выреза камеры.",
+                    reason = "Опция: скрытие области выреза камеры при зеркалировании по USB.",
                     relevance = RequirementRelevance.OPTIONAL_FEATURE,
-                    roleBadge = "Опция: 16:9"
+                    roleBadge = "Опция: Вырез"
                 ),
                 PermissionRequirementSpec(
                     key = AppPermissionKey.NOTIFICATION_LISTENER,

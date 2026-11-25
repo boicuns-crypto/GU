@@ -69,13 +69,7 @@ data class ScreenKeepAliveConfig(
      * hides system bars while USB streaming is active (plus optional Shizuku `noCutout` overlay in Mirroring mode),
      * and restores default cutout/system bars cleanly upon USB disconnect or service shutdown.
      */
-    val fillCameraCutoutOnUsb: Boolean = true,
-    /**
-     * Switches phone display resolution via Shizuku (`wm size 1080x1920`) while USB Mirroring is active
-     * so landscape orientation becomes 1920×1080 (16:9) without black bars on 1280×720 Head Units,
-     * automatically resetting via `wm size reset` / `wm density reset` on disconnect or stop.
-     */
-    val mirroringAspect16by9Shizuku: Boolean = false
+    val fillCameraCutoutOnUsb: Boolean = true
 )
 
 /**
@@ -117,7 +111,6 @@ object ScreenKeepAlivePreferences {
     private const val KEY_AUTO_WAKE_SCREEN_OFF = "screen_auto_wake_on_off"
     private const val KEY_AUTO_CONFIRM_MP = "screen_auto_confirm_media_projection"
     private const val KEY_FILL_CAMERA_CUTOUT_USB = "screen_fill_camera_cutout_on_usb"
-    private const val KEY_MIRRORING_ASPECT_16_9_SHIZUKU = "screen_mirroring_aspect_16_9_shizuku"
 
     private val _config = MutableStateFlow(ScreenKeepAliveConfig())
     val config: StateFlow<ScreenKeepAliveConfig> = _config.asStateFlow()
@@ -137,8 +130,7 @@ object ScreenKeepAlivePreferences {
             autoRotateLeftOnUsb = prefs.getBoolean(KEY_AUTO_ROTATE_LEFT_USB, true),
             autoWakeOnScreenOff = prefs.getBoolean(KEY_AUTO_WAKE_SCREEN_OFF, false),
             autoConfirmMediaProjection = prefs.getBoolean(KEY_AUTO_CONFIRM_MP, true),
-            fillCameraCutoutOnUsb = prefs.getBoolean(KEY_FILL_CAMERA_CUTOUT_USB, true),
-            mirroringAspect16by9Shizuku = prefs.getBoolean(KEY_MIRRORING_ASPECT_16_9_SHIZUKU, false)
+            fillCameraCutoutOnUsb = prefs.getBoolean(KEY_FILL_CAMERA_CUTOUT_USB, true)
         )
     }
 
@@ -165,7 +157,6 @@ object ScreenKeepAlivePreferences {
             .remove(KEY_AUTO_WAKE_SCREEN_OFF)
             .remove(KEY_AUTO_CONFIRM_MP)
             .remove(KEY_FILL_CAMERA_CUTOUT_USB)
-            .remove(KEY_MIRRORING_ASPECT_16_9_SHIZUKU)
             .apply()
         _config.value = ScreenKeepAliveConfig()
     }
@@ -181,7 +172,6 @@ object ScreenKeepAlivePreferences {
             .putBoolean(KEY_AUTO_WAKE_SCREEN_OFF, cfg.autoWakeOnScreenOff)
             .putBoolean(KEY_AUTO_CONFIRM_MP, cfg.autoConfirmMediaProjection)
             .putBoolean(KEY_FILL_CAMERA_CUTOUT_USB, cfg.fillCameraCutoutOnUsb)
-            .putBoolean(KEY_MIRRORING_ASPECT_16_9_SHIZUKU, cfg.mirroringAspect16by9Shizuku)
             .apply()
     }
 }
@@ -579,18 +569,6 @@ class ScreenKeepAliveManager(
             isMirroringMode: Boolean,
             isShizukuReady: Boolean
         ): Boolean = fillCameraCutoutOnUsb &&
-            isUsbConnected &&
-            isStreamingOrProjecting &&
-            isMirroringMode &&
-            isShizukuReady
-
-        fun shouldApplyShizukuMirroring16by9(
-            mirroringAspect16by9Shizuku: Boolean,
-            isUsbConnected: Boolean,
-            isStreamingOrProjecting: Boolean,
-            isMirroringMode: Boolean,
-            isShizukuReady: Boolean
-        ): Boolean = mirroringAspect16by9Shizuku &&
             isUsbConnected &&
             isStreamingOrProjecting &&
             isMirroringMode &&

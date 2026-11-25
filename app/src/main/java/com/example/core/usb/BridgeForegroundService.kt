@@ -13,11 +13,14 @@ import android.hardware.usb.UsbAccessory
 import android.hardware.usb.UsbManager
 import android.os.Binder
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
 import android.os.PowerManager
 import android.os.SystemClock
 import android.util.Log
 import android.view.MotionEvent
+import android.widget.Toast
 import androidx.core.app.NotificationCompat
 import com.example.MainActivity
 import com.example.R
@@ -46,6 +49,7 @@ import com.example.protocol.carlife.CarLifeControlSessionState
 import com.example.protocol.carlife.CarLifeControlStateMachine
 import com.example.protocol.carlife.CarLifeFrame
 import com.example.protocol.carlife.CarLifeFrameCodec
+import com.example.protocol.carlife.CarLifeHardKey
 import com.example.protocol.carlife.CarLifeInputEvent
 import com.example.protocol.carlife.CarLifeMsgType
 import com.example.protocol.carlife.CarLifeTouchDecoder
@@ -428,6 +432,13 @@ class BridgeForegroundService : Service() {
 
     private val binder = LocalBinder()
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    @Volatile
+    private var lastHardKeyTimestampMs: Long = 0L
+
+    @Volatile
+    private var lastHardKeyCode: Int = Int.MIN_VALUE
 
     private var wakeLock: PowerManager.WakeLock? = null
     private var screenWakeLock: PowerManager.WakeLock? = null
@@ -813,7 +824,7 @@ class BridgeForegroundService : Service() {
             val cfg = ScreenKeepAlivePreferences.config.value
             if (activeAppMode == AppMode.SHIZUKU_COCKPIT ||
                 (activeAppMode == AppMode.MIRRORING &&
-                    (cfg.fillCameraCutoutOnUsb || cfg.mirroringAspect16by9Shizuku) &&
+                    cfg.fillCameraCutoutOnUsb &&
                     shizukuSnap.isBinderAlive &&
                     shizukuSnap.hasPermission)
             ) {
@@ -1398,7 +1409,7 @@ class BridgeForegroundService : Service() {
                     val shizukuSnap = CarLifeShizukuManager.refreshStatus(applicationContext)
                     val keepAliveCfg = ScreenKeepAlivePreferences.config.value
                     val needShizukuForMirroring = mode == AppMode.MIRRORING &&
-                        (keepAliveCfg.fillCameraCutoutOnUsb || keepAliveCfg.mirroringAspect16by9Shizuku) &&
+                        keepAliveCfg.fillCameraCutoutOnUsb &&
                         shizukuSnap.isBinderAlive &&
                         shizukuSnap.hasPermission
                     if (mode == AppMode.SHIZUKU_COCKPIT || needShizukuForMirroring) {
@@ -1410,11 +1421,6 @@ class BridgeForegroundService : Service() {
                     if (mode != AppMode.MIRRORING) {
                         if (CarLifeShizukuManager.noCutoutOverlayEnabledByBridge) {
                             CarLifeShizukuManager.setNoCutoutOverlayEnabledAsync(false)
-                        }
-                        if (CarLifeShizukuManager.mirroringAspect16by9ModifiedByBridge) {
-                            CarLifeShizukuManager.resetDisplaySizeAsync(force = false) {
-                                notifyPhysicalBoundsChanged()
-                            }
                         }
                     }
                 }
@@ -1654,33 +1660,6 @@ class BridgeForegroundService : Service() {
                 syncScreenKeepAliveState(force = true)
             }
 
-            ACTION_RESET_DISPLAY_SIZE -> {
-                serviceScope.launch {
-                    CarLifeShizukuManager.init(applicationContext)
-                    val snap = CarLifeShizukuManager.refreshStatus(applicationContext)
-                    if (snap.isBinderAlive && snap.hasPermission && CarLifeShizukuManager.userService == null) {
-                        CarLifeShizukuManager.bindUserServiceIfReady(applicationContext)
-                        var waitedMs = 0L
-                        while (CarLifeShizukuManager.userService == null && waitedMs < 1_200L) {
-                            kotlinx.coroutines.delay(100L)
-                            waitedMs += 100L
-                        }
-                    }
-                    val ok = CarLifeShizukuManager.resetDisplaySize(force = true) {
-                        notifyPhysicalBoundsChanged()
-                    }
-                    BridgeTelemetryBus.updateState {
-                        it.copy(
-                            lastProtocolEvent = if (ok) {
-                                "Разрешение экрана телефона сброшено (wm size reset)"
-                            } else {
-                                "Не удалось выполнить wm size reset — проверьте права Shizuku"
-                            }
-                        )
-                    }
-                }
-            }
-
             ACTION_DISCONNECT_STOP -> {
                 autoTestJob?.cancel()
                 autoTestJob = null
@@ -1690,11 +1669,6 @@ class BridgeForegroundService : Service() {
                 }
                 serviceScope.launch {
                     runCatching { CarLifeShizukuManager.setNoCutoutOverlayEnabled(false) }
-                    runCatching {
-                        CarLifeShizukuManager.resetDisplaySize(force = false) {
-                            notifyPhysicalBoundsChanged()
-                        }
-                    }
                     audioCaptureManager.stopCapture(
                         sendMediaStop = usbTransport.state.value is UsbTransportState.Connected
                     )
@@ -1709,17 +1683,6 @@ class BridgeForegroundService : Service() {
         }
 
         return START_STICKY
-    }
-
-    private fun notifyPhysicalBoundsChanged() {
-        if (!::projectionManager.isInitialized) return
-        projectionManager.recalculatePhysicalScreenBounds(requestSyncOnChange = true)
-        serviceScope.launch {
-            kotlinx.coroutines.delay(250L)
-            if (::projectionManager.isInitialized) {
-                projectionManager.recalculatePhysicalScreenBounds(requestSyncOnChange = true)
-            }
-        }
     }
 
     private fun syncScreenKeepAliveState(
@@ -1743,14 +1706,7 @@ class BridgeForegroundService : Service() {
             isMirroringMode = mirroringMode,
             isShizukuReady = isShizukuReady
         )
-        val shouldApplyShizuku16by9 = ScreenKeepAliveManager.shouldApplyShizukuMirroring16by9(
-            mirroringAspect16by9Shizuku = cfg.mirroringAspect16by9Shizuku,
-            isUsbConnected = usbConnected,
-            isStreamingOrProjecting = isStreamingOrProjecting,
-            isMirroringMode = mirroringMode,
-            isShizukuReady = isShizukuReady
-        )
-        if ((shouldApplyShizukuCutout || shouldApplyShizuku16by9) && CarLifeShizukuManager.userService == null) {
+        if (shouldApplyShizukuCutout && CarLifeShizukuManager.userService == null) {
             CarLifeShizukuManager.bindUserServiceIfReady(applicationContext)
         }
 
@@ -1760,18 +1716,6 @@ class BridgeForegroundService : Service() {
             }
         } else if (CarLifeShizukuManager.noCutoutOverlayEnabledByBridge) {
             CarLifeShizukuManager.setNoCutoutOverlayEnabledAsync(false)
-        }
-
-        if (shouldApplyShizuku16by9) {
-            if (CarLifeShizukuManager.userService != null && !CarLifeShizukuManager.mirroringAspect16by9ModifiedByBridge) {
-                CarLifeShizukuManager.setMirroringAspect16by9Async {
-                    notifyPhysicalBoundsChanged()
-                }
-            }
-        } else if (CarLifeShizukuManager.mirroringAspect16by9ModifiedByBridge) {
-            CarLifeShizukuManager.resetDisplaySizeAsync(force = false) {
-                notifyPhysicalBoundsChanged()
-            }
         }
 
         val currentTuple = Triple(true, usbConnected, mirroringMode)
@@ -1820,7 +1764,6 @@ class BridgeForegroundService : Service() {
             )
         }
         runCatching { CarLifeShizukuManager.setNoCutoutOverlayEnabled(false) }
-        runCatching { CarLifeShizukuManager.resetDisplaySize(force = false) }
         if (!AppEditionConfig.isMirrorOnly) {
             runCatching { CarLifeShizukuManager.unbindUserService(applicationContext) }
         }
@@ -2057,12 +2000,37 @@ class BridgeForegroundService : Service() {
                         )
                     }
                     is CarLifeInputEvent.HardKey -> {
-                        projectionManager.injectHardKeyPacket(
-                            CarLifeHardKeyPacket(
+                        val steeringCfg = TouchSettingsPreferences.steeringWheelConfig.value
+                        val toastText = CarLifeHardKey.formatDiagnosticToast(
+                            keycode = decodedEvent.rawKeyCode,
+                            swapTrackButtons = steeringCfg.swapTrackButtons
+                        )
+                        Log.i(TAG, toastText)
+                        if (steeringCfg.showKeyCodesToast) {
+                            mainHandler.post {
+                                runCatching {
+                                    Toast.makeText(
+                                        applicationContext,
+                                        toastText,
+                                        Toast.LENGTH_SHORT
+                                    ).show()
+                                }
+                            }
+                        }
+                        val nowElapsed = SystemClock.elapsedRealtime()
+                        val shouldExecute = (nowElapsed - lastHardKeyTimestampMs >= HARD_KEY_DEBOUNCE_MS) ||
+                            (decodedEvent.rawKeyCode != lastHardKeyCode)
+                        if (shouldExecute) {
+                            lastHardKeyTimestampMs = nowElapsed
+                            lastHardKeyCode = decodedEvent.rawKeyCode
+                            val pkt = CarLifeHardKeyPacket(
                                 carLifeKeyCode = decodedEvent.rawKeyCode,
                                 androidKeyCode = decodedEvent.androidKeyCode
                             )
-                        )
+                            serviceScope.launch(Dispatchers.Default) {
+                                projectionManager.injectHardKeyPacket(pkt)
+                            }
+                        }
                     }
                     null -> Unit
                 }
@@ -2077,18 +2045,19 @@ class BridgeForegroundService : Service() {
                             "Touch ${decodedEvent.type.label}: HU(${decodedEvent.rawX},${decodedEvent.rawY}) -> Cockpit VD(${decodedEvent.scaledX.toInt()},${decodedEvent.scaledY.toInt()})"
                     }
                     is CarLifeInputEvent.HardKey -> {
-                        val hardKeyLog = "HARD_KEY: code=${decodedEvent.rawKeyCode} (0x${decodedEvent.rawKeyCode.toString(16)})"
-                        Log.i(TAG, hardKeyLog)
-                        hardKeyLog
+                        val steeringCfg = TouchSettingsPreferences.steeringWheelConfig.value
+                        CarLifeHardKey.formatDiagnosticToast(
+                            keycode = decodedEvent.rawKeyCode,
+                            swapTrackButtons = steeringCfg.swapTrackButtons
+                        )
                     }
                     null -> "Raw Touch Frame (${frame.payload.size}B)"
                 }
                 BridgeTelemetryBus.updateState {
                     if (decodedEvent is CarLifeInputEvent.HardKey) {
-                        val mappedSuffix = decodedEvent.mappedKey?.let { k -> " • ${k.label}" }.orEmpty()
                         it.copy(
                             lastTouchOrKeyEvent = eventSummary,
-                            lastSteeringWheelKeyEvent = "$eventSummary$mappedSuffix"
+                            lastSteeringWheelKeyEvent = eventSummary
                         )
                     } else {
                         it.copy(lastTouchOrKeyEvent = eventSummary)
@@ -2319,8 +2288,8 @@ class BridgeForegroundService : Service() {
         const val ACTION_START_AUDIO_CAPTURE = "com.example.core.usb.action.START_AUDIO_CAPTURE"
         const val ACTION_STOP_AUDIO_CAPTURE = "com.example.core.usb.action.STOP_AUDIO_CAPTURE"
         const val ACTION_UPDATE_SCREEN_KEEP_ALIVE = "com.example.core.usb.action.UPDATE_SCREEN_KEEP_ALIVE"
-        const val ACTION_RESET_DISPLAY_SIZE = "com.example.core.usb.action.RESET_DISPLAY_SIZE"
         const val ACTION_DISCONNECT_STOP = "com.example.core.usb.action.DISCONNECT_STOP"
+        const val HARD_KEY_DEBOUNCE_MS = 250L
 
         const val EXTRA_RESULT_CODE = "extra_result_code"
         const val EXTRA_RESULT_DATA = "extra_result_data"

@@ -171,7 +171,6 @@ class MainActivity : ComponentActivity() {
             if (intent.action == UsbManager.ACTION_USB_ACCESSORY_DETACHED) {
                 restoreDefaultWindowCutoutAndBars()
                 CarLifeShizukuManager.setNoCutoutOverlayEnabledAsync(false)
-                CarLifeShizukuManager.resetDisplaySizeAsync(force = false)
             }
         }
     }
@@ -312,7 +311,7 @@ class MainActivity : ComponentActivity() {
             val appMode = BridgeTelemetryBus.runtimeState.value.appMode
             val cfg = ScreenKeepAlivePreferences.config.value
             val needShizukuForMirroring = appMode == AppMode.MIRRORING &&
-                (cfg.fillCameraCutoutOnUsb || cfg.mirroringAspect16by9Shizuku)
+                cfg.fillCameraCutoutOnUsb
             if ((appMode == AppMode.SHIZUKU_COCKPIT || needShizukuForMirroring) &&
                 snapshot.isBinderAlive &&
                 snapshot.hasPermission
@@ -324,7 +323,6 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         restoreDefaultWindowCutoutAndBars()
-        CarLifeShizukuManager.resetDisplaySizeAsync(force = false)
         if (usbDetachReceiverRegistered) {
             runCatching { unregisterReceiver(usbDetachReceiver) }
             usbDetachReceiverRegistered = false
@@ -2525,6 +2523,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
     }
     val activeThemeMode by ThemePreferences.themeMode.collectAsState()
     val keepAliveConfig by ScreenKeepAlivePreferences.config.collectAsStateWithLifecycle()
+    val steeringWheelConfig by TouchSettingsPreferences.steeringWheelConfig.collectAsStateWithLifecycle()
     var diagnosticsExpanded by rememberSaveable { mutableStateOf(false) }
     var mirroringDiagExpanded by rememberSaveable { mutableStateOf(false) }
     // Tab 0 (default): «Команды 0x0001 & 0x0006 (RX/TX)»
@@ -2709,6 +2708,76 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                             )
                         )
                     }
+
+                    // Раздел «Кнопки на руле» — инверсия треков Вперёд / Назад (0x00060008)
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(colorScheme.background)
+                            .border(1.dp, colorScheme.outline, RoundedCornerShape(10.dp))
+                            .padding(horizontal = 12.dp, vertical = 10.dp)
+                            .testTag("steering_wheel_settings_section"),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "Кнопки на руле (0x00060008)",
+                                style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.SemiBold),
+                                color = colorScheme.onSurface
+                            )
+                            VwStatusBadge(
+                                label = if (steeringWheelConfig.swapTrackButtons) "ИНВЕРСИЯ" else "ШТАТНО",
+                                tone = if (steeringWheelConfig.swapTrackButtons) VwBadgeTone.ACTIVE else VwBadgeTone.WAITING
+                            )
+                        }
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(min = 48.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .padding(end = 12.dp),
+                                verticalArrangement = Arrangement.spacedBy(2.dp)
+                            ) {
+                                Text(
+                                    text = "Поменять местами Вперёд / Назад",
+                                    style = MaterialTheme.typography.labelLarge,
+                                    color = colorScheme.onSurface
+                                )
+                                Text(
+                                    text = if (steeringWheelConfig.swapTrackButtons) {
+                                        "Вкл — коды 15 (0x0F) / 7 и 16 (0x10) / 6 поменяны местами без пересборки"
+                                    } else {
+                                        "Выкл — 15 (0x0F) / 7 = Предыдущий трек, 16 (0x10) / 6 = Следующий трек, 20 (0x14) = OK / Пауза"
+                                    },
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = colorScheme.onSurfaceVariant
+                                )
+                            }
+                            Switch(
+                                checked = steeringWheelConfig.swapTrackButtons,
+                                onCheckedChange = { enabled ->
+                                    TouchSettingsPreferences.setSwapSteeringWheelTrackButtons(enabled, context)
+                                },
+                                modifier = Modifier.testTag("swap_steering_wheel_tracks_switch"),
+                                colors = SwitchDefaults.colors(
+                                    checkedThumbColor = colorScheme.onPrimary,
+                                    checkedTrackColor = colorScheme.primary,
+                                    uncheckedThumbColor = colorScheme.onSurfaceVariant,
+                                    uncheckedTrackColor = colorScheme.surfaceVariant
+                                )
+                            )
+                        }
+                    }
                 }
             }
         }
@@ -2742,7 +2811,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                         if (!state.isServiceRunning) {
                             val keepAliveCfg = ScreenKeepAlivePreferences.config.value
                             val snap = CarLifeShizukuManager.refreshStatus(context)
-                            if ((keepAliveCfg.fillCameraCutoutOnUsb || keepAliveCfg.mirroringAspect16by9Shizuku) &&
+                            if (keepAliveCfg.fillCameraCutoutOnUsb &&
                                 snap.isBinderAlive &&
                                 snap.hasPermission
                             ) {
@@ -2944,7 +3013,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                         AppMode.COCKPIT ->
                                             "В дороге: панель VW 250 px слева, сетка приложений и встроенная карта; тач работает напрямую, ниже доступны настройки звука 0x0003 и видео H.264."
                                         AppMode.MIRRORING ->
-                                            "В дороге: полная трансляция экрана 30 FPS; ниже активны настройки чувствительности тача Accessibility, KeepAlive / 1% OLED и 16:9."
+                                            "В дороге: полная трансляция экрана 30 FPS; ниже активны настройки чувствительности тача Accessibility и KeepAlive / 1% OLED."
                                         AppMode.SHIZUKU_COCKPIT ->
                                             "В дороге: Навигатор/2ГИС на втором дисплее + левая панель VW поверх; ниже отображаются параметры Shizuku, звука 0x0003 и видео H.264."
                                     },
@@ -3252,16 +3321,11 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                     TouchSensitivitySettingsCard()
                 }
 
-                // Экран и питание — KeepAlive + 1% OLED + 16:9 Shizuku для режима «Зеркало»
+                // Экран и питание — KeepAlive + 1% OLED для режима «Зеркало»
                 item {
-                    val shizukuStatusForMirrorCard by CarLifeShizukuManager.status.collectAsStateWithLifecycle()
-                    val isShizukuReadyForMirrorCard = !isMirrorOnly &&
-                        shizukuStatusForMirrorCard.isBinderAlive &&
-                        shizukuStatusForMirrorCard.hasPermission
                     ScreenKeepAliveSettingsCard(
                         keepAliveState = state.screenKeepAliveState,
                         hasOverlayPermission = checklistStatus.step2OverlayGranted,
-                        isShizukuReady = isShizukuReadyForMirrorCard,
                         onOpenOverlaySettings = onOpenOverlaySettings,
                         onNotifyServiceConfigChanged = {
                             if (state.isServiceRunning) {
@@ -3269,18 +3333,6 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                     action = BridgeForegroundService.ACTION_UPDATE_SCREEN_KEEP_ALIVE
                                 }
                                 safeStartService(context, intent)
-                            }
-                        },
-                        onResetDisplaySizeManual = {
-                            if (state.isServiceRunning) {
-                                val intent = Intent(context, BridgeForegroundService::class.java).apply {
-                                    action = BridgeForegroundService.ACTION_RESET_DISPLAY_SIZE
-                                }
-                                safeStartService(context, intent)
-                            } else {
-                                CarLifeShizukuManager.init(context)
-                                CarLifeShizukuManager.bindUserServiceIfReady(context)
-                                CarLifeShizukuManager.resetDisplaySizeAsync(force = true)
                             }
                         }
                     )
@@ -3319,7 +3371,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                 VwStatusBadge(label = "КОКПИТ", tone = VwBadgeTone.ACTIVE)
                             }
                             Text(
-                                text = "Левая панель VW (250 px) и встроенная Яндекс Карта работают на отдельном VirtualDisplay. Касания экрана ГУ и клавиши на руле (HOME, BACK, NAVI, SEEK±) обрабатываются напрямую.",
+                                text = "Левая панель VW (250 px) и встроенная Яндекс Карта работают на отдельном VirtualDisplay. Касания экрана ГУ и клавиши на руле (HOME, BACK, NAVI, SEEK±, OK) обрабатываются напрямую.",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = colorScheme.onSurfaceVariant
                             )
@@ -3329,7 +3381,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                 border = BorderStroke(1.dp, colorScheme.outline)
                             ) {
                                 Text(
-                                    text = "Настройки чувствительности Accessibility-тача, затемнения 1% OLED и экрана 16:9 скрыты, так как они используются только в типе подключения «Зеркало».",
+                                    text = "Настройки чувствительности Accessibility-тача и затемнения 1% OLED скрыты, так как они используются только в типе подключения «Зеркало».",
                                     style = MaterialTheme.typography.labelSmall,
                                     color = colorScheme.onSurfaceVariant,
                                     modifier = Modifier
@@ -3430,7 +3482,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                 border = BorderStroke(1.dp, colorScheme.outline)
                             ) {
                                 Text(
-                                    text = "Навигатор и 2ГИС запускаются на отдельном виртуальном экране, а рулевые клавиши HOME/BACK и тач идут напрямую через Shizuku. Настройки Accessibility-тача и 16:9 скрыты (только для «Зеркало»).",
+                                    text = "Навигатор и 2ГИС запускаются на отдельном виртуальном экране, а рулевые клавиши HOME/BACK и тач идут напрямую через Shizuku. Настройки Accessibility-тача и затемнения 1% OLED скрыты (только для «Зеркало»).",
                                     style = MaterialTheme.typography.labelSmall,
                                     color = colorScheme.onSurfaceVariant,
                                     modifier = Modifier
@@ -3841,6 +3893,54 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                             },
                             contentDescription = "Развернуть лог пакетов и диагностику USB AOA",
                             tint = colorScheme.primary
+                        )
+                    }
+
+                    // Тумблер «Показывать коды клавиш руля (Toast)» (включён по умолчанию)
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 48.dp)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(colorScheme.background)
+                            .border(1.dp, colorScheme.outline, RoundedCornerShape(10.dp))
+                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .weight(1f)
+                                .padding(end = 12.dp),
+                            verticalArrangement = Arrangement.spacedBy(2.dp)
+                        ) {
+                            Text(
+                                text = "Показывать коды клавиш руля (Toast)",
+                                style = MaterialTheme.typography.labelLarge,
+                                color = colorScheme.onSurface
+                            )
+                            Text(
+                                text = if (steeringWheelConfig.showKeyCodesToast) {
+                                    "Вкл — при нажатии на руле всплывает «Руль: code=XX (0x..) → Действие»"
+                                } else {
+                                    "Выкл — коды клавиш 0x00060008 записываются только в строку «Последняя клавиша руля»"
+                                },
+                                style = MaterialTheme.typography.labelSmall,
+                                color = colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Switch(
+                            checked = steeringWheelConfig.showKeyCodesToast,
+                            onCheckedChange = { enabled ->
+                                TouchSettingsPreferences.setShowSteeringWheelKeyCodesToast(enabled, context)
+                            },
+                            modifier = Modifier.testTag("steering_wheel_toast_switch"),
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = colorScheme.onPrimary,
+                                checkedTrackColor = colorScheme.primary,
+                                uncheckedThumbColor = colorScheme.onSurfaceVariant,
+                                uncheckedTrackColor = colorScheme.surfaceVariant
+                            )
                         )
                     }
 

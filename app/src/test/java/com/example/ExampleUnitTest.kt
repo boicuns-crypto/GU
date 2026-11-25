@@ -255,6 +255,31 @@ class ExampleUnitTest {
         val decodedKey = CarLifeTouchDecoder.decodeTouchChannelFrame(keyFrame)
         assertTrue(decodedKey is CarLifeInputEvent.HardKey)
         assertEquals(CarLifeHardKey.SEEK_ADD, (decodedKey as CarLifeInputEvent.HardKey).mappedKey)
+        assertEquals(16, decodedKey.rawKeyCode)
+        assertEquals(
+            "Руль: code=16 (0x10) → След. трек",
+            CarLifeHardKey.formatDiagnosticToast(keycode = 16, swapTrackButtons = false)
+        )
+        assertEquals(
+            "Руль: code=16 (0x10) → Пред. трек",
+            CarLifeHardKey.formatDiagnosticToast(keycode = 16, swapTrackButtons = true)
+        )
+        assertEquals(
+            "Руль: code=15 (0xf) → Пред. трек",
+            CarLifeHardKey.formatDiagnosticToast(keycode = 15, swapTrackButtons = false)
+        )
+        assertEquals(
+            "Руль: code=15 (0xf) → След. трек",
+            CarLifeHardKey.formatDiagnosticToast(keycode = 15, swapTrackButtons = true)
+        )
+        assertEquals(
+            "Руль: code=20 (0x14) → Пауза / Воспр.",
+            CarLifeHardKey.formatDiagnosticToast(keycode = 20, swapTrackButtons = false)
+        )
+        assertEquals(
+            "Руль: code=99 (0x63) → Не назначено",
+            CarLifeHardKey.formatDiagnosticToast(keycode = 99, swapTrackButtons = false)
+        )
     }
 
     @Test
