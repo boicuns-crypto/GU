@@ -480,6 +480,11 @@ class CockpitProjectionManager(
         }
     }
 
+    fun recalculatePhysicalScreenBounds(requestSyncOnChange: Boolean = true) {
+        lastKnownScreenSize = null
+        refreshPhysicalScreenOrientation(requestSyncOnChange = requestSyncOnChange)
+    }
+
     private fun refreshPhysicalScreenOrientation(requestSyncOnChange: Boolean) {
         val currentSize = CarLifeAccessibilityService.instance?.getPhysicalScreenSize()
             ?: CarLifeAccessibilityService.computePhysicalScreenSize(appContext)

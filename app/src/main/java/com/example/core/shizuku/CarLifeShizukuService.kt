@@ -39,6 +39,9 @@ class CarLifeShizukuService : ICarLifeShizukuService.Stub {
     @Volatile
     private var noCutoutOverlayEnabledByService: Boolean = false
 
+    @Volatile
+    private var displaySizeModifiedByService: Boolean = false
+
     override fun launchAppOnDisplay(
         packageName: String?,
         activityName: String?,
@@ -195,12 +198,45 @@ class CarLifeShizukuService : ICarLifeShizukuService.Stub {
         }.getOrDefault(false)
     }
 
+    override fun setMirroringAspect16by9() {
+        runCatching {
+            val res = execShellCommandDetailed(buildWmSize16by9Command())
+            if (res.isSuccess) {
+                displaySizeModifiedByService = true
+                Log.i(TAG, "setMirroringAspect16by9 applied: wm size 1080x1920")
+            } else {
+                Log.w(TAG, "setMirroringAspect16by9 warning (code=${res.exitCode}): ${res.stderr.ifBlank { res.stdout }}")
+            }
+        }.onFailure { e ->
+            Log.w(TAG, "setMirroringAspect16by9 failed: ${e.message}")
+        }
+    }
+
+    override fun resetDisplaySize() {
+        runCatching {
+            val sizeRes = execShellCommandDetailed(buildWmSizeResetCommand())
+            val densityRes = execShellCommandDetailed(buildWmDensityResetCommand())
+            displaySizeModifiedByService = false
+            Log.i(TAG, "resetDisplaySize completed (sizeExit=${sizeRes.exitCode}, densityExit=${densityRes.exitCode})")
+        }.onFailure { e ->
+            displaySizeModifiedByService = false
+            Log.w(TAG, "resetDisplaySize failed: ${e.message}")
+        }
+    }
+
     override fun destroy() {
         if (noCutoutOverlayEnabledByService) {
             runCatching {
                 execShellCommandDetailed(buildNoCutoutOverlayCommand(enable = false))
             }
             noCutoutOverlayEnabledByService = false
+        }
+        if (displaySizeModifiedByService) {
+            runCatching {
+                execShellCommandDetailed(buildWmSizeResetCommand())
+                execShellCommandDetailed(buildWmDensityResetCommand())
+            }
+            displaySizeModifiedByService = false
         }
         runCatching { commandExecutor.shutdownNow() }
         exitProcess(0)
@@ -252,6 +288,24 @@ class CarLifeShizukuService : ICarLifeShizukuService.Stub {
             "overlay",
             if (enable) "enable" else "disable",
             NO_CUTOUT_OVERLAY_PACKAGE
+        )
+
+        internal fun buildWmSize16by9Command(): Array<String> = arrayOf(
+            "wm",
+            "size",
+            "1080x1920"
+        )
+
+        internal fun buildWmSizeResetCommand(): Array<String> = arrayOf(
+            "wm",
+            "size",
+            "reset"
+        )
+
+        internal fun buildWmDensityResetCommand(): Array<String> = arrayOf(
+            "wm",
+            "density",
+            "reset"
         )
 
         internal fun buildStartCommand(

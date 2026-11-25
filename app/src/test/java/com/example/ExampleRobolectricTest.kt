@@ -449,6 +449,10 @@ class ExampleRobolectricTest {
 
       override fun setNoCutoutOverlayEnabled(enabled: Boolean): Boolean = true
 
+      override fun setMirroringAspect16by9() = Unit
+
+      override fun resetDisplaySize() = Unit
+
       override fun destroy() = Unit
     }
 
@@ -1325,6 +1329,8 @@ class ExampleRobolectricTest {
 
       override fun sendKeyEvent(keyCode: Int, displayId: Int) = Unit
       override fun setNoCutoutOverlayEnabled(enabled: Boolean): Boolean = false
+      override fun setMirroringAspect16by9() = Unit
+      override fun resetDisplaySize() = Unit
       override fun destroy() = Unit
     }
 
@@ -1602,6 +1608,159 @@ class ExampleRobolectricTest {
     } finally {
       ScreenKeepAlivePreferences.clear(context)
     }
+  }
+
+  @Test
+  fun `shizuku 16by9 mirroring commands, preference defaults, manager lifecycle, and bounds refresh behave cleanly`() {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    var set16by9Calls = 0
+    var resetDisplayCalls = 0
+    var onAppliedInvoked = 0
+    var onResetInvoked = 0
+
+    val fakeStub = object : ICarLifeShizukuService.Stub() {
+      override fun launchAppOnDisplay(packageName: String?, activityName: String?, displayId: Int) = Unit
+      override fun injectTouch(action: Int, x: Float, y: Float, downTime: Long, eventTime: Long, displayId: Int) = Unit
+      override fun sendKeyEvent(keyCode: Int, displayId: Int) = Unit
+      override fun setNoCutoutOverlayEnabled(enabled: Boolean): Boolean = true
+      override fun setMirroringAspect16by9() {
+        set16by9Calls++
+      }
+      override fun resetDisplaySize() {
+        resetDisplayCalls++
+      }
+      override fun destroy() = Unit
+    }
+
+    try {
+      ScreenKeepAlivePreferences.clear(context)
+      assertFalse(ScreenKeepAlivePreferences.init(context).mirroringAspect16by9Shizuku)
+
+      ScreenKeepAlivePreferences.updateConfig(context) { it.copy(mirroringAspect16by9Shizuku = true) }
+      assertTrue(ScreenKeepAlivePreferences.init(context).mirroringAspect16by9Shizuku)
+
+      assertEquals(listOf("wm", "size", "1080x1920"), CarLifeShizukuService.buildWmSize16by9Command().toList())
+      assertEquals(listOf("wm", "size", "reset"), CarLifeShizukuService.buildWmSizeResetCommand().toList())
+      assertEquals(listOf("wm", "density", "reset"), CarLifeShizukuService.buildWmDensityResetCommand().toList())
+
+      assertTrue(
+        ScreenKeepAliveManager.shouldApplyShizukuMirroring16by9(
+          mirroringAspect16by9Shizuku = true,
+          isUsbConnected = true,
+          isStreamingOrProjecting = true,
+          isMirroringMode = true,
+          isShizukuReady = true
+        )
+      )
+      assertFalse(
+        ScreenKeepAliveManager.shouldApplyShizukuMirroring16by9(
+          mirroringAspect16by9Shizuku = true,
+          isUsbConnected = true,
+          isStreamingOrProjecting = true,
+          isMirroringMode = false,
+          isShizukuReady = true
+        )
+      )
+      assertFalse(
+        ScreenKeepAliveManager.shouldApplyShizukuMirroring16by9(
+          mirroringAspect16by9Shizuku = true,
+          isUsbConnected = true,
+          isStreamingOrProjecting = true,
+          isMirroringMode = true,
+          isShizukuReady = false
+        )
+      )
+
+      CarLifeShizukuManager.setServiceForTesting(fakeStub)
+      assertFalse(CarLifeShizukuManager.mirroringAspect16by9ModifiedByBridge)
+
+      // Reset when not modified and force=false should be a no-op
+      assertTrue(CarLifeShizukuManager.resetDisplaySize(force = false))
+      assertEquals(0, resetDisplayCalls)
+
+      // Apply 16:9 via Shizuku stub
+      assertTrue(CarLifeShizukuManager.setMirroringAspect16by9 { onAppliedInvoked++ })
+      assertEquals(1, set16by9Calls)
+      assertEquals(1, onAppliedInvoked)
+      assertTrue(CarLifeShizukuManager.mirroringAspect16by9ModifiedByBridge)
+
+      // Duplicate call avoids repeating IPC
+      assertTrue(CarLifeShizukuManager.setMirroringAspect16by9 { onAppliedInvoked++ })
+      assertEquals(1, set16by9Calls)
+      assertEquals(2, onAppliedInvoked)
+
+      // Reset now executes AIDL resetDisplaySize() and clears tracking flag
+      assertTrue(CarLifeShizukuManager.resetDisplaySize(force = false) { onResetInvoked++ })
+      assertEquals(1, resetDisplayCalls)
+      assertEquals(1, onResetInvoked)
+      assertFalse(CarLifeShizukuManager.mirroringAspect16by9ModifiedByBridge)
+
+      // Manual force reset runs even when not marked modified
+      assertTrue(CarLifeShizukuManager.resetDisplaySize(force = true) { onResetInvoked++ })
+      assertEquals(2, resetDisplayCalls)
+      assertEquals(2, onResetInvoked)
+
+      // CockpitProjectionManager bounds recalculation populates phoneScreenWidth / Height cleanly
+      val projManager = CockpitProjectionManager(context = context, onEncodedVideoNal = { _, _, _ -> })
+      projManager.recalculatePhysicalScreenBounds(requestSyncOnChange = false)
+      assertTrue(projManager.stats.value.phoneScreenWidth > 0)
+      assertTrue(projManager.stats.value.phoneScreenHeight > 0)
+      kotlinx.coroutines.runBlocking { projManager.stopProjection() }
+    } finally {
+      CarLifeShizukuManager.resetForTesting()
+      ScreenKeepAlivePreferences.clear(context)
+    }
+  }
+
+  @Test
+  fun `unified 8-item AppPermissionsSnapshot computes counters, Shizuku status, and missing runtime permissions`() {
+    val allMissing = AppPermissionsSnapshot()
+    assertEquals(8, allMissing.totalCount)
+    assertEquals(0, allMissing.grantedCount)
+    assertFalse(allMissing.allGranted)
+    assertEquals(
+      listOf(
+        android.Manifest.permission.RECORD_AUDIO,
+        android.Manifest.permission.POST_NOTIFICATIONS,
+        android.Manifest.permission.ACCESS_FINE_LOCATION
+      ),
+      allMissing.missingRuntimePermissions(sdkInt = 35)
+    )
+    assertEquals(
+      listOf(
+        android.Manifest.permission.RECORD_AUDIO,
+        android.Manifest.permission.ACCESS_FINE_LOCATION
+      ),
+      allMissing.missingRuntimePermissions(sdkInt = 31)
+    )
+
+    // Shizuku requires BOTH binder alive and permission granted
+    val binderOnly = AppPermissionsSnapshot(shizukuBinderAlive = true, shizukuPermissionGranted = false)
+    assertFalse(binderOnly.shizukuGranted)
+    assertEquals(0, binderOnly.grantedCount)
+
+    val partial = AppPermissionsSnapshot(
+      recordAudioGranted = true,
+      postNotificationsGranted = true,
+      fineLocationGranted = false,
+      accessibilityEnabled = true,
+      notificationListenerGranted = false,
+      overlayGranted = true,
+      batteryOptimizationIgnored = true,
+      shizukuBinderAlive = true,
+      shizukuPermissionGranted = true
+    )
+    assertEquals(6, partial.grantedCount)
+    assertFalse(partial.allGranted)
+    assertEquals(listOf(android.Manifest.permission.ACCESS_FINE_LOCATION), partial.missingRuntimePermissions(sdkInt = 35))
+
+    val complete = partial.copy(
+      fineLocationGranted = true,
+      notificationListenerGranted = true
+    )
+    assertEquals(8, complete.grantedCount)
+    assertTrue(complete.allGranted)
+    assertTrue(complete.missingRuntimePermissions(sdkInt = 35).isEmpty())
   }
 }
 

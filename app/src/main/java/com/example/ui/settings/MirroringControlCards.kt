@@ -316,8 +316,10 @@ fun TouchSensitivitySettingsCard(
 fun ScreenKeepAliveSettingsCard(
     keepAliveState: ScreenKeepAliveState,
     hasOverlayPermission: Boolean,
+    isShizukuReady: Boolean = false,
     onOpenOverlaySettings: () -> Unit,
     onNotifyServiceConfigChanged: () -> Unit,
+    onResetDisplaySizeManual: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -472,6 +474,47 @@ fun ScreenKeepAliveSettingsCard(
                 }
             )
 
+            SettingsSwitchRow(
+                title = "Полный экран 16:9 (через Shizuku)",
+                subtitle = if (isShizukuReady) {
+                    "При старте зеркалирования по USB задаёт wm size 1080x1920 (1920×1080 в альбоме на 1280×720 без чёрных полос) и сбрасывает обратно при отключении"
+                } else {
+                    "Требуется активный Shizuku с выданными правами (вкладка «Подключение»)"
+                },
+                checked = config.mirroringAspect16by9Shizuku,
+                enabled = isShizukuReady,
+                testTag = "screen_mirroring_16_9_shizuku_switch",
+                onCheckedChange = { enabled ->
+                    ScreenKeepAlivePreferences.updateConfig(context) {
+                        it.copy(mirroringAspect16by9Shizuku = enabled)
+                    }
+                    onNotifyServiceConfigChanged()
+                }
+            )
+
+            OutlinedButton(
+                onClick = onResetDisplaySizeManual,
+                enabled = isShizukuReady,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 48.dp)
+                    .testTag("reset_display_size_manual_btn"),
+                shape = RoundedCornerShape(10.dp),
+                border = BorderStroke(
+                    1.dp,
+                    if (isShizukuReady) colorScheme.outline else colorScheme.outline.copy(alpha = 0.45f)
+                ),
+                colors = ButtonDefaults.outlinedButtonColors(
+                    contentColor = colorScheme.onSurface,
+                    disabledContentColor = colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
+                )
+            ) {
+                Text(
+                    text = "Сбросить экран телефона (wm size reset)",
+                    style = MaterialTheme.typography.labelLarge
+                )
+            }
+
             val needsOverlayPerm = config.keepScreenAwakeOverlay ||
                 config.dimPhoneScreenDuringMirroring ||
                 config.autoRotateLeftOnUsb
@@ -555,6 +598,7 @@ private fun SettingsSwitchRow(
     subtitle: String,
     checked: Boolean,
     testTag: String,
+    enabled: Boolean = true,
     onCheckedChange: (Boolean) -> Unit
 ) {
     val colorScheme = MaterialTheme.colorScheme
@@ -578,7 +622,7 @@ private fun SettingsSwitchRow(
             Text(
                 text = title,
                 style = MaterialTheme.typography.labelLarge,
-                color = colorScheme.onSurface
+                color = if (enabled) colorScheme.onSurface else colorScheme.onSurfaceVariant
             )
             Text(
                 text = subtitle,
@@ -589,6 +633,7 @@ private fun SettingsSwitchRow(
         Switch(
             checked = checked,
             onCheckedChange = onCheckedChange,
+            enabled = enabled,
             modifier = Modifier.testTag(testTag),
             colors = SwitchDefaults.colors(
                 checkedThumbColor = colorScheme.onPrimary,

@@ -810,9 +810,10 @@ class BridgeForegroundService : Service() {
         if (!AppEditionConfig.isMirrorOnly) {
             CarLifeShizukuManager.init(applicationContext)
             val shizukuSnap = CarLifeShizukuManager.refreshStatus(applicationContext)
+            val cfg = ScreenKeepAlivePreferences.config.value
             if (activeAppMode == AppMode.SHIZUKU_COCKPIT ||
                 (activeAppMode == AppMode.MIRRORING &&
-                    ScreenKeepAlivePreferences.config.value.fillCameraCutoutOnUsb &&
+                    (cfg.fillCameraCutoutOnUsb || cfg.mirroringAspect16by9Shizuku) &&
                     shizukuSnap.isBinderAlive &&
                     shizukuSnap.hasPermission)
             ) {
@@ -996,9 +997,29 @@ class BridgeForegroundService : Service() {
 
         // Observe Projection Pipeline stats
         serviceScope.launch {
+            var lastProjRunning: Boolean? = null
             projectionManager.stats.collect { projStats ->
                 BridgeTelemetryBus.updateState { current ->
                     current.copy(projectionStats = projStats)
+                }
+                if (lastProjRunning != projStats.isRunning) {
+                    lastProjRunning = projStats.isRunning
+                    syncScreenKeepAliveState(force = true)
+                }
+            }
+        }
+
+        // Observe Shizuku UserService connection to immediately apply 16:9 / noCutout when bound
+        if (!AppEditionConfig.isMirrorOnly) {
+            serviceScope.launch {
+                var wasUserServiceBound = false
+                CarLifeShizukuManager.status.collect { shizukuState ->
+                    if (shizukuState.isUserServiceBound && !wasUserServiceBound) {
+                        wasUserServiceBound = true
+                        syncScreenKeepAliveState(force = true)
+                    } else if (!shizukuState.isUserServiceBound) {
+                        wasUserServiceBound = false
+                    }
                 }
             }
         }
@@ -1375,19 +1396,26 @@ class BridgeForegroundService : Service() {
 
                 if (!AppEditionConfig.isMirrorOnly) {
                     val shizukuSnap = CarLifeShizukuManager.refreshStatus(applicationContext)
-                    val needShizukuForCutout = mode == AppMode.MIRRORING &&
-                        ScreenKeepAlivePreferences.config.value.fillCameraCutoutOnUsb &&
+                    val keepAliveCfg = ScreenKeepAlivePreferences.config.value
+                    val needShizukuForMirroring = mode == AppMode.MIRRORING &&
+                        (keepAliveCfg.fillCameraCutoutOnUsb || keepAliveCfg.mirroringAspect16by9Shizuku) &&
                         shizukuSnap.isBinderAlive &&
                         shizukuSnap.hasPermission
-                    if (mode == AppMode.SHIZUKU_COCKPIT || needShizukuForCutout) {
+                    if (mode == AppMode.SHIZUKU_COCKPIT || needShizukuForMirroring) {
                         CarLifeShizukuManager.init(applicationContext)
                         CarLifeShizukuManager.bindUserServiceIfReady(applicationContext)
                     } else if (previousMode == AppMode.SHIZUKU_COCKPIT || previousMode == AppMode.MIRRORING) {
-                        CarLifeShizukuManager.setNoCutoutOverlayEnabledAsync(false)
-                        CarLifeShizukuManager.unbindUserService(applicationContext)
+                        CarLifeShizukuManager.cleanupAndResetThenUnbind(applicationContext)
                     }
-                    if (mode != AppMode.MIRRORING && CarLifeShizukuManager.noCutoutOverlayEnabledByBridge) {
-                        CarLifeShizukuManager.setNoCutoutOverlayEnabledAsync(false)
+                    if (mode != AppMode.MIRRORING) {
+                        if (CarLifeShizukuManager.noCutoutOverlayEnabledByBridge) {
+                            CarLifeShizukuManager.setNoCutoutOverlayEnabledAsync(false)
+                        }
+                        if (CarLifeShizukuManager.mirroringAspect16by9ModifiedByBridge) {
+                            CarLifeShizukuManager.resetDisplaySizeAsync(force = false) {
+                                notifyPhysicalBoundsChanged()
+                            }
+                        }
                     }
                 }
                 syncScreenKeepAliveState(force = true)
@@ -1454,6 +1482,7 @@ class BridgeForegroundService : Service() {
                         sendMediaStop = usbTransport.state.value is UsbTransportState.Connected
                     )
                     projectionManager.stopProjection()
+                    syncScreenKeepAliveState(force = true)
                 }
             }
 
@@ -1625,6 +1654,33 @@ class BridgeForegroundService : Service() {
                 syncScreenKeepAliveState(force = true)
             }
 
+            ACTION_RESET_DISPLAY_SIZE -> {
+                serviceScope.launch {
+                    CarLifeShizukuManager.init(applicationContext)
+                    val snap = CarLifeShizukuManager.refreshStatus(applicationContext)
+                    if (snap.isBinderAlive && snap.hasPermission && CarLifeShizukuManager.userService == null) {
+                        CarLifeShizukuManager.bindUserServiceIfReady(applicationContext)
+                        var waitedMs = 0L
+                        while (CarLifeShizukuManager.userService == null && waitedMs < 1_200L) {
+                            kotlinx.coroutines.delay(100L)
+                            waitedMs += 100L
+                        }
+                    }
+                    val ok = CarLifeShizukuManager.resetDisplaySize(force = true) {
+                        notifyPhysicalBoundsChanged()
+                    }
+                    BridgeTelemetryBus.updateState {
+                        it.copy(
+                            lastProtocolEvent = if (ok) {
+                                "Разрешение экрана телефона сброшено (wm size reset)"
+                            } else {
+                                "Не удалось выполнить wm size reset — проверьте права Shizuku"
+                            }
+                        )
+                    }
+                }
+            }
+
             ACTION_DISCONNECT_STOP -> {
                 autoTestJob?.cancel()
                 autoTestJob = null
@@ -1634,6 +1690,11 @@ class BridgeForegroundService : Service() {
                 }
                 serviceScope.launch {
                     runCatching { CarLifeShizukuManager.setNoCutoutOverlayEnabled(false) }
+                    runCatching {
+                        CarLifeShizukuManager.resetDisplaySize(force = false) {
+                            notifyPhysicalBoundsChanged()
+                        }
+                    }
                     audioCaptureManager.stopCapture(
                         sendMediaStop = usbTransport.state.value is UsbTransportState.Connected
                     )
@@ -1650,6 +1711,17 @@ class BridgeForegroundService : Service() {
         return START_STICKY
     }
 
+    private fun notifyPhysicalBoundsChanged() {
+        if (!::projectionManager.isInitialized) return
+        projectionManager.recalculatePhysicalScreenBounds(requestSyncOnChange = true)
+        serviceScope.launch {
+            kotlinx.coroutines.delay(250L)
+            if (::projectionManager.isInitialized) {
+                projectionManager.recalculatePhysicalScreenBounds(requestSyncOnChange = true)
+            }
+        }
+    }
+
     private fun syncScreenKeepAliveState(
         usbConnectedOverride: Boolean? = null,
         force: Boolean = false
@@ -1663,21 +1735,43 @@ class BridgeForegroundService : Service() {
             (::projectionManager.isInitialized && projectionManager.stats.value.isRunning)
 
         val shizukuStatus = CarLifeShizukuManager.status.value
+        val isShizukuReady = shizukuStatus.isBinderAlive && shizukuStatus.hasPermission
         val shouldApplyShizukuCutout = ScreenKeepAliveManager.shouldApplyShizukuNoCutoutOverlay(
             fillCameraCutoutOnUsb = cfg.fillCameraCutoutOnUsb,
             isUsbConnected = usbConnected,
             isStreamingOrProjecting = isStreamingOrProjecting,
             isMirroringMode = mirroringMode,
-            isShizukuReady = shizukuStatus.isBinderAlive && shizukuStatus.hasPermission
+            isShizukuReady = isShizukuReady
         )
+        val shouldApplyShizuku16by9 = ScreenKeepAliveManager.shouldApplyShizukuMirroring16by9(
+            mirroringAspect16by9Shizuku = cfg.mirroringAspect16by9Shizuku,
+            isUsbConnected = usbConnected,
+            isStreamingOrProjecting = isStreamingOrProjecting,
+            isMirroringMode = mirroringMode,
+            isShizukuReady = isShizukuReady
+        )
+        if ((shouldApplyShizukuCutout || shouldApplyShizuku16by9) && CarLifeShizukuManager.userService == null) {
+            CarLifeShizukuManager.bindUserServiceIfReady(applicationContext)
+        }
+
         if (shouldApplyShizukuCutout) {
-            if (CarLifeShizukuManager.userService == null) {
-                CarLifeShizukuManager.bindUserServiceIfReady(applicationContext)
-            } else if (!CarLifeShizukuManager.noCutoutOverlayEnabledByBridge) {
+            if (CarLifeShizukuManager.userService != null && !CarLifeShizukuManager.noCutoutOverlayEnabledByBridge) {
                 CarLifeShizukuManager.setNoCutoutOverlayEnabledAsync(true)
             }
         } else if (CarLifeShizukuManager.noCutoutOverlayEnabledByBridge) {
             CarLifeShizukuManager.setNoCutoutOverlayEnabledAsync(false)
+        }
+
+        if (shouldApplyShizuku16by9) {
+            if (CarLifeShizukuManager.userService != null && !CarLifeShizukuManager.mirroringAspect16by9ModifiedByBridge) {
+                CarLifeShizukuManager.setMirroringAspect16by9Async {
+                    notifyPhysicalBoundsChanged()
+                }
+            }
+        } else if (CarLifeShizukuManager.mirroringAspect16by9ModifiedByBridge) {
+            CarLifeShizukuManager.resetDisplaySizeAsync(force = false) {
+                notifyPhysicalBoundsChanged()
+            }
         }
 
         val currentTuple = Triple(true, usbConnected, mirroringMode)
@@ -1726,6 +1820,7 @@ class BridgeForegroundService : Service() {
             )
         }
         runCatching { CarLifeShizukuManager.setNoCutoutOverlayEnabled(false) }
+        runCatching { CarLifeShizukuManager.resetDisplaySize(force = false) }
         if (!AppEditionConfig.isMirrorOnly) {
             runCatching { CarLifeShizukuManager.unbindUserService(applicationContext) }
         }
@@ -2224,6 +2319,7 @@ class BridgeForegroundService : Service() {
         const val ACTION_START_AUDIO_CAPTURE = "com.example.core.usb.action.START_AUDIO_CAPTURE"
         const val ACTION_STOP_AUDIO_CAPTURE = "com.example.core.usb.action.STOP_AUDIO_CAPTURE"
         const val ACTION_UPDATE_SCREEN_KEEP_ALIVE = "com.example.core.usb.action.UPDATE_SCREEN_KEEP_ALIVE"
+        const val ACTION_RESET_DISPLAY_SIZE = "com.example.core.usb.action.RESET_DISPLAY_SIZE"
         const val ACTION_DISCONNECT_STOP = "com.example.core.usb.action.DISCONNECT_STOP"
 
         const val EXTRA_RESULT_CODE = "extra_result_code"

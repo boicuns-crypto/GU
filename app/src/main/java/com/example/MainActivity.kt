@@ -126,6 +126,7 @@ import com.example.core.projection.MediaProjectionTokenStore
 import com.example.core.projection.ScreenKeepAliveManager
 import com.example.core.projection.ScreenKeepAlivePreferences
 import com.example.core.shizuku.CarLifeShizukuManager
+import com.example.core.shizuku.ShizukuStatusState
 import com.example.core.usb.BridgeForegroundService
 import com.example.core.usb.BridgeRuntimeState
 import com.example.core.usb.BridgeTelemetryBus
@@ -164,6 +165,7 @@ class MainActivity : ComponentActivity() {
             if (intent.action == UsbManager.ACTION_USB_ACCESSORY_DETACHED) {
                 restoreDefaultWindowCutoutAndBars()
                 CarLifeShizukuManager.setNoCutoutOverlayEnabledAsync(false)
+                CarLifeShizukuManager.resetDisplaySizeAsync(force = false)
             }
         }
     }
@@ -301,7 +303,11 @@ class MainActivity : ComponentActivity() {
         if (!AppEditionConfig.isMirrorOnly) {
             MediaPlayerController.refreshSessions()
             val snapshot = CarLifeShizukuManager.refreshStatus(this)
-            if (BridgeTelemetryBus.runtimeState.value.appMode == AppMode.SHIZUKU_COCKPIT &&
+            val appMode = BridgeTelemetryBus.runtimeState.value.appMode
+            val cfg = ScreenKeepAlivePreferences.config.value
+            val needShizukuForMirroring = appMode == AppMode.MIRRORING &&
+                (cfg.fillCameraCutoutOnUsb || cfg.mirroringAspect16by9Shizuku)
+            if ((appMode == AppMode.SHIZUKU_COCKPIT || needShizukuForMirroring) &&
                 snapshot.isBinderAlive &&
                 snapshot.hasPermission
             ) {
@@ -312,6 +318,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         restoreDefaultWindowCutoutAndBars()
+        CarLifeShizukuManager.resetDisplaySizeAsync(force = false)
         if (usbDetachReceiverRegistered) {
             runCatching { unregisterReceiver(usbDetachReceiver) }
             usbDetachReceiverRegistered = false
@@ -545,6 +552,105 @@ private fun evaluateSetupChecklist(
     )
 }
 
+internal data class AppPermissionsSnapshot(
+    val recordAudioGranted: Boolean = false,
+    val postNotificationsGranted: Boolean = false,
+    val fineLocationGranted: Boolean = false,
+    val accessibilityEnabled: Boolean = false,
+    val notificationListenerGranted: Boolean = false,
+    val overlayGranted: Boolean = false,
+    val batteryOptimizationIgnored: Boolean = false,
+    val shizukuBinderAlive: Boolean = false,
+    val shizukuPermissionGranted: Boolean = false,
+    val shizukuAppInstalled: Boolean = false
+) {
+    val shizukuGranted: Boolean
+        get() = shizukuBinderAlive && shizukuPermissionGranted
+
+    val grantedCount: Int
+        get() = listOf(
+            recordAudioGranted,
+            postNotificationsGranted,
+            fineLocationGranted,
+            accessibilityEnabled,
+            notificationListenerGranted,
+            overlayGranted,
+            batteryOptimizationIgnored,
+            shizukuGranted
+        ).count { it }
+
+    val totalCount: Int
+        get() = 8
+
+    val allGranted: Boolean
+        get() = grantedCount == totalCount
+
+    fun missingRuntimePermissions(sdkInt: Int = Build.VERSION.SDK_INT): List<String> = buildList {
+        if (!recordAudioGranted) {
+            add(Manifest.permission.RECORD_AUDIO)
+        }
+        if (sdkInt >= Build.VERSION_CODES.TIRAMISU && !postNotificationsGranted) {
+            add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        if (!fineLocationGranted) {
+            add(Manifest.permission.ACCESS_FINE_LOCATION)
+        }
+    }
+}
+
+internal fun evaluateAppPermissions(
+    context: Context,
+    a11yRealtimeFlag: Boolean,
+    shizukuStatus: ShizukuStatusState,
+    sdkInt: Int = Build.VERSION.SDK_INT
+): AppPermissionsSnapshot {
+    val pkg = context.packageName
+
+    val recordAudio = ContextCompat.checkSelfPermission(
+        context,
+        Manifest.permission.RECORD_AUDIO
+    ) == PackageManager.PERMISSION_GRANTED
+
+    val postNotifications = if (sdkInt >= Build.VERSION_CODES.TIRAMISU) {
+        ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.POST_NOTIFICATIONS
+        ) == PackageManager.PERMISSION_GRANTED
+    } else {
+        true
+    }
+
+    val fineLocation = ContextCompat.checkSelfPermission(
+        context,
+        Manifest.permission.ACCESS_FINE_LOCATION
+    ) == PackageManager.PERMISSION_GRANTED
+
+    val accessibilityEnabled = a11yRealtimeFlag ||
+        CarLifeAccessibilityService.isEnabledInSettings(context)
+
+    val notificationGranted = runCatching {
+        NotificationManagerCompat.getEnabledListenerPackages(context).contains(pkg)
+    }.getOrDefault(false)
+
+    val overlayGranted = Settings.canDrawOverlays(context)
+
+    val powerManager = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
+    val batteryUnrestricted = powerManager?.isIgnoringBatteryOptimizations(pkg) == true
+
+    return AppPermissionsSnapshot(
+        recordAudioGranted = recordAudio,
+        postNotificationsGranted = postNotifications,
+        fineLocationGranted = fineLocation,
+        accessibilityEnabled = accessibilityEnabled,
+        notificationListenerGranted = notificationGranted,
+        overlayGranted = overlayGranted,
+        batteryOptimizationIgnored = batteryUnrestricted,
+        shizukuBinderAlive = shizukuStatus.isBinderAlive,
+        shizukuPermissionGranted = shizukuStatus.hasPermission,
+        shizukuAppInstalled = shizukuStatus.isShizukuAppInstalled
+    )
+}
+
 @Composable
 fun CarLifeBridgeApp(
     onRequestMediaProjection: () -> Unit,
@@ -564,6 +670,7 @@ fun CarLifeBridgeApp(
     val mediaState by MediaPlayerController.mediaState.collectAsStateWithLifecycle()
     val a11yEnabled by CarLifeAccessibilityService.isServiceEnabled.collectAsStateWithLifecycle()
     val hasMediaProjectionToken by MediaProjectionTokenStore.hasValidToken.collectAsStateWithLifecycle()
+    val shizukuStatus by CarLifeShizukuManager.status.collectAsStateWithLifecycle()
 
     val isMirrorOnly = AppEditionConfig.isMirrorOnly
     // Full Edition: 0 = «Лаунчер», 1 = «Подключение», 2 = «Настройки»
@@ -586,15 +693,39 @@ fun CarLifeBridgeApp(
         )
     }
 
-    DisposableEffect(lifecycleOwner, a11yEnabled, hasMediaProjectionToken, runtimeState.transportState) {
+    var permissionsSnapshot by remember {
+        mutableStateOf(
+            evaluateAppPermissions(
+                context = context,
+                a11yRealtimeFlag = a11yEnabled,
+                shizukuStatus = shizukuStatus
+            )
+        )
+    }
+
+    fun refreshAllPermissionsAndChecklist() {
+        val latestShizuku = if (!isMirrorOnly) {
+            CarLifeShizukuManager.refreshStatus(context)
+        } else {
+            shizukuStatus
+        }
+        checklistStatus = evaluateSetupChecklist(
+            context = context,
+            a11yRealtimeFlag = a11yEnabled,
+            hasMediaProjectionToken = hasMediaProjectionToken,
+            transportState = runtimeState.transportState
+        )
+        permissionsSnapshot = evaluateAppPermissions(
+            context = context,
+            a11yRealtimeFlag = a11yEnabled,
+            shizukuStatus = latestShizuku
+        )
+    }
+
+    DisposableEffect(lifecycleOwner, a11yEnabled, hasMediaProjectionToken, runtimeState.transportState, shizukuStatus) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
-                checklistStatus = evaluateSetupChecklist(
-                    context = context,
-                    a11yRealtimeFlag = a11yEnabled,
-                    hasMediaProjectionToken = hasMediaProjectionToken,
-                    transportState = runtimeState.transportState
-                )
+                refreshAllPermissionsAndChecklist()
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -603,7 +734,7 @@ fun CarLifeBridgeApp(
         }
     }
 
-    LaunchedEffect(selectedTab, a11yEnabled, hasMediaProjectionToken, runtimeState.transportState) {
+    LaunchedEffect(selectedTab, a11yEnabled, hasMediaProjectionToken, runtimeState.transportState, shizukuStatus) {
         while (isActive) {
             val latest = evaluateSetupChecklist(
                 context = context,
@@ -611,18 +742,32 @@ fun CarLifeBridgeApp(
                 hasMediaProjectionToken = hasMediaProjectionToken,
                 transportState = runtimeState.transportState
             )
+            val latestPerms = evaluateAppPermissions(
+                context = context,
+                a11yRealtimeFlag = a11yEnabled,
+                shizukuStatus = shizukuStatus
+            )
             checklistStatus = latest
+            permissionsSnapshot = latestPerms
             // Avoid unnecessary 1s Binder IPC polling when setup is complete and user is on Launcher/Settings tabs
-            if (selectedTab != 1 && latest.allPrerequisitesReady) {
+            if (selectedTab != 1 && latest.allPrerequisitesReady && latestPerms.allGranted) {
                 break
             }
             delay(if (selectedTab == 1) 1_000L else 3_000L)
         }
     }
 
-    val notificationPermissionLauncher = rememberLauncherForActivityResult(
+    val runtimePermissionsBatchLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions()
-    ) { /* Handled gracefully */ }
+    ) { results ->
+        refreshAllPermissionsAndChecklist()
+        if (results[Manifest.permission.RECORD_AUDIO] == true && runtimeState.isServiceRunning) {
+            val audioIntent = Intent(context, BridgeForegroundService::class.java).apply {
+                action = BridgeForegroundService.ACTION_START_AUDIO_CAPTURE
+            }
+            safeStartService(context, audioIntent)
+        }
+    }
 
     LaunchedEffect(Unit) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -631,7 +776,7 @@ fun CarLifeBridgeApp(
                 Manifest.permission.POST_NOTIFICATIONS
             ) == PackageManager.PERMISSION_GRANTED
             if (!notifGranted) {
-                notificationPermissionLauncher.launch(arrayOf(Manifest.permission.POST_NOTIFICATIONS))
+                runtimePermissionsBatchLauncher.launch(arrayOf(Manifest.permission.POST_NOTIFICATIONS))
             }
         }
         if (!isMirrorOnly) {
@@ -806,7 +951,16 @@ fun CarLifeBridgeApp(
 
                     1 -> OnboardingChecklistScreen(
                         status = checklistStatus,
+                        permissions = permissionsSnapshot,
                         runtimeState = runtimeState,
+                        onGrantBasicRuntimePermissions = { missing ->
+                            if (missing.isNotEmpty()) {
+                                runtimePermissionsBatchLauncher.launch(missing.toTypedArray())
+                            }
+                        },
+                        onRequestSingleRuntimePermission = { perm ->
+                            runtimePermissionsBatchLauncher.launch(arrayOf(perm))
+                        },
                         onRequestBatteryUnrestricted = {
                             requestIgnoreBatteryOptimizations(context)
                         },
@@ -821,6 +975,15 @@ fun CarLifeBridgeApp(
                         },
                         onOpenNotificationListenerSettings = {
                             MediaPlayerController.openNotificationListenerSettings(context)
+                        },
+                        onRequestOrOpenShizuku = {
+                            val latestShizuku = CarLifeShizukuManager.refreshStatus(context)
+                            if (latestShizuku.isBinderAlive) {
+                                CarLifeShizukuManager.requestPermission(context)
+                            } else {
+                                openShizukuAppOrPage(context)
+                            }
+                            refreshAllPermissionsAndChecklist()
                         },
                         onRequestMediaProjection = onRequestMediaProjection,
                         onScanAndAttachUsb = onStartOrScanBridge,
@@ -948,6 +1111,27 @@ private fun openAppDetailsSettings(context: Context) {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
         context.startActivity(intent)
+    }
+}
+
+private fun openShizukuAppOrPage(context: Context) {
+    val launched = runCatching {
+        context.packageManager.getLaunchIntentForPackage("moe.shizuku.privileged.api")?.let { intent ->
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            context.startActivity(intent)
+            true
+        } ?: false
+    }.getOrDefault(false)
+    if (!launched) {
+        runCatching {
+            val webIntent = Intent(
+                Intent.ACTION_VIEW,
+                Uri.parse("https://shizuku.rikka.app/")
+            ).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(webIntent)
+        }
     }
 }
 
@@ -1125,12 +1309,16 @@ private fun VwStatusBadge(
 @Composable
 private fun OnboardingChecklistScreen(
     status: SetupChecklistStatus,
+    permissions: AppPermissionsSnapshot,
     runtimeState: BridgeRuntimeState,
+    onGrantBasicRuntimePermissions: (List<String>) -> Unit,
+    onRequestSingleRuntimePermission: (String) -> Unit,
     onRequestBatteryUnrestricted: () -> Unit,
     onRequestOverlayPermission: () -> Unit,
     onOpenAccessibilitySettings: () -> Unit,
     onOpenAppDetailsSettings: () -> Unit,
     onOpenNotificationListenerSettings: () -> Unit,
+    onRequestOrOpenShizuku: () -> Unit,
     onRequestMediaProjection: () -> Unit,
     onScanAndAttachUsb: () -> Unit,
     onOpenLauncherTab: () -> Unit
@@ -1198,9 +1386,9 @@ private fun OnboardingChecklistScreen(
 
                     Text(
                         text = if (status.allPrerequisitesReady) {
-                            "Все ${status.totalMandatorySteps} разрешения выданы. Видеопоток H.264 (SPS/PPS + IDR) готов к передаче без зависания на 90%."
+                            "Обязательные доступы и захват экрана готовы. Видеопоток H.264 (SPS/PPS + IDR) готов к передаче без зависания на 90%."
                         } else {
-                            "Выполните ${status.totalMandatorySteps} шага подготовки перед подключением USB-кабеля к ГУ автомобиля, чтобы CarLife проходил загрузку 90% → 100%."
+                            "Выдайте разрешения ниже и подтвердите «Весь экран» перед подключением USB-кабеля к ГУ автомобиля, чтобы CarLife проходил загрузку 90% → 100%."
                         },
                         style = MaterialTheme.typography.bodyMedium,
                         color = colorScheme.onSurfaceVariant
@@ -1219,75 +1407,22 @@ private fun OnboardingChecklistScreen(
             }
         }
 
-        // ШАГ 1: Снятие ограничений батареи
+        // ЕДИНЫЙ БЛОК: Разрешения приложения (8 пунктов, авто-обновление в ON_RESUME и авто-сворачивание при 8/8)
         item {
-            ChecklistStepCard(
-                title = "Шаг 1. Снятие ограничений батареи (WakeLock & 30fps)",
-                isCompleted = status.step1BatteryUnrestricted,
-                description = "Отключите оптимизацию батареи, чтобы система One UI не усыпляла видеопоток при выключенном экране телефона.",
-                primaryButtonText = if (status.step1BatteryUnrestricted) {
-                    "Оптимизация отключена"
-                } else {
-                    "Отключить оптимизацию батареи"
-                },
-                testTag = "step1_battery_btn",
-                onPrimaryClick = onRequestBatteryUnrestricted
+            UnifiedAppPermissionsCard(
+                permissions = permissions,
+                onGrantBasicRuntimePermissions = onGrantBasicRuntimePermissions,
+                onRequestSingleRuntimePermission = onRequestSingleRuntimePermission,
+                onOpenAccessibilitySettings = onOpenAccessibilitySettings,
+                onOpenAppDetailsSettings = onOpenAppDetailsSettings,
+                onOpenNotificationListenerSettings = onOpenNotificationListenerSettings,
+                onRequestOverlayPermission = onRequestOverlayPermission,
+                onRequestBatteryUnrestricted = onRequestBatteryUnrestricted,
+                onRequestOrOpenShizuku = onRequestOrOpenShizuku
             )
         }
 
-        // ШАГ 2: Разрешение «Поверх других окон» (Overlay)
-        item {
-            ChecklistStepCard(
-                title = "Шаг 2. Разрешение «Поверх других окон» (Overlay)",
-                isCompleted = status.step2OverlayGranted,
-                description = "Разрешите показ поверх других окон — это необходимо для запуска полноценных приложений на экране ГУ из фонового сервиса.",
-                primaryButtonText = if (status.step2OverlayGranted) {
-                    "Разрешение Overlay выдано"
-                } else {
-                    "Разрешить «Поверх других окон»"
-                },
-                testTag = "step2_overlay_btn",
-                onPrimaryClick = onRequestOverlayPermission
-            )
-        }
-
-        // ШАГ 3: Служба специальных возможностей (Accessibility Service)
-        item {
-            ChecklistStepCard(
-                title = "Шаг 3. Служба специальных возможностей (Тачскрин ГУ)",
-                isCompleted = status.step3AccessibilityEnabled,
-                description = "Откройте «Специальные возможности» -> «Установленные приложения» -> включите службу управления касаниями CarLife. (Если кнопка неактивна на Android 16: Настройки -> Приложения -> Наше приложение -> Меню ⋮ -> «Разрешить ограниченные настройки»).",
-                primaryButtonText = if (status.step3AccessibilityEnabled) {
-                    "Служба касаний активна"
-                } else {
-                    "Открыть Специальные возможности"
-                },
-                testTag = "step3_accessibility_btn",
-                onPrimaryClick = onOpenAccessibilitySettings,
-                secondaryButtonText = "О приложении (Разрешить ограниченные настройки)",
-                onSecondaryClick = onOpenAppDetailsSettings
-            )
-        }
-
-        // ШАГ 4: Доступ к уведомлениям (только в Full-версии с виджетом плеера Кокпита)
-        if (!isMirrorOnly) {
-            item {
-                ChecklistStepCard(
-                    title = "Шаг 4. Доступ к уведомлениям (Для виджета музыки на ГУ)",
-                    isCompleted = status.step4NotificationAccessGranted,
-                    description = "Разрешите чтение уведомлений для отображения обложек треков и управления Яндекс.Музыкой / Spotify с экрана ГУ.",
-                    primaryButtonText = if (status.step4NotificationAccessGranted) {
-                        "Доступ к уведомлениям открыт"
-                    } else {
-                        "Разрешить доступ к уведомлениям"
-                    },
-                    testTag = "step4_notifications_btn",
-                    onPrimaryClick = onOpenNotificationListenerSettings
-                )
-            }
-        }
-
-        // ШАГ 5 (или 4 в Mirror Only): Захват экрана (MediaProjection) — КРИТИЧНО ДЛЯ ПРОХОЖДЕНИЯ 90%
+        // Захват экрана (MediaProjection) — КРИТИЧНО ДЛЯ ПРОХОЖДЕНИЯ 90%
         item {
             Card(
                 modifier = Modifier.fillMaxWidth(),
@@ -1308,11 +1443,7 @@ private fun OnboardingChecklistScreen(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(
-                            text = if (isMirrorOnly) {
-                                "Шаг 4. Захват экрана (MediaProjection) — КРИТИЧНО ДЛЯ 90%"
-                            } else {
-                                "Шаг 5. Захват экрана (MediaProjection) — КРИТИЧНО ДЛЯ 90%"
-                            },
+                            text = "Захват экрана (MediaProjection) — КРИТИЧНО ДЛЯ 90%",
                             style = MaterialTheme.typography.titleMedium,
                             color = colorScheme.onSurface,
                             modifier = Modifier.weight(1f)
@@ -1432,11 +1563,7 @@ private fun OnboardingChecklistScreen(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(
-                            text = if (isMirrorOnly) {
-                                "Шаг 5. Подключение USB-кабеля к ГУ автомобиля"
-                            } else {
-                                "Шаг 6. Подключение USB-кабеля к ГУ автомобиля"
-                            },
+                            text = "Подключение USB-кабеля к ГУ автомобиля",
                             style = MaterialTheme.typography.titleMedium,
                             color = if (step6Active) colorScheme.onSurface else vw.textMuted,
                             modifier = Modifier.weight(1f)
@@ -1513,19 +1640,27 @@ private fun OnboardingChecklistScreen(
 }
 
 @Composable
-private fun ChecklistStepCard(
-    title: String,
-    isCompleted: Boolean,
-    description: String,
-    primaryButtonText: String,
-    testTag: String,
-    onPrimaryClick: () -> Unit,
-    secondaryButtonText: String? = null,
-    onSecondaryClick: (() -> Unit)? = null
+private fun UnifiedAppPermissionsCard(
+    permissions: AppPermissionsSnapshot,
+    onGrantBasicRuntimePermissions: (List<String>) -> Unit,
+    onRequestSingleRuntimePermission: (String) -> Unit,
+    onOpenAccessibilitySettings: () -> Unit,
+    onOpenAppDetailsSettings: () -> Unit,
+    onOpenNotificationListenerSettings: () -> Unit,
+    onRequestOverlayPermission: () -> Unit,
+    onRequestBatteryUnrestricted: () -> Unit,
+    onRequestOrOpenShizuku: () -> Unit
 ) {
     val colorScheme = MaterialTheme.colorScheme
+    val vw = MaterialTheme.vwColors
+    var expandedWhenAllGranted by rememberSaveable { mutableStateOf(false) }
+    val showFullList = !permissions.allGranted || expandedWhenAllGranted
+    val missingRuntime = permissions.missingRuntimePermissions()
+
     Card(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("unified_permissions_card"),
         shape = RoundedCornerShape(14.dp),
         colors = CardDefaults.cardColors(containerColor = colorScheme.surface),
         elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
@@ -1542,88 +1677,326 @@ private fun ChecklistStepCard(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text(
-                    text = title,
-                    style = MaterialTheme.typography.titleMedium,
-                    color = colorScheme.onSurface,
-                    modifier = Modifier.weight(1f)
-                )
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "Разрешения приложения",
+                        style = MaterialTheme.typography.titleMedium,
+                        color = colorScheme.onSurface
+                    )
+                    Text(
+                        text = "Разрешения: ${permissions.grantedCount} из ${permissions.totalCount}",
+                        style = MaterialTheme.typography.labelSmall.tabular(),
+                        color = if (permissions.allGranted) vw.onSuccessContainer else colorScheme.onSurfaceVariant,
+                        modifier = Modifier.testTag("unified_permissions_counter")
+                    )
+                }
                 Spacer(modifier = Modifier.width(8.dp))
-                StatusBadgePill(isCompleted = isCompleted)
+                VwStatusBadge(
+                    label = "${permissions.grantedCount} / ${permissions.totalCount}",
+                    tone = if (permissions.allGranted) VwBadgeTone.ACTIVE else VwBadgeTone.WAITING
+                )
             }
 
-            Text(
-                text = description,
-                style = MaterialTheme.typography.bodyMedium,
-                color = colorScheme.onSurfaceVariant
-            )
-
-            if (isCompleted) {
+            if (permissions.allGranted) {
                 Surface(
                     modifier = Modifier
                         .fillMaxWidth()
                         .heightIn(min = 48.dp)
                         .clip(RoundedCornerShape(10.dp))
-                        .clickable(onClick = onPrimaryClick)
-                        .testTag(testTag),
-                    color = colorScheme.surfaceVariant,
+                        .clickable { expandedWhenAllGranted = !expandedWhenAllGranted }
+                        .testTag("unified_permissions_collapsed_row"),
+                    color = vw.successContainer,
                     shape = RoundedCornerShape(10.dp),
-                    border = BorderStroke(1.dp, colorScheme.outline)
+                    border = BorderStroke(1.dp, vw.statusActiveDot.copy(alpha = 0.35f))
                 ) {
-                    Box(
+                    Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(horizontal = 14.dp, vertical = 12.dp),
-                        contentAlignment = Alignment.CenterStart
+                            .padding(horizontal = 12.dp, vertical = 10.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text(
-                            text = primaryButtonText,
-                            style = MaterialTheme.typography.labelLarge,
-                            color = colorScheme.onSurface
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.CheckCircle,
+                                contentDescription = "Все разрешения выданы",
+                                tint = vw.statusActiveDot,
+                                modifier = Modifier.size(20.dp)
+                            )
+                            Text(
+                                text = "Все разрешения выданы (8/8)",
+                                style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.SemiBold),
+                                color = vw.onSuccessContainer
+                            )
+                        }
+                        Icon(
+                            imageVector = if (expandedWhenAllGranted) {
+                                Icons.Default.KeyboardArrowUp
+                            } else {
+                                Icons.Default.KeyboardArrowDown
+                            },
+                            contentDescription = "Показать список разрешений",
+                            tint = vw.onSuccessContainer
                         )
                     }
                 }
-            } else {
-                Button(
-                    onClick = onPrimaryClick,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(min = 48.dp)
-                        .testTag(testTag),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = colorScheme.primary,
-                        contentColor = colorScheme.onPrimary
-                    ),
-                    shape = RoundedCornerShape(10.dp)
-                ) {
-                    Text(
-                        text = primaryButtonText,
-                        fontWeight = FontWeight.SemiBold
+            }
+
+            AnimatedVisibility(visible = showFullList) {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (missingRuntime.isNotEmpty()) {
+                        FilledTonalButton(
+                            onClick = { onGrantBasicRuntimePermissions(missingRuntime) },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(min = 48.dp)
+                                .testTag("perm_grant_basic_btn"),
+                            shape = RoundedCornerShape(10.dp),
+                            colors = ButtonDefaults.filledTonalButtonColors(
+                                containerColor = colorScheme.primaryContainer,
+                                contentColor = colorScheme.onPrimaryContainer
+                            )
+                        ) {
+                            Text(
+                                text = "Выдать базовые (${missingRuntime.size})",
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
+                    }
+
+                    // 1. Запись аудио (RECORD_AUDIO)
+                    PermissionChecklistItemRow(
+                        title = "1. Запись аудио (RECORD_AUDIO)",
+                        subtitle = "Захват звука медиа для передачи по USB (0x0003)",
+                        granted = permissions.recordAudioGranted,
+                        actionLabel = "Выдать",
+                        testTag = "perm_item_record_audio_btn",
+                        onActionClick = {
+                            onRequestSingleRuntimePermission(Manifest.permission.RECORD_AUDIO)
+                        }
+                    )
+
+                    // 2. Уведомления (POST_NOTIFICATIONS, Android 13+)
+                    val notificationsSubtitle = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        "Стабильная работа USB-сервиса в фоне"
+                    } else {
+                        "Стабильная работа USB-сервиса в фоне (выдано по умолчанию на Android < 13)"
+                    }
+                    PermissionChecklistItemRow(
+                        title = "2. Уведомления (POST_NOTIFICATIONS)",
+                        subtitle = notificationsSubtitle,
+                        granted = permissions.postNotificationsGranted,
+                        actionLabel = "Выдать",
+                        testTag = "perm_item_notifications_btn",
+                        onActionClick = {
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                onRequestSingleRuntimePermission(Manifest.permission.POST_NOTIFICATIONS)
+                            }
+                        }
+                    )
+
+                    // 3. Геолокация (ACCESS_FINE_LOCATION)
+                    PermissionChecklistItemRow(
+                        title = "3. Геолокация (ACCESS_FINE_LOCATION)",
+                        subtitle = "Определение позиции и пробок во встроенных Яндекс Картах",
+                        granted = permissions.fineLocationGranted,
+                        actionLabel = "Выдать",
+                        testTag = "perm_item_location_btn",
+                        onActionClick = {
+                            onRequestSingleRuntimePermission(Manifest.permission.ACCESS_FINE_LOCATION)
+                        }
+                    )
+
+                    // 4. Специальные возможности (AccessibilityService)
+                    PermissionChecklistItemRow(
+                        title = "4. Специальные возможности (Accessibility)",
+                        subtitle = "Управление касаниями с экрана ГУ в режиме Зеркалирования",
+                        granted = permissions.accessibilityEnabled,
+                        actionLabel = "Настроить",
+                        testTag = "perm_item_accessibility_btn",
+                        onActionClick = onOpenAccessibilitySettings,
+                        secondaryLinkLabel = if (!permissions.accessibilityEnabled) {
+                            "О приложении (Android 16: Разрешить ограниченные настройки)"
+                        } else {
+                            null
+                        },
+                        onSecondaryLinkClick = onOpenAppDetailsSettings
+                    )
+
+                    // 5. Доступ к медиаплееру (NotificationListenerService)
+                    PermissionChecklistItemRow(
+                        title = "5. Доступ к медиаплееру (Уведомления)",
+                        subtitle = "Название трека, обложка и кнопки управления плеером",
+                        granted = permissions.notificationListenerGranted,
+                        actionLabel = "Настроить",
+                        testTag = "perm_item_notification_listener_btn",
+                        onActionClick = onOpenNotificationListenerSettings
+                    )
+
+                    // 6. Поверх других окон (SYSTEM_ALERT_WINDOW)
+                    PermissionChecklistItemRow(
+                        title = "6. Поверх других окон (Overlay)",
+                        subtitle = "Постоянная левая панель VW поверх Навигатора (Shizuku)",
+                        granted = permissions.overlayGranted,
+                        actionLabel = "Настроить",
+                        testTag = "perm_item_overlay_btn",
+                        onActionClick = onRequestOverlayPermission
+                    )
+
+                    // 7. Работа без ограничений батареи
+                    PermissionChecklistItemRow(
+                        title = "7. Без ограничений батареи",
+                        subtitle = "Защита от остановки трансляции системой в фоне",
+                        granted = permissions.batteryOptimizationIgnored,
+                        actionLabel = "Настроить",
+                        testTag = "perm_item_battery_btn",
+                        onActionClick = onRequestBatteryUnrestricted
+                    )
+
+                    // 8. Доступ Shizuku
+                    val shizukuSubtitle = when {
+                        permissions.shizukuGranted ->
+                            "Второй экран (Навигатор/2ГИС) и полный экран 16:9"
+                        permissions.shizukuBinderAlive ->
+                            "Второй экран (Навигатор/2ГИС) и полный экран 16:9 • служба активна, нужны права"
+                        else ->
+                            "Второй экран (Навигатор/2ГИС) и полный экран 16:9 • Служба не запущена"
+                    }
+                    PermissionChecklistItemRow(
+                        title = "8. Доступ Shizuku",
+                        subtitle = shizukuSubtitle,
+                        granted = permissions.shizukuGranted,
+                        actionLabel = if (permissions.shizukuBinderAlive) "Выдать" else "Открыть Shizuku",
+                        testTag = "perm_item_shizuku_btn",
+                        useWaitingToneWhenMissing = !permissions.shizukuBinderAlive,
+                        onActionClick = onRequestOrOpenShizuku
                     )
                 }
             }
+        }
+    }
+}
 
-            if (secondaryButtonText != null && onSecondaryClick != null) {
+@Composable
+private fun PermissionChecklistItemRow(
+    title: String,
+    subtitle: String,
+    granted: Boolean,
+    actionLabel: String,
+    testTag: String,
+    useWaitingToneWhenMissing: Boolean = false,
+    onActionClick: () -> Unit,
+    secondaryLinkLabel: String? = null,
+    onSecondaryLinkClick: (() -> Unit)? = null
+) {
+    val colorScheme = MaterialTheme.colorScheme
+    val vw = MaterialTheme.vwColors
+    val indicatorColor = when {
+        granted -> vw.statusActiveDot
+        useWaitingToneWhenMissing -> vw.statusWaitingDot
+        else -> colorScheme.error
+    }
+
+    Surface(
+        color = colorScheme.background,
+        shape = RoundedCornerShape(10.dp),
+        border = BorderStroke(
+            1.dp,
+            if (granted) colorScheme.outline else indicatorColor.copy(alpha = 0.35f)
+        )
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(
+                    modifier = Modifier
+                        .weight(1f)
+                        .padding(end = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(10.dp)
+                            .clip(CircleShape)
+                            .background(indicatorColor)
+                    )
+                    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Text(
+                            text = title,
+                            style = MaterialTheme.typography.labelLarge,
+                            color = colorScheme.onSurface
+                        )
+                        Text(
+                            text = subtitle,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+
+                if (granted) {
+                    Icon(
+                        imageVector = Icons.Default.CheckCircle,
+                        contentDescription = "Выдано",
+                        tint = vw.statusActiveDot,
+                        modifier = Modifier.size(22.dp)
+                    )
+                } else {
+                    FilledTonalButton(
+                        onClick = onActionClick,
+                        modifier = Modifier
+                            .heightIn(min = 48.dp)
+                            .testTag(testTag),
+                        shape = RoundedCornerShape(10.dp),
+                        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp),
+                        colors = ButtonDefaults.filledTonalButtonColors(
+                            containerColor = colorScheme.primaryContainer,
+                            contentColor = colorScheme.onPrimaryContainer
+                        )
+                    ) {
+                        Text(
+                            text = actionLabel,
+                            style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
+                            softWrap = false
+                        )
+                    }
+                }
+            }
+
+            if (secondaryLinkLabel != null && onSecondaryLinkClick != null) {
                 Surface(
                     modifier = Modifier
                         .fillMaxWidth()
                         .heightIn(min = 48.dp)
-                        .clip(RoundedCornerShape(10.dp))
-                        .clickable(onClick = onSecondaryClick)
+                        .clip(RoundedCornerShape(8.dp))
+                        .clickable(onClick = onSecondaryLinkClick)
                         .testTag("${testTag}_secondary"),
                     color = colorScheme.surfaceVariant,
-                    shape = RoundedCornerShape(10.dp),
+                    shape = RoundedCornerShape(8.dp),
                     border = BorderStroke(1.dp, colorScheme.outline)
                 ) {
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(horizontal = 14.dp, vertical = 12.dp),
+                            .padding(horizontal = 12.dp, vertical = 10.dp),
                         contentAlignment = Alignment.CenterStart
                     ) {
                         Text(
-                            text = secondaryButtonText,
-                            style = MaterialTheme.typography.labelMedium,
+                            text = secondaryLinkLabel,
+                            style = MaterialTheme.typography.labelSmall,
                             color = colorScheme.onSurfaceVariant
                         )
                     }
@@ -2031,13 +2404,27 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                         }
                     }
                     AppMode.MIRRORING -> {
-                        CarLifeShizukuManager.unbindUserService(context)
+                        if (!state.isServiceRunning) {
+                            val keepAliveCfg = ScreenKeepAlivePreferences.config.value
+                            val snap = CarLifeShizukuManager.refreshStatus(context)
+                            if ((keepAliveCfg.fillCameraCutoutOnUsb || keepAliveCfg.mirroringAspect16by9Shizuku) &&
+                                snap.isBinderAlive &&
+                                snap.hasPermission
+                            ) {
+                                CarLifeShizukuManager.init(context)
+                                CarLifeShizukuManager.bindUserServiceIfReady(context)
+                            } else {
+                                CarLifeShizukuManager.cleanupAndResetThenUnbind(context)
+                            }
+                        }
                         if (!MediaProjectionTokenStore.hasValidToken.value) {
                             onRequestMediaProjection()
                         }
                     }
                     AppMode.COCKPIT -> {
-                        CarLifeShizukuManager.unbindUserService(context)
+                        if (!state.isServiceRunning) {
+                            CarLifeShizukuManager.cleanupAndResetThenUnbind(context)
+                        }
                     }
                 }
                 if (state.isServiceRunning) {
@@ -2569,11 +2956,16 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
             TouchSensitivitySettingsCard()
         }
 
-        // 4. Экран и питание — работа Зеркалирования и звука 0x0003 при погашенном экране + 1% OLED
+        // 4. Экран и питание — работа Зеркалирования и звука 0x0003 при погашенном экране + 1% OLED + 16:9 Shizuku
         item {
+            val shizukuStatusForMirrorCard by CarLifeShizukuManager.status.collectAsStateWithLifecycle()
+            val isShizukuReadyForMirrorCard = !isMirrorOnly &&
+                shizukuStatusForMirrorCard.isBinderAlive &&
+                shizukuStatusForMirrorCard.hasPermission
             ScreenKeepAliveSettingsCard(
                 keepAliveState = state.screenKeepAliveState,
                 hasOverlayPermission = checklistStatus.step2OverlayGranted,
+                isShizukuReady = isShizukuReadyForMirrorCard,
                 onOpenOverlaySettings = onOpenOverlaySettings,
                 onNotifyServiceConfigChanged = {
                     if (state.isServiceRunning) {
@@ -2581,6 +2973,18 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                             action = BridgeForegroundService.ACTION_UPDATE_SCREEN_KEEP_ALIVE
                         }
                         safeStartService(context, intent)
+                    }
+                },
+                onResetDisplaySizeManual = {
+                    if (state.isServiceRunning) {
+                        val intent = Intent(context, BridgeForegroundService::class.java).apply {
+                            action = BridgeForegroundService.ACTION_RESET_DISPLAY_SIZE
+                        }
+                        safeStartService(context, intent)
+                    } else {
+                        CarLifeShizukuManager.init(context)
+                        CarLifeShizukuManager.bindUserServiceIfReady(context)
+                        CarLifeShizukuManager.resetDisplaySizeAsync(force = true)
                     }
                 }
             )

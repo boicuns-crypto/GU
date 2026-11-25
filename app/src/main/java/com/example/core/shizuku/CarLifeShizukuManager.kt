@@ -57,6 +57,10 @@ object CarLifeShizukuManager {
     var noCutoutOverlayEnabledByBridge: Boolean = false
         private set
 
+    @Volatile
+    var mirroringAspect16by9ModifiedByBridge: Boolean = false
+        private set
+
     private val listenersInitialized = AtomicBoolean(false)
     private val bindingInProgress = AtomicBoolean(false)
     private val asyncExecutor = Executors.newSingleThreadExecutor { runnable ->
@@ -363,6 +367,84 @@ object CarLifeShizukuManager {
         }
     }
 
+    fun setMirroringAspect16by9(onApplied: (() -> Unit)? = null): Boolean {
+        if (mirroringAspect16by9ModifiedByBridge) {
+            onApplied?.invoke()
+            return true
+        }
+        val service = userService ?: return false
+        return runCatching {
+            service.setMirroringAspect16by9()
+            mirroringAspect16by9ModifiedByBridge = true
+            onApplied?.invoke()
+            true
+        }.onFailure { e ->
+            Log.w(TAG, "setMirroringAspect16by9 IPC failed: ${e.message}")
+            handleIpcFailure()
+        }.getOrDefault(false)
+    }
+
+    fun setMirroringAspect16by9Async(onApplied: (() -> Unit)? = null) {
+        if (mirroringAspect16by9ModifiedByBridge) {
+            onApplied?.invoke()
+            return
+        }
+        if (userService == null) return
+        asyncExecutor.execute {
+            setMirroringAspect16by9(onApplied)
+        }
+    }
+
+    fun resetDisplaySize(force: Boolean = false, onReset: (() -> Unit)? = null): Boolean {
+        if (!force && !mirroringAspect16by9ModifiedByBridge) {
+            return true
+        }
+        val service = userService ?: run {
+            if (!force) {
+                mirroringAspect16by9ModifiedByBridge = false
+            }
+            return false
+        }
+        return runCatching {
+            service.resetDisplaySize()
+            mirroringAspect16by9ModifiedByBridge = false
+            onReset?.invoke()
+            true
+        }.onFailure { e ->
+            Log.w(TAG, "resetDisplaySize IPC failed: ${e.message}")
+            if (!force) {
+                mirroringAspect16by9ModifiedByBridge = false
+            }
+            handleIpcFailure()
+        }.getOrDefault(false)
+    }
+
+    fun resetDisplaySizeAsync(force: Boolean = false, onReset: (() -> Unit)? = null) {
+        if (!force && !mirroringAspect16by9ModifiedByBridge) return
+        if (userService == null) {
+            if (!force) mirroringAspect16by9ModifiedByBridge = false
+            return
+        }
+        asyncExecutor.execute {
+            resetDisplaySize(force = force, onReset = onReset)
+        }
+    }
+
+    fun cleanupAndResetThenUnbind(context: Context? = appContext) {
+        val ctx = context?.applicationContext ?: context ?: appContext
+        if (userService == null) {
+            noCutoutOverlayEnabledByBridge = false
+            mirroringAspect16by9ModifiedByBridge = false
+            unbindUserService(ctx)
+            return
+        }
+        asyncExecutor.execute {
+            runCatching { setNoCutoutOverlayEnabled(false) }
+            runCatching { resetDisplaySize(force = false) }
+            unbindUserService(ctx)
+        }
+    }
+
     private fun handleIpcFailure() {
         val ctx = appContext
         val binder = runCatching { userService?.asBinder() }.getOrNull()
@@ -424,6 +506,7 @@ object CarLifeShizukuManager {
         userService = null
         autoBindWhenReady = false
         noCutoutOverlayEnabledByBridge = false
+        mirroringAspect16by9ModifiedByBridge = false
         bindingInProgress.set(false)
         _status.value = ShizukuStatusState()
     }
