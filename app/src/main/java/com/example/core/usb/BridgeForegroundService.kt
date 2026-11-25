@@ -2250,7 +2250,7 @@ class BridgeForegroundService : Service() {
             is UsbTransportState.Error ->
                 state.reason
             UsbTransportState.Disconnected ->
-                "Standby — Ready for Jetta VS7 (MQB) Baidu CarLife Head Unit"
+                "JETTA Connect — ожидание USB-подключения к ГУ Jetta VS7 (CarLife)"
         }
 
         return NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)

@@ -20,7 +20,7 @@ object AppEditionConfig {
         get() = if (isMirrorOnly) "Mirror Only" else "Full"
 
     val appDisplayName: String
-        get() = if (isMirrorOnly) "Jetta Mirror" else "Jetta VS7"
+        get() = if (isMirrorOnly) "Jetta Mirror" else "JETTA Connect"
 
     @VisibleForTesting
     internal fun setMirrorOnlyOverrideForTesting(override: Boolean?) {

@@ -22,6 +22,6 @@ dependencyResolutionManagement {
   }
 }
 
-rootProject.name = "Jetta VS7"
+rootProject.name = "JETTA Connect"
 
 include(":app")

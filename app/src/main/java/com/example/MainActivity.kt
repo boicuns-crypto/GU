@@ -137,6 +137,7 @@ import com.example.feature.cockpit.CarLifeLauncherRepository
 import com.example.feature.cockpit.MediaPlayerController
 import com.example.feature.cockpit.MediaState
 import com.example.protocol.carlife.CarLifeChannel
+import com.example.ui.guide.SetupGuideScreen
 import com.example.ui.settings.ScreenKeepAliveSettingsCard
 import com.example.ui.settings.TouchSensitivitySettingsCard
 import com.example.ui.theme.CockpitIcons
@@ -677,6 +678,7 @@ fun CarLifeBridgeApp(
     // Mirror-Only Edition: 1 = «Подключение» (default), 2 = «Настройки»
     var selectedTab by rememberSaveable { mutableIntStateOf(if (isMirrorOnly) 1 else 0) }
     val effectiveSelectedTab = if (isMirrorOnly && selectedTab == 0) 1 else selectedTab
+    var showSetupGuide by rememberSaveable { mutableStateOf(false) }
 
     var configuredWidth by rememberSaveable { mutableIntStateOf(1280) }
     var configuredHeight by rememberSaveable { mutableIntStateOf(720) }
@@ -794,6 +796,13 @@ fun CarLifeBridgeApp(
         modifier = Modifier.fillMaxSize(),
         containerColor = colorScheme.background,
         contentWindowInsets = WindowInsets.safeDrawing,
+        topBar = {
+            VwPhoneTopBar(
+                isUsbConnected = runtimeState.transportState is UsbTransportState.Connected,
+                isMirrorOnly = isMirrorOnly,
+                onOpenGuide = { showSetupGuide = true }
+            )
+        },
         bottomBar = {
             if (!isLandscape) {
                 Surface(
@@ -1063,11 +1072,30 @@ fun CarLifeBridgeApp(
                         onStartProjection = onStartProjection,
                         onStopProjection = onStopProjection,
                         onRequestMediaProjection = onRequestMediaProjection,
-                        onRequestRecordAudioPermission = onRequestRecordAudioPermission
+                        onRequestRecordAudioPermission = onRequestRecordAudioPermission,
+                        onOpenSetupGuide = { showSetupGuide = true }
                     )
                 }
             }
         }
+    }
+
+    if (showSetupGuide) {
+        SetupGuideScreen(
+            onDismiss = { showSetupGuide = false },
+            onOpenConnectionTab = { selectedTab = 1 },
+            onOpenSettingsTab = { selectedTab = 2 },
+            onOpenAppDetailsSettings = { openAppDetailsSettings(context) },
+            onOpenAccessibilitySettings = {
+                CarLifeAccessibilityService.openAccessibilitySettings(context)
+            },
+            onOpenNotificationListenerSettings = {
+                MediaPlayerController.openNotificationListenerSettings(context)
+            },
+            onOpenDisplaySettings = { openDisplaySettings(context) },
+            onOpenShizuku = { openShizukuAppOrPage(context) },
+            onOpenDeveloperSettings = { openDeveloperSettings(context) }
+        )
     }
 }
 
@@ -1131,6 +1159,135 @@ private fun openShizukuAppOrPage(context: Context) {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
             context.startActivity(webIntent)
+        }
+    }
+}
+
+private fun openDisplaySettings(context: Context) {
+    runCatching {
+        val intent = Intent(Settings.ACTION_DISPLAY_SETTINGS).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        context.startActivity(intent)
+    }.onFailure {
+        runCatching {
+            context.startActivity(
+                Intent(Settings.ACTION_SETTINGS).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+            )
+        }
+    }
+}
+
+private fun openDeveloperSettings(context: Context) {
+    runCatching {
+        val intent = Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        context.startActivity(intent)
+    }.onFailure {
+        runCatching {
+            context.startActivity(
+                Intent(Settings.ACTION_SETTINGS).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+            )
+        }
+    }
+}
+
+@Composable
+private fun VwPhoneTopBar(
+    isUsbConnected: Boolean,
+    isMirrorOnly: Boolean,
+    onOpenGuide: () -> Unit
+) {
+    val colorScheme = MaterialTheme.colorScheme
+    val vw = MaterialTheme.vwColors
+
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("vw_phone_top_bar"),
+        color = colorScheme.surface,
+        shadowElevation = 0.dp
+    ) {
+        Column(modifier = Modifier.fillMaxWidth()) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 52.dp)
+                    .padding(horizontal = 16.dp, vertical = 6.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(9.dp)
+                            .clip(CircleShape)
+                            .background(if (isUsbConnected) vw.statusActiveDot else vw.accentBlue)
+                    )
+                    Text(
+                        text = "JETTA Connect",
+                        style = MaterialTheme.typography.titleMedium.copy(
+                            fontWeight = FontWeight.Bold,
+                            letterSpacing = 0.2.sp
+                        ),
+                        color = colorScheme.onSurface,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.testTag("topbar_app_title")
+                    )
+                    if (isMirrorOnly) {
+                        VwStatusBadge(
+                            label = "Mirror",
+                            tone = VwBadgeTone.WAITING
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.width(8.dp))
+
+                FilledTonalButton(
+                    onClick = onOpenGuide,
+                    modifier = Modifier
+                        .heightIn(min = 48.dp)
+                        .testTag("topbar_guide_btn"),
+                    shape = RoundedCornerShape(10.dp),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
+                    colors = ButtonDefaults.filledTonalButtonColors(
+                        containerColor = colorScheme.primaryContainer,
+                        contentColor = colorScheme.onPrimaryContainer
+                    )
+                ) {
+                    Icon(
+                        imageVector = CockpitIcons.HelpOutline,
+                        contentDescription = "Открыть инструкцию",
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = "Инструкция",
+                        style = MaterialTheme.typography.labelLarge.copy(
+                            fontWeight = FontWeight.SemiBold
+                        ),
+                        maxLines = 1
+                    )
+                }
+            }
+
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(1.dp)
+                    .background(colorScheme.outline)
+            )
         }
     }
 }
@@ -1334,7 +1491,7 @@ private fun OnboardingChecklistScreen(
         contentPadding = PaddingValues(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        // Заголовочная карточка мастера настройки Jetta VS7
+        // Заголовочная карточка мастера настройки JETTA Connect
         item {
             Card(
                 modifier = Modifier.fillMaxWidth(),
@@ -1357,9 +1514,9 @@ private fun OnboardingChecklistScreen(
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
                                 text = if (isMirrorOnly) {
-                                    "JETTA MIRROR • ЗЕРКАЛИРОВАНИЕ"
+                                    "JETTA Connect • ЗЕРКАЛИРОВАНИЕ"
                                 } else {
-                                    "JETTA VS7 • ПОДКЛЮЧЕНИЕ"
+                                    "JETTA Connect • ПОДКЛЮЧЕНИЕ"
                                 },
                                 style = MaterialTheme.typography.labelSmall.copy(
                                     fontWeight = FontWeight.Bold,
@@ -1371,7 +1528,7 @@ private fun OnboardingChecklistScreen(
                                 text = if (isMirrorOnly) {
                                     "Мастер настройки Зеркалирования"
                                 } else {
-                                    "Мастер настройки CarLife"
+                                    "Мастер настройки JETTA Connect"
                                 },
                                 style = MaterialTheme.typography.titleMedium,
                                 color = colorScheme.onSurface
@@ -1580,7 +1737,7 @@ private fun OnboardingChecklistScreen(
                     }
 
                     Text(
-                        text = "Подключите телефон кабелем к USB-порту автомобиля и нажмите на всплывающем окне «ОК» (всегда открывать при подключении CarLife).",
+                        text = "Подключите телефон кабелем к USB-порту автомобиля и нажмите на всплывающем окне «ОК» (всегда открывать JETTA Connect при подключении).",
                         style = MaterialTheme.typography.bodyMedium,
                         color = if (step6Active) colorScheme.onSurfaceVariant else vw.textMuted
                     )
@@ -1814,7 +1971,7 @@ private fun UnifiedAppPermissionsCard(
                     // 4. Специальные возможности (AccessibilityService)
                     PermissionChecklistItemRow(
                         title = "4. Специальные возможности (Accessibility)",
-                        subtitle = "Управление касаниями с экрана ГУ в режиме Зеркалирования",
+                        subtitle = "Включите «JETTA Connect (Управление экраном)» для касаний с ГУ",
                         granted = permissions.accessibilityEnabled,
                         actionLabel = "Настроить",
                         testTag = "perm_item_accessibility_btn",
@@ -2044,7 +2201,8 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
     onStartProjection: (Int, Int, Int) -> Unit,
     onStopProjection: () -> Unit,
     onRequestMediaProjection: () -> Unit = {},
-    onRequestRecordAudioPermission: () -> Unit = {}
+    onRequestRecordAudioPermission: () -> Unit = {},
+    onOpenSetupGuide: () -> Unit = {}
 ) {
     val context = LocalContext.current
     val colorScheme = MaterialTheme.colorScheme
@@ -2114,6 +2272,32 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                         VwStatusBadge(
                             label = activeThemeMode.label,
                             tone = VwBadgeTone.WAITING
+                        )
+                    }
+
+                    // Быстрый переход к встроенной инструкции из раздела «Настройки»
+                    OutlinedButton(
+                        onClick = onOpenSetupGuide,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 48.dp)
+                            .testTag("settings_guide_btn"),
+                        shape = RoundedCornerShape(10.dp),
+                        border = BorderStroke(1.dp, vw.accentBlue.copy(alpha = 0.5f))
+                    ) {
+                        Icon(
+                            imageVector = CockpitIcons.MenuBook,
+                            contentDescription = "Инструкция по подключению и настройке",
+                            tint = vw.accentBlue,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "Инструкция по подключению и настройке (6 шагов)",
+                            color = colorScheme.primary,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
                         )
                     }
 

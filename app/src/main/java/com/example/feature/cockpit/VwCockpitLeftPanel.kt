@@ -128,45 +128,23 @@ fun VwCockpitLeftPanel(
                 .padding(horizontal = 12.dp, vertical = 12.dp),
             verticalArrangement = Arrangement.SpaceBetween
         ) {
-            // 1. Top block: JETTA VS7 badge + Day/Night button + crisp tabular clock
+            // 1. Top block: Crisp tabular clock + Day/Night button, with JETTA Connect badge underneath
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Surface(
-                        color = colorScheme.surfaceVariant,
-                        shape = RoundedCornerShape(8.dp),
-                        border = BorderStroke(1.dp, colorScheme.outline)
-                    ) {
-                        Row(
-                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(5.dp)
-                        ) {
-                            Box(
-                                modifier = Modifier
-                                    .size(6.dp)
-                                    .clip(CircleShape)
-                                    .background(
-                                        if (virtualDisplayId != Display.DEFAULT_DISPLAY) {
-                                            vw.statusActiveDot
-                                        } else {
-                                            vw.accentBlue
-                                        }
-                                    )
-                            )
-                            Text(
-                                text = "JETTA VS7",
-                                style = MaterialTheme.typography.labelSmall.copy(
-                                    fontWeight = FontWeight.Bold,
-                                    letterSpacing = 0.8.sp
-                                ),
-                                color = colorScheme.primary
-                            )
-                        }
-                    }
+                    Text(
+                        text = currentTime,
+                        style = MaterialTheme.typography.displaySmall.copy(
+                            fontSize = 36.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            fontFeatureSettings = "tnum"
+                        ),
+                        color = colorScheme.onSurface,
+                        modifier = Modifier.testTag("dock_clock_text")
+                    )
 
                     // Compact Day/Night theme switcher (48.dp touch target for easy driving tap)
                     IconButton(
@@ -190,16 +168,41 @@ fun VwCockpitLeftPanel(
                     }
                 }
 
-                Text(
-                    text = currentTime,
-                    style = MaterialTheme.typography.displaySmall.copy(
-                        fontSize = 36.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        fontFeatureSettings = "tnum"
-                    ),
-                    color = colorScheme.onSurface,
-                    modifier = Modifier.testTag("dock_clock_text")
-                )
+                Surface(
+                    modifier = Modifier.testTag("dock_brand_badge"),
+                    color = colorScheme.surfaceVariant,
+                    shape = RoundedCornerShape(8.dp),
+                    border = BorderStroke(1.dp, colorScheme.outline)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 9.dp, vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(6.dp)
+                                .clip(CircleShape)
+                                .background(
+                                    if (virtualDisplayId != Display.DEFAULT_DISPLAY) {
+                                        vw.statusActiveDot
+                                    } else {
+                                        vw.accentBlue
+                                    }
+                                )
+                        )
+                        Text(
+                            text = "JETTA Connect",
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                fontWeight = FontWeight.Bold,
+                                letterSpacing = 0.6.sp
+                            ),
+                            color = colorScheme.primary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
 
                 // Thin VW Electric Blue accent line
                 Box(

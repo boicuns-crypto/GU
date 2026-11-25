@@ -885,9 +885,9 @@ private fun CompactTopDockBar(
                     ) {
                         Text(
                             text = if (virtualDisplayId != Display.DEFAULT_DISPLAY) {
-                                "JETTA VS7 • VD #$virtualDisplayId"
+                                "JETTA Connect • VD #$virtualDisplayId"
                             } else {
-                                "JETTA VS7"
+                                "JETTA Connect"
                             },
                             style = MaterialTheme.typography.labelSmall.copy(
                                 fontWeight = FontWeight.Bold,
@@ -990,7 +990,7 @@ private fun InstalledAppsGridPanel(
                 .padding(14.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            // VW MIB3 Header: «Jetta VS7 • Приложения» + filter chips + refresh
+            // VW MIB3 Header: «JETTA Connect • Приложения» + filter chips + refresh
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -998,7 +998,7 @@ private fun InstalledAppsGridPanel(
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
-                        text = "Jetta VS7 • Приложения",
+                        text = "JETTA Connect • Приложения",
                         style = MaterialTheme.typography.titleMedium.copy(
                             fontWeight = FontWeight.SemiBold
                         ),

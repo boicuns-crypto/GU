@@ -1776,7 +1776,7 @@ class CockpitProjectionManager(
         canvas.drawRoundRect(gridPanelRect, 20f * scale, 20f * scale, borderPaint)
 
         canvas.drawText(
-            "CarLife Кокпит • Приложения смартфона",
+            "JETTA Connect • Приложения",
             gridPanelRect.left + 18f * scale,
             gridPanelRect.top + 36f * scale,
             titlePaint

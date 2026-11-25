@@ -53,6 +53,7 @@ import com.example.feature.cockpit.InstalledAppInfo
 import com.example.feature.cockpit.MediaPlayerController
 import com.example.feature.cockpit.MediaState
 import com.example.feature.cockpit.VW_LEFT_PANEL_WIDTH_PX
+import com.example.ui.guide.SetupGuideCatalog
 import com.example.ui.theme.ThemeMode
 import com.example.ui.theme.ThemePreferences
 import com.example.ui.theme.VwDarkColorScheme
@@ -76,7 +77,7 @@ class ExampleRobolectricTest {
   fun `read string from context`() {
     val context = ApplicationProvider.getApplicationContext<Context>()
     val appName = context.getString(R.string.app_name)
-    assertEquals("Jetta VS7", appName)
+    assertEquals("JETTA Connect", appName)
   }
 
   @Test
@@ -676,7 +677,10 @@ class ExampleRobolectricTest {
     assertTrue(drawnTexts.any { it.contains("РЕЖИМ ЗЕРКАЛИРОВАНИЯ ЭКРАНА") })
     assertTrue(drawnTexts.any { it.contains("MediaProjection: Нет токена Весь экран") })
     assertTrue(drawnTexts.any { it.contains("Откат в Кокпит отключён") })
-    assertFalse("Must never draw Cockpit Launcher header in Mirroring mode", drawnTexts.any { it.contains("CarLife Кокпит") })
+    assertFalse(
+      "Must never draw Cockpit Launcher header in Mirroring mode",
+      drawnTexts.any { it.contains("JETTA Connect • Приложения") || it.contains("CarLife Кокпит") }
+    )
     assertEquals(AppMode.MIRRORING, manager.appMode)
 
     bitmap.recycle()
@@ -1761,6 +1765,40 @@ class ExampleRobolectricTest {
     assertEquals(8, complete.grantedCount)
     assertTrue(complete.allGranted)
     assertTrue(complete.missingRuntimePermissions(sdkInt = 35).isEmpty())
+  }
+
+  @Test
+  fun `JETTA Connect branding resources and Edition display name match specification`() {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    assertEquals("JETTA Connect", context.getString(R.string.app_name))
+    assertEquals("JETTA Connect", context.getString(R.string.notif_title_active))
+    assertEquals(
+      "JETTA Connect (Управление экраном)",
+      context.getString(R.string.accessibility_service_label)
+    )
+
+    try {
+      AppEditionConfig.setMirrorOnlyOverrideForTesting(false)
+      assertEquals("JETTA Connect", AppEditionConfig.appDisplayName)
+    } finally {
+      AppEditionConfig.setMirrorOnlyOverrideForTesting(null)
+    }
+  }
+
+  @Test
+  fun `SetupGuideCatalog provides 6 VW MIB3 steps and returns 0 when optional drawable screenshots are absent`() {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    val steps = SetupGuideCatalog.steps
+    assertEquals(6, steps.size)
+    assertEquals((1..6).toList(), steps.map { it.stepNumber })
+    assertEquals(
+      (1..6).map { "guide_step_$it" },
+      steps.map { it.drawableName }
+    )
+    assertTrue(steps.all { it.badge.isNotBlank() && it.title.isNotBlank() && it.summary.isNotBlank() && it.highlights.isNotEmpty() })
+    assertEquals(0, SetupGuideCatalog.resolveOptionalGuideDrawableId(context, 0))
+    assertEquals(0, SetupGuideCatalog.resolveOptionalGuideDrawableId(context, 1))
+    assertEquals(0, SetupGuideCatalog.resolveOptionalGuideDrawableId(context, 7))
   }
 }
 
