@@ -77,6 +77,7 @@ import com.example.feature.cockpit.CockpitUiStateController
 import com.example.feature.cockpit.MediaControllerRepository
 import com.example.feature.cockpit.MediaPlayerController
 import com.example.feature.cockpit.VW_LEFT_PANEL_WIDTH_PX
+import com.example.feature.cockpit.computeVwLeftPanelWidthPx
 import com.example.protocol.carlife.CarLifeFrameCodec
 import com.example.protocol.carlife.CarLifeHardKey
 import com.example.protocol.carlife.CarLifeTouchDecoder
@@ -543,7 +544,9 @@ class CockpitProjectionManager(
         isShizukuLauncherGridVisible = false
         runCatching { cockpitPresentation?.hide() }
         val display = virtualDisplay?.display ?: return
+        val widthPx = _stats.value.width.coerceAtLeast(DEFAULT_WIDTH)
         val heightPx = _stats.value.height.coerceAtLeast(DEFAULT_HEIGHT)
+        val leftPanelWidthPx = computeVwLeftPanelWidthPx(widthPx)
         val overlay = shizukuLeftPanelOverlay ?: ShizukuLeftPanelOverlay(
             appContext = appContext,
             onHomeClick = {
@@ -560,7 +563,7 @@ class CockpitProjectionManager(
         ).also { shizukuLeftPanelOverlay = it }
         overlay.show(
             display = display,
-            panelWidthPx = VW_LEFT_PANEL_WIDTH_PX,
+            panelWidthPx = leftPanelWidthPx,
             displayHeightPx = heightPx
         )
     }
@@ -2077,6 +2080,8 @@ class CockpitProjectionManager(
                         lastKnownScreenSize = it
                     }
                 }
+                val captureW = currentStats.width.takeIf { it > 0 }?.toFloat() ?: huTouchMaxX
+                val captureH = currentStats.height.takeIf { it > 0 }?.toFloat() ?: huTouchMaxY
                 val mapped = CarLifeAccessibilityService.mapHuTouchToPhysicalScreenDetailed(
                     rawX = packet.rawX,
                     rawY = packet.rawY,
@@ -2084,7 +2089,9 @@ class CockpitProjectionManager(
                     huHeight = huTouchMaxY,
                     screenWidth = screenW,
                     screenHeight = screenH,
-                    applyEdgeGuard = touchCfg.edgeBackGuardEnabled
+                    applyEdgeGuard = touchCfg.edgeBackGuardEnabled,
+                    captureWidth = captureW,
+                    captureHeight = captureH
                 )
                 val orientLabel = if (mapped.isLandscape) "Landscape" else "Portrait"
 
@@ -2176,11 +2183,12 @@ class CockpitProjectionManager(
                     lastShizukuMoveY = Float.NaN
                 }
 
+                val leftPanelWidthPx = computeVwLeftPanelWidthPx(targetWidth).toFloat()
                 val nowUptime = SystemClock.uptimeMillis()
                 val downTime = when (packet.androidAction) {
                     MotionEvent.ACTION_DOWN -> {
                         lastDownTime.set(nowUptime)
-                        shizukuTouchDownInLeftPanel = scaledX < VW_LEFT_PANEL_WIDTH_PX.toFloat()
+                        shizukuTouchDownInLeftPanel = scaledX < leftPanelWidthPx
                         nowUptime
                     }
                     MotionEvent.ACTION_MOVE,
@@ -2196,7 +2204,7 @@ class CockpitProjectionManager(
                 }
                 val eventTime = maxOf(downTime, nowUptime)
                 val routeToLeftPanel = shizukuTouchDownInLeftPanel ||
-                    (packet.androidAction == MotionEvent.ACTION_DOWN && scaledX < VW_LEFT_PANEL_WIDTH_PX.toFloat())
+                    (packet.androidAction == MotionEvent.ACTION_DOWN && scaledX < leftPanelWidthPx)
                 if (packet.androidAction == MotionEvent.ACTION_UP || packet.androidAction == MotionEvent.ACTION_CANCEL) {
                     shizukuTouchDownInLeftPanel = false
                 }

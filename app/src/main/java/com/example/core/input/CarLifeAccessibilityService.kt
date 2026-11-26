@@ -710,9 +710,13 @@ class CarLifeAccessibilityService : AccessibilityService() {
         }
 
         /**
-         * Detailed Head Unit (`1280×720`) -> physical smartphone screen mapping that also reports
-         * whether the touch landed inside the active projected area (excluding pillarbox/letterbox black bars)
-         * and guards horizontal edge taps against accidentally triggering Samsung One UI back-swipe gestures.
+         * Detailed Head Unit (`1280×720`, `800×480`, `1024×800`, etc.) -> physical smartphone screen mapping
+         * that also reports whether the touch landed inside the active projected area (excluding pillarbox/letterbox
+         * black bars) and guards horizontal edge taps against accidentally triggering Samsung One UI back-swipe gestures.
+         *
+         * When [captureWidth] and [captureHeight] are specified (e.g. `800×480` = `5:3` or `1024×800` = `5:4`),
+         * letterbox/pillarbox margins are computed against the actual `VirtualDisplay` video stream geometry,
+         * even if the Head Unit touch controller normalizes raw touches to `1280×720`.
          */
         fun mapHuTouchToPhysicalScreenDetailed(
             rawX: Int,
@@ -721,30 +725,39 @@ class CarLifeAccessibilityService : AccessibilityService() {
             huHeight: Float = 720f,
             screenWidth: Int,
             screenHeight: Int,
-            applyEdgeGuard: Boolean = true
+            applyEdgeGuard: Boolean = true,
+            captureWidth: Float = huWidth,
+            captureHeight: Float = huHeight
         ): MappedPhysicalTouch {
             val safeHuW = huWidth.coerceAtLeast(1f)
             val safeHuH = huHeight.coerceAtLeast(1f)
+            val safeCaptureW = captureWidth.takeIf { it > 0f } ?: safeHuW
+            val safeCaptureH = captureHeight.takeIf { it > 0f } ?: safeHuH
             val safeScreenW = screenWidth.coerceAtLeast(1).toFloat()
             val safeScreenH = screenHeight.coerceAtLeast(1).toFloat()
 
-            // MediaProjection AUTO_MIRROR fits the phone screen inside huWidth x huHeight preserving aspect ratio.
-            val scale = minOf(safeHuW / safeScreenW, safeHuH / safeScreenH)
+            // Convert raw Head Unit coordinates into the actual VirtualDisplay capture coordinate space.
+            // When captureWidth == huWidth and captureHeight == huHeight (e.g. 1280x720), captureX == rawX and captureY == rawY.
+            val captureX = rawX.toFloat() * (safeCaptureW / safeHuW)
+            val captureY = rawY.toFloat() * (safeCaptureH / safeHuH)
+
+            // MediaProjection AUTO_MIRROR fits the phone screen inside safeCaptureW x safeCaptureH preserving aspect ratio.
+            val scale = minOf(safeCaptureW / safeScreenW, safeCaptureH / safeScreenH)
             val drawnW = (safeScreenW * scale).coerceAtLeast(1f)
             val drawnH = (safeScreenH * scale).coerceAtLeast(1f)
-            val offsetX = (safeHuW - drawnW) / 2f
-            val offsetY = (safeHuH - drawnH) / 2f
+            val offsetX = (safeCaptureW - drawnW) / 2f
+            val offsetY = (safeCaptureH - drawnH) / 2f
 
             // Allow a small 6 px forgiveness band around the active image border while rejecting deep black bars
             val borderTolerancePx = 6f
-            val isInsideX = rawX.toFloat() >= (offsetX - borderTolerancePx) &&
-                rawX.toFloat() <= (offsetX + drawnW + borderTolerancePx)
-            val isInsideY = rawY.toFloat() >= (offsetY - borderTolerancePx) &&
-                rawY.toFloat() <= (offsetY + drawnH + borderTolerancePx)
+            val isInsideX = captureX >= (offsetX - borderTolerancePx) &&
+                captureX <= (offsetX + drawnW + borderTolerancePx)
+            val isInsideY = captureY >= (offsetY - borderTolerancePx) &&
+                captureY <= (offsetY + drawnH + borderTolerancePx)
             val isInsideActiveArea = isInsideX && isInsideY
 
-            val normX = ((rawX.toFloat() - offsetX) / drawnW).coerceIn(0f, 1f)
-            val normY = ((rawY.toFloat() - offsetY) / drawnH).coerceIn(0f, 1f)
+            val normX = ((captureX - offsetX) / drawnW).coerceIn(0f, 1f)
+            val normY = ((captureY - offsetY) / drawnH).coerceIn(0f, 1f)
 
             val maxX = (safeScreenW - 1f).coerceAtLeast(0f)
             val maxY = (safeScreenH - 1f).coerceAtLeast(0f)
@@ -769,7 +782,7 @@ class CarLifeAccessibilityService : AccessibilityService() {
          * Maps Head Unit touch coordinates (`rawX`, `rawY` in `huWidth × huHeight`, default `1280×720`)
          * into real physical smartphone screen coordinates (`screenWidth × screenHeight`), accounting
          * for current orientation (landscape / portrait) and Android `MediaProjection` aspect-preserving
-         * centering (letterbox/pillarbox) inside the `1280×720` capture surface.
+         * centering (letterbox/pillarbox) inside the capture surface.
          */
         fun mapHuTouchToPhysicalScreen(
             rawX: Int,
@@ -777,7 +790,9 @@ class CarLifeAccessibilityService : AccessibilityService() {
             huWidth: Float = 1280f,
             huHeight: Float = 720f,
             screenWidth: Int,
-            screenHeight: Int
+            screenHeight: Int,
+            captureWidth: Float = huWidth,
+            captureHeight: Float = huHeight
         ): Pair<Float, Float> {
             val mapped = mapHuTouchToPhysicalScreenDetailed(
                 rawX = rawX,
@@ -786,7 +801,9 @@ class CarLifeAccessibilityService : AccessibilityService() {
                 huHeight = huHeight,
                 screenWidth = screenWidth,
                 screenHeight = screenHeight,
-                applyEdgeGuard = false
+                applyEdgeGuard = false,
+                captureWidth = captureWidth,
+                captureHeight = captureHeight
             )
             return mapped.x to mapped.y
         }

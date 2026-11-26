@@ -1969,12 +1969,14 @@ class BridgeForegroundService : Service() {
                 lastHuConfirmationSource = "0x0006 Touch/HardKey"
                 huConfirmationSeq.incrementAndGet()
                 val projStats = projectionManager.stats.value
+                val activeTargetW = projStats.width.coerceAtLeast(1)
+                val activeTargetH = projStats.height.coerceAtLeast(1)
                 val decodedEvent = CarLifeTouchDecoder.decodeTouchChannelFrame(
                     frame = frame,
-                    targetWidth = projStats.width.coerceAtLeast(1),
-                    targetHeight = projStats.height.coerceAtLeast(1),
-                    defaultHuWidth = CarLifeTouchDecoder.DEFAULT_HU_TOUCH_MAX_X.toInt(),
-                    defaultHuHeight = CarLifeTouchDecoder.DEFAULT_HU_TOUCH_MAX_Y.toInt()
+                    targetWidth = activeTargetW,
+                    targetHeight = activeTargetH,
+                    defaultHuWidth = activeTargetW,
+                    defaultHuHeight = activeTargetH
                 )
                 when (decodedEvent) {
                     is CarLifeInputEvent.Touch -> {

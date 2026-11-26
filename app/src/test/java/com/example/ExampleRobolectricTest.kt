@@ -1900,7 +1900,88 @@ class ExampleRobolectricTest {
     )
     assertTrue(shizukuReady.allMandatoryReady)
   }
+
+  @Test
+  fun `touch mapping accurately handles 800x480 and 1024x800 letterbox and adaptive left panel while keeping 1280x720 unchanged`() {
+    // 1. Adaptive left panel width: 1280x720 stays strictly 250px, 1024x800 uses 220px, 800x480 uses 190px
+    assertEquals(250, com.example.feature.cockpit.computeVwLeftPanelWidthPx(1280))
+    assertEquals(220, com.example.feature.cockpit.computeVwLeftPanelWidthPx(1024))
+    assertEquals(190, com.example.feature.cockpit.computeVwLeftPanelWidthPx(800))
+
+    // 2. Mirroring letterbox calculation on S26 Ultra (3120x1440, 19.5:9) when HU sends 1280x720 normalized touch coordinates
+    // while VirtualDisplay is streaming at 1024x800 (5:4) or 800x480 (5:3):
+    // In 1024x800, drawnH = 1440 * (1024 / 3120) = 472.615 px -> offsetY = (800 - 472.615) / 2 = 163.69 px (20.46% of height).
+    // In 1280x720 HU space, 20.46% of 720 = 147.3 px. A tap at rawY = 100 (13.9% from top) is inside the top black bar in 1024x800!
+    val mirror1024x800BlackBarTap = CarLifeAccessibilityService.mapHuTouchToPhysicalScreenDetailed(
+      rawX = 640,
+      rawY = 100,
+      huWidth = 1280f,
+      huHeight = 720f,
+      screenWidth = 3120,
+      screenHeight = 1440,
+      applyEdgeGuard = false,
+      captureWidth = 1024f,
+      captureHeight = 800f
+    )
+    assertFalse(
+      "rawY=100 out of 720 is inside the 20.5% letterbox bar of a 1024x800 VirtualDisplay",
+      mirror1024x800BlackBarTap.isInsideActiveArea
+    )
+
+    // Center tap (640, 360) must always map to exact center (1560, 720) across 1280x720, 1024x800, and 800x480
+    val center1024x800 = CarLifeAccessibilityService.mapHuTouchToPhysicalScreenDetailed(
+      rawX = 640,
+      rawY = 360,
+      huWidth = 1280f,
+      huHeight = 720f,
+      screenWidth = 3120,
+      screenHeight = 1440,
+      applyEdgeGuard = false,
+      captureWidth = 1024f,
+      captureHeight = 800f
+    )
+    assertTrue(center1024x800.isInsideActiveArea)
+    assertEquals(1560f, center1024x800.x, 1.5f)
+    assertEquals(720f, center1024x800.y, 1.5f)
+
+    val center800x480 = CarLifeAccessibilityService.mapHuTouchToPhysicalScreenDetailed(
+      rawX = 400,
+      rawY = 240,
+      huWidth = 800f,
+      huHeight = 480f,
+      screenWidth = 3120,
+      screenHeight = 1440,
+      applyEdgeGuard = false,
+      captureWidth = 800f,
+      captureHeight = 480f
+    )
+    assertTrue(center800x480.isInsideActiveArea)
+    assertEquals(1560f, center800x480.x, 1.5f)
+    assertEquals(720f, center800x480.y, 1.5f)
+
+    // 3. 1280x720 behavior remains 100% identical
+    val legacy1280 = CarLifeAccessibilityService.mapHuTouchToPhysicalScreenDetailed(
+      rawX = 640,
+      rawY = 360,
+      huWidth = 1280f,
+      huHeight = 720f,
+      screenWidth = 3120,
+      screenHeight = 1440,
+      applyEdgeGuard = false
+    )
+    val explicit1280 = CarLifeAccessibilityService.mapHuTouchToPhysicalScreenDetailed(
+      rawX = 640,
+      rawY = 360,
+      huWidth = 1280f,
+      huHeight = 720f,
+      screenWidth = 3120,
+      screenHeight = 1440,
+      applyEdgeGuard = false,
+      captureWidth = 1280f,
+      captureHeight = 720f
+    )
+    assertEquals(legacy1280.x, explicit1280.x, 0.001f)
+    assertEquals(legacy1280.y, explicit1280.y, 0.001f)
+    assertEquals(legacy1280.isInsideActiveArea, explicit1280.isInsideActiveArea)
+  }
 }
-
-
-

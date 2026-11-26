@@ -3800,25 +3800,32 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
 
                     Row(
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
                         SelectableOptionButton(
                             label = "800 × 480",
-                            selected = configuredWidth == 800,
+                            selected = configuredWidth == 800 && configuredHeight == 480,
                             testTag = "res_480p_btn",
                             onClick = { onSelectResolution(800, 480) },
                             modifier = Modifier.weight(1f)
                         )
                         SelectableOptionButton(
                             label = "1024 × 600",
-                            selected = configuredWidth == 1024,
+                            selected = configuredWidth == 1024 && configuredHeight == 600,
                             testTag = "res_600p_btn",
                             onClick = { onSelectResolution(1024, 600) },
                             modifier = Modifier.weight(1f)
                         )
                         SelectableOptionButton(
+                            label = "1024 × 800",
+                            selected = configuredWidth == 1024 && configuredHeight == 800,
+                            testTag = "res_800p_btn",
+                            onClick = { onSelectResolution(1024, 800) },
+                            modifier = Modifier.weight(1f)
+                        )
+                        SelectableOptionButton(
                             label = "1280 × 720",
-                            selected = configuredWidth == 1280,
+                            selected = configuredWidth == 1280 && configuredHeight == 720,
                             testTag = "res_720p_btn",
                             onClick = { onSelectResolution(1280, 720) },
                             modifier = Modifier.weight(1f)

@@ -685,12 +685,13 @@ fun CarLifeAppLauncherScreen(
             modifier = Modifier.fillMaxSize()
         ) {
             val isWideScreen = maxWidth >= 560.dp
+            val leftPanelWidthPx = computeVwLeftPanelWidthPx(maxWidth.value.toInt())
 
             if (isWideScreen) {
                 Row(
                     modifier = Modifier.fillMaxSize()
                 ) {
-                    // Exact 250 px (250.dp at 160 dpi) Permanent VW Left Panel (x = 0..250)
+                    // Permanent VW Left Panel (250 px at 1280×720, 220 px at 1024×800/600, 190 px at 800×480)
                     VwCockpitLeftPanel(
                         virtualDisplayId = virtualDisplayId,
                         mediaState = mediaState,
@@ -703,9 +704,10 @@ fun CarLifeAppLauncherScreen(
                         onPreviousTrack = onPreviousTrack,
                         onRequestNotificationAccess = onRequestNotificationAccess,
                         isFloatingOverlay = false,
+                        panelWidthDp = leftPanelWidthPx,
                         modifier = Modifier
                             .padding(start = 0.dp, top = 0.dp, bottom = 0.dp)
-                            .width(VW_LEFT_PANEL_WIDTH_PX.dp)
+                            .width(leftPanelWidthPx.dp)
                             .fillMaxHeight()
                     )
 
