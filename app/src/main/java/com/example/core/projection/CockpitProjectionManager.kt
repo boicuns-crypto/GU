@@ -386,6 +386,7 @@ class CockpitProjectionManager(
     private var mediaProjectionCallback: MediaProjection.Callback? = null
     private var mediaCodec: MediaCodec? = null
     private var encoderInputSurface: Surface? = null
+    private var mirrorGlScaler: FullScreenMirrorGlScaler? = null
     private var virtualDisplay: VirtualDisplay? = null
     private var virtualDisplayWidth: Int = 0
     private var virtualDisplayHeight: Int = 0
@@ -494,6 +495,12 @@ class CockpitProjectionManager(
         val prev = lastKnownScreenSize
         if (prev != currentSize) {
             lastKnownScreenSize = currentSize
+            mirrorGlScaler?.updateGeometry(
+                newTargetWidth = _stats.value.width.coerceAtLeast(1),
+                newTargetHeight = _stats.value.height.coerceAtLeast(1),
+                newPhoneWidth = currentSize.first,
+                newPhoneHeight = currentSize.second
+            )
             _stats.update {
                 it.copy(
                     phoneScreenWidth = currentSize.first,
@@ -633,6 +640,8 @@ class CockpitProjectionManager(
                         runCatching { virtualDisplay?.surface = null }
                         runCatching { virtualDisplay?.release() }
                         virtualDisplay = null
+                        runCatching { mirrorGlScaler?.release() }
+                        mirrorGlScaler = null
                         virtualDisplayWidth = 0
                         virtualDisplayHeight = 0
                         virtualDisplayDpi = 0
@@ -963,13 +972,36 @@ class CockpitProjectionManager(
                     )
                 }
             } else {
+                val (initPhoneW, initPhoneH) = lastKnownScreenSize
+                    ?: CarLifeAccessibilityService.instance?.getPhysicalScreenSize()
+                    ?: CarLifeAccessibilityService.computePhysicalScreenSize(appContext)
+                val targetVdSurface: Surface = if (wantMirrorOnlyFlags) {
+                    val scaler = FullScreenMirrorGlScaler(
+                        encoderOutputSurface = inputSurface,
+                        initialWidth = safeWidth,
+                        initialHeight = safeHeight,
+                        initialPhoneWidth = initPhoneW,
+                        initialPhoneHeight = initPhoneH
+                    )
+                    val glCaptureSurface = scaler.start()
+                    if (glCaptureSurface != null) {
+                        mirrorGlScaler = scaler
+                        glCaptureSurface
+                    } else {
+                        scaler.release()
+                        inputSurface
+                    }
+                } else {
+                    inputSurface
+                }
+
                 if (usedMediaProjection && vDisplay != null) {
                     val flagsMatch =
                         virtualDisplayIsMirrorOnly == wantMirrorOnlyFlags &&
                             virtualDisplayFlags == targetVdFlags
                     if (flagsMatch) {
                         // Android 14–16 best practice: NEVER release+recreate VirtualDisplay when only surface/size/dpi changed.
-                        // Resize in-place if dimensions or DPI changed, then attach the new MediaCodec inputSurface.
+                        // Resize in-place if dimensions or DPI changed, then attach the new targetVdSurface.
                         val dimensionsChanged =
                             virtualDisplayWidth != safeWidth ||
                                 virtualDisplayHeight != safeHeight ||
@@ -981,7 +1013,7 @@ class CockpitProjectionManager(
                                 virtualDisplayHeight = safeHeight
                                 virtualDisplayDpi = effectiveDpi
                             }
-                            vDisplay!!.surface = inputSurface
+                            vDisplay!!.surface = targetVdSurface
                         }.onFailure { e ->
                             Log.w(TAG, "VirtualDisplay resize/setSurface failed (${e.message}), recreating cleanly")
                             runCatching { vDisplay?.release() }
@@ -1059,7 +1091,7 @@ class CockpitProjectionManager(
                                             safeHeight,
                                             effectiveDpi,
                                             createdFlags,
-                                            inputSurface,
+                                            targetVdSurface,
                                             null,
                                             mainHandler
                                         )
@@ -1073,7 +1105,7 @@ class CockpitProjectionManager(
                                                 safeHeight,
                                                 effectiveDpi,
                                                 createdFlags,
-                                                inputSurface,
+                                                targetVdSurface,
                                                 null,
                                                 mainHandler
                                             )
@@ -1257,7 +1289,9 @@ class CockpitProjectionManager(
                 } else {
                     // MediaProjection missing or failed:
                     // STRICT NO-FALLBACK RULE: When MIRRORING is selected, NEVER show CockpitPresentation or drawCarLifeLauncherFrame!
-                    // Instead keep appMode = MIRRORING and feed a dedicated Mirroring standby/error diagnostic frame so USB 0x0002 stays alive.
+                    // Release any intermediate GL scaler on encoderInputSurface before starting Canvas diagnostic loop.
+                    mirrorGlScaler?.release()
+                    mirrorGlScaler = null
                     if (targetAppMode == AppMode.MIRRORING) {
                         dismissPresentationSafely()
                     }
@@ -1781,7 +1815,7 @@ class CockpitProjectionManager(
         canvas.drawRoundRect(gridPanelRect, 20f * scale, 20f * scale, borderPaint)
 
         canvas.drawText(
-            "JETTA Connect • Приложения",
+            "JETTA Connect",
             gridPanelRect.left + 18f * scale,
             gridPanelRect.top + 36f * scale,
             titlePaint
@@ -2082,6 +2116,7 @@ class CockpitProjectionManager(
                 }
                 val captureW = currentStats.width.takeIf { it > 0 }?.toFloat() ?: huTouchMaxX
                 val captureH = currentStats.height.takeIf { it > 0 }?.toFloat() ?: huTouchMaxY
+                val isFullScreenGlActive = mirrorGlScaler?.isInitialized == true
                 val mapped = CarLifeAccessibilityService.mapHuTouchToPhysicalScreenDetailed(
                     rawX = packet.rawX,
                     rawY = packet.rawY,
@@ -2091,7 +2126,8 @@ class CockpitProjectionManager(
                     screenHeight = screenH,
                     applyEdgeGuard = touchCfg.edgeBackGuardEnabled,
                     captureWidth = captureW,
-                    captureHeight = captureH
+                    captureHeight = captureH,
+                    isFullScreenStretched = isFullScreenGlActive
                 )
                 val orientLabel = if (mapped.isLandscape) "Landscape" else "Portrait"
 
@@ -2669,6 +2705,8 @@ class CockpitProjectionManager(
         }
 
         runCatching { virtualDisplay?.surface = null }
+        runCatching { mirrorGlScaler?.release() }
+        mirrorGlScaler = null
 
         runCatching { mediaCodec?.stop() }
         runCatching { mediaCodec?.release() }

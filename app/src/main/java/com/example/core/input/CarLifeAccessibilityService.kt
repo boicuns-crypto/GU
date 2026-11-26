@@ -714,9 +714,11 @@ class CarLifeAccessibilityService : AccessibilityService() {
          * that also reports whether the touch landed inside the active projected area (excluding pillarbox/letterbox
          * black bars) and guards horizontal edge taps against accidentally triggering Samsung One UI back-swipe gestures.
          *
-         * When [captureWidth] and [captureHeight] are specified (e.g. `800×480` = `5:3` or `1024×800` = `5:4`),
-         * letterbox/pillarbox margins are computed against the actual `VirtualDisplay` video stream geometry,
-         * even if the Head Unit touch controller normalizes raw touches to `1280×720`.
+         * - When [isFullScreenStretched] is `true` and the smartphone is in landscape (`screenWidth >= screenHeight`),
+         *   the video stream fills 100% of the Head Unit screen (`FullScreenMirrorGlScaler` strips top/bottom letterbox bars),
+         *   so `0..huWidth` and `0..huHeight` map directly onto `0..screenWidth` and `0..screenHeight` with zero black-bar offset.
+         * - When [isFullScreenStretched] is `false` (or the phone is in portrait orientation), letterbox/pillarbox margins
+         *   are computed against [captureWidth] × [captureHeight].
          */
         fun mapHuTouchToPhysicalScreenDetailed(
             rawX: Int,
@@ -727,7 +729,8 @@ class CarLifeAccessibilityService : AccessibilityService() {
             screenHeight: Int,
             applyEdgeGuard: Boolean = true,
             captureWidth: Float = huWidth,
-            captureHeight: Float = huHeight
+            captureHeight: Float = huHeight,
+            isFullScreenStretched: Boolean = false
         ): MappedPhysicalTouch {
             val safeHuW = huWidth.coerceAtLeast(1f)
             val safeHuH = huHeight.coerceAtLeast(1f)
@@ -735,6 +738,28 @@ class CarLifeAccessibilityService : AccessibilityService() {
             val safeCaptureH = captureHeight.takeIf { it > 0f } ?: safeHuH
             val safeScreenW = screenWidth.coerceAtLeast(1).toFloat()
             val safeScreenH = screenHeight.coerceAtLeast(1).toFloat()
+            val isLandscape = screenWidth >= screenHeight
+
+            val maxX = (safeScreenW - 1f).coerceAtLeast(0f)
+            val maxY = (safeScreenH - 1f).coerceAtLeast(0f)
+
+            if (isFullScreenStretched && isLandscape) {
+                val normX = (rawX.toFloat() / safeHuW).coerceIn(0f, 1f)
+                val normY = (rawY.toFloat() / safeHuH).coerceIn(0f, 1f)
+                var physX = (normX * safeScreenW).coerceIn(0f, maxX)
+                val physY = (normY * safeScreenH).coerceIn(0f, maxY)
+                if (applyEdgeGuard && safeScreenW > EDGE_BACK_GUARD_PX * 4f) {
+                    physX = physX.coerceIn(EDGE_BACK_GUARD_PX, maxX - EDGE_BACK_GUARD_PX)
+                }
+                return MappedPhysicalTouch(
+                    x = physX,
+                    y = physY,
+                    isInsideActiveArea = true,
+                    isLandscape = screenWidth > screenHeight,
+                    screenWidth = screenWidth,
+                    screenHeight = screenHeight
+                )
+            }
 
             // Convert raw Head Unit coordinates into the actual VirtualDisplay capture coordinate space.
             // When captureWidth == huWidth and captureHeight == huHeight (e.g. 1280x720), captureX == rawX and captureY == rawY.
@@ -759,8 +784,6 @@ class CarLifeAccessibilityService : AccessibilityService() {
             val normX = ((captureX - offsetX) / drawnW).coerceIn(0f, 1f)
             val normY = ((captureY - offsetY) / drawnH).coerceIn(0f, 1f)
 
-            val maxX = (safeScreenW - 1f).coerceAtLeast(0f)
-            val maxY = (safeScreenH - 1f).coerceAtLeast(0f)
             var physX = (normX * safeScreenW).coerceIn(0f, maxX)
             val physY = (normY * safeScreenH).coerceIn(0f, maxY)
 
@@ -792,7 +815,8 @@ class CarLifeAccessibilityService : AccessibilityService() {
             screenWidth: Int,
             screenHeight: Int,
             captureWidth: Float = huWidth,
-            captureHeight: Float = huHeight
+            captureHeight: Float = huHeight,
+            isFullScreenStretched: Boolean = false
         ): Pair<Float, Float> {
             val mapped = mapHuTouchToPhysicalScreenDetailed(
                 rawX = rawX,
@@ -803,7 +827,8 @@ class CarLifeAccessibilityService : AccessibilityService() {
                 screenHeight = screenHeight,
                 applyEdgeGuard = false,
                 captureWidth = captureWidth,
-                captureHeight = captureHeight
+                captureHeight = captureHeight,
+                isFullScreenStretched = isFullScreenStretched
             )
             return mapped.x to mapped.y
         }

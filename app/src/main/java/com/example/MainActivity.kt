@@ -834,16 +834,20 @@ fun CarLifeBridgeApp(
     val colorScheme = MaterialTheme.colorScheme
     val vw = MaterialTheme.vwColors
 
+    val showPhoneTopBar = isMirrorOnly || effectiveSelectedTab != 0
+
     Scaffold(
         modifier = Modifier.fillMaxSize(),
         containerColor = colorScheme.background,
         contentWindowInsets = WindowInsets.safeDrawing,
         topBar = {
-            VwPhoneTopBar(
-                isUsbConnected = runtimeState.transportState is UsbTransportState.Connected,
-                isMirrorOnly = isMirrorOnly,
-                isLandscape = isLandscape
-            )
+            if (showPhoneTopBar) {
+                VwPhoneTopBar(
+                    isUsbConnected = runtimeState.transportState is UsbTransportState.Connected,
+                    isMirrorOnly = isMirrorOnly,
+                    isLandscape = isLandscape
+                )
+            }
         },
         bottomBar = {
             if (!isLandscape) {
@@ -907,6 +911,7 @@ fun CarLifeBridgeApp(
         Row(
             modifier = Modifier
                 .fillMaxSize()
+                .then(if (!showPhoneTopBar) Modifier.statusBarsPadding() else Modifier)
                 .padding(innerPadding)
                 .consumeWindowInsets(innerPadding)
                 .windowInsetsPadding(

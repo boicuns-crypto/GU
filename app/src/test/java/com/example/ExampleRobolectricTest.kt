@@ -1983,5 +1983,90 @@ class ExampleRobolectricTest {
     assertEquals(legacy1280.x, explicit1280.x, 0.001f)
     assertEquals(legacy1280.y, explicit1280.y, 0.001f)
     assertEquals(legacy1280.isInsideActiveArea, explicit1280.isInsideActiveArea)
+
+    // 4. Full-screen stretched mode (FullScreenMirrorGlScaler active): strips top/bottom letterbox bars across
+    // 800x480, 1024x800, and 1280x720 in landscape and maps 100% of HU screen directly to phone screen
+    val crop1280 = com.example.core.projection.FullScreenMirrorGlScaler.computeNormalizedActiveCropRect(
+      captureWidth = 1280,
+      captureHeight = 720,
+      screenWidth = 3120,
+      screenHeight = 1440
+    )
+    assertEquals(0f, crop1280.uOffset, 0.001f)
+    assertEquals(1f, crop1280.uScale, 0.001f)
+    assertTrue("Top/bottom black bars should be stripped in 1280x720 landscape", crop1280.vOffset > 0.05f && crop1280.vScale < 0.9f)
+
+    val crop800x480 = com.example.core.projection.FullScreenMirrorGlScaler.computeNormalizedActiveCropRect(
+      captureWidth = 800,
+      captureHeight = 480,
+      screenWidth = 3120,
+      screenHeight = 1440
+    )
+    assertEquals(0f, crop800x480.uOffset, 0.001f)
+    assertEquals(1f, crop800x480.uScale, 0.001f)
+    assertTrue("Top/bottom black bars should be stripped in 800x480 landscape", crop800x480.vOffset > 0.1f && crop800x480.vScale < 0.8f)
+
+    val crop1024x800 = com.example.core.projection.FullScreenMirrorGlScaler.computeNormalizedActiveCropRect(
+      captureWidth = 1024,
+      captureHeight = 800,
+      screenWidth = 3120,
+      screenHeight = 1440
+    )
+    assertEquals(0f, crop1024x800.uOffset, 0.001f)
+    assertEquals(1f, crop1024x800.uScale, 0.001f)
+    assertTrue("Top/bottom black bars should be stripped in 1024x800 landscape", crop1024x800.vOffset > 0.19f && crop1024x800.vScale < 0.62f)
+
+    // With isFullScreenStretched = true, even rawY=36 (top 5% of HU screen) is inside active area and maps to ~72px on 1440p phone
+    val stretchedTopTap = CarLifeAccessibilityService.mapHuTouchToPhysicalScreenDetailed(
+      rawX = 640,
+      rawY = 36,
+      huWidth = 1280f,
+      huHeight = 720f,
+      screenWidth = 3120,
+      screenHeight = 1440,
+      applyEdgeGuard = false,
+      captureWidth = 1024f,
+      captureHeight = 800f,
+      isFullScreenStretched = true
+    )
+    assertTrue(stretchedTopTap.isInsideActiveArea)
+    assertEquals(1560f, stretchedTopTap.x, 1.5f)
+    assertEquals(72f, stretchedTopTap.y, 1.5f)
+  }
+
+  @Test
+  fun `LauncherFilterPreferences defaults to AUTO filter and persists user selection`() {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    context.getSharedPreferences(
+      com.example.feature.cockpit.LauncherFilterPreferences.PREFS_NAME,
+      Context.MODE_PRIVATE
+    ).edit().clear().commit()
+
+    // Default must be FILTER_AUTO (1)
+    assertEquals(
+      com.example.feature.cockpit.LauncherFilterPreferences.FILTER_AUTO,
+      com.example.feature.cockpit.LauncherFilterPreferences.loadSelectedFilter(context)
+    )
+
+    // Save FILTER_ALL (0) and verify reload
+    com.example.feature.cockpit.LauncherFilterPreferences.saveSelectedFilter(
+      context,
+      com.example.feature.cockpit.LauncherFilterPreferences.FILTER_ALL
+    )
+    assertEquals(
+      com.example.feature.cockpit.LauncherFilterPreferences.FILTER_ALL,
+      com.example.feature.cockpit.LauncherFilterPreferences.loadSelectedFilter(context)
+    )
+
+    // Save FILTER_AUTO (1) and verify reload
+    com.example.feature.cockpit.LauncherFilterPreferences.saveSelectedFilter(
+      context,
+      com.example.feature.cockpit.LauncherFilterPreferences.FILTER_AUTO
+    )
+    assertEquals(
+      com.example.feature.cockpit.LauncherFilterPreferences.FILTER_AUTO,
+      com.example.feature.cockpit.LauncherFilterPreferences.loadSelectedFilter(context)
+    )
   }
 }
+
