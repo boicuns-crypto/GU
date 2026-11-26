@@ -68,25 +68,13 @@ import kotlinx.coroutines.delay
 const val VW_LEFT_PANEL_WIDTH_PX = 250
 
 /**
- * Computes the VW MIB3 Left Panel width for the given display width:
- * - At `1280×720` (and any width `>= 1150`): returns strictly [VW_LEFT_PANEL_WIDTH_PX] (`250 px`).
- * - At `1024×800` / `1024×600` (`960..1149 px`): returns `220 px` (`78%` left for Navigator).
- * - At `800×480` (`< 960 px`): returns `190 px` (`76%` left for Navigator instead of 31.25% occupied by 250px).
- */
-fun computeVwLeftPanelWidthPx(displayWidthPx: Int): Int = when {
-    displayWidthPx <= 0 || displayWidthPx >= 1150 -> VW_LEFT_PANEL_WIDTH_PX
-    displayWidthPx >= 960 -> 220
-    else -> 190
-}
-
-/**
  * Permanent Volkswagen MIB3 Left Sidebar (`250.dp` wide out of `1280.dp`) shared across:
  * 1. Standard Cockpit mode (`Presentation`, right pane switches between 4×3 Grid and Yandex Maps WebView).
  * 2. Cockpit + Shizuku mode (rendered inside `Presentation` on Launcher Grid AND inside
- *    `ShizukuLeftPanelOverlay` floating on `x = 0..panelWidth` above Yandex Navigator / 2GIS).
+ *    `ShizukuLeftPanelOverlay` floating on `x = 0..250` above Yandex Navigator / 2GIS).
  *
  * Top-to-bottom layout:
- * 1. Large `tnum` clock + `JETTA Connect` badge + compact Day/Night theme toggle button.
+ * 1. Large `tnum` clock + `JETTA VS7` badge + compact Day/Night theme toggle button.
  * 2. Navigation keys: «Домой», «Назад», «Карта».
  * 3. Bottom: Compact VW MIB3 Music Player widget (`⏮`, `⏯`, `⏭`).
  */
@@ -103,7 +91,6 @@ fun VwCockpitLeftPanel(
     onPreviousTrack: () -> Unit,
     onRequestNotificationAccess: () -> Unit = {},
     isFloatingOverlay: Boolean = false,
-    panelWidthDp: Int = VW_LEFT_PANEL_WIDTH_PX,
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -127,7 +114,7 @@ fun VwCockpitLeftPanel(
 
     Card(
         modifier = modifier
-            .width(panelWidthDp.dp)
+            .width(VW_LEFT_PANEL_WIDTH_PX.dp)
             .fillMaxHeight()
             .testTag("vw_cockpit_left_panel"),
         shape = panelShape,

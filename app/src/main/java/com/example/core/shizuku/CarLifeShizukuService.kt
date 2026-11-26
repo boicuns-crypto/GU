@@ -174,9 +174,6 @@ class CarLifeShizukuService : ICarLifeShizukuService.Stub {
         }
     }
 
-    @Volatile
-    private var customDisplayAspectAppliedByService: Boolean = false
-
     override fun setNoCutoutOverlayEnabled(enabled: Boolean): Boolean {
         return runCatching {
             if (enabled) {
@@ -198,47 +195,7 @@ class CarLifeShizukuService : ICarLifeShizukuService.Stub {
         }.getOrDefault(false)
     }
 
-    override fun applyCustomDisplayAspect(targetWidth: Int, targetHeight: Int): Boolean {
-        return runCatching {
-            val safeTargetLong = maxOf(targetWidth, targetHeight).coerceAtLeast(480)
-            val safeTargetShort = minOf(targetWidth, targetHeight).coerceAtLeast(272)
-            val query = execShellCommandDetailed(arrayOf("wm", "size"))
-            val regex = Regex("""Physical size:\s*(\d+)x(\d+)""")
-            val match = regex.find(query.stdout)
-            val physW = match?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 1080
-            val physH = match?.groupValues?.getOrNull(2)?.toIntOrNull() ?: 2340
-            val physShort = minOf(physW, physH).coerceIn(720, 2160)
-            val matchedLong = (((physShort.toLong() * safeTargetLong) / safeTargetShort).toInt() / 2 * 2)
-                .coerceIn(physShort, 4096)
-
-            val res = execShellCommandDetailed(arrayOf("wm", "size", "${physShort}x${matchedLong}"))
-            if (res.isSuccess) {
-                customDisplayAspectAppliedByService = true
-            }
-            res.isSuccess
-        }.onFailure { e ->
-            Log.w(TAG, "applyCustomDisplayAspect(${targetWidth}x${targetHeight}) failed: ${e.message}")
-        }.getOrDefault(false)
-    }
-
-    override fun restoreNativeDisplayAspect(): Boolean {
-        return runCatching {
-            val res = execShellCommandDetailed(arrayOf("wm", "size", "reset"))
-            customDisplayAspectAppliedByService = false
-            res.isSuccess
-        }.onFailure { e ->
-            Log.w(TAG, "restoreNativeDisplayAspect failed: ${e.message}")
-            customDisplayAspectAppliedByService = false
-        }.getOrDefault(false)
-    }
-
     override fun destroy() {
-        if (customDisplayAspectAppliedByService) {
-            runCatching {
-                execShellCommandDetailed(arrayOf("wm", "size", "reset"))
-            }
-            customDisplayAspectAppliedByService = false
-        }
         if (noCutoutOverlayEnabledByService) {
             runCatching {
                 execShellCommandDetailed(buildNoCutoutOverlayCommand(enable = false))

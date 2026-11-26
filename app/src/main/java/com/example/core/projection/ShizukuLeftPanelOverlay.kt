@@ -153,8 +153,7 @@ class ShizukuLeftPanelOverlay(
                             onPlayPause = { MediaPlayerController.playPause() },
                             onNextTrack = { MediaPlayerController.next() },
                             onPreviousTrack = { MediaPlayerController.previous() },
-                            isFloatingOverlay = true,
-                            panelWidthDp = panelWidthPx
+                            isFloatingOverlay = true
                         )
                     }
                 }
