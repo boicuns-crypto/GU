@@ -247,15 +247,19 @@ class MainActivity : ComponentActivity() {
             val runtimeState by BridgeTelemetryBus.runtimeState.collectAsStateWithLifecycle()
             val keepAliveConfig by ScreenKeepAlivePreferences.config.collectAsStateWithLifecycle()
             val isDarkTheme = resolveIsDarkTheme(activeThemeMode)
+            val isUsbConnected = runtimeState.transportState is UsbTransportState.Connected
             val shouldFillCutout = ScreenKeepAliveManager.shouldApplyDisplayCutoutFill(
                 fillCameraCutoutOnUsb = keepAliveConfig.fillCameraCutoutOnUsb,
-                isUsbConnected = runtimeState.transportState is UsbTransportState.Connected,
+                isUsbConnected = isUsbConnected,
                 isStreamingOrProjecting = runtimeState.isVideoChannelReadyForStreaming ||
                     runtimeState.projectionStats.isRunning
             )
 
-            LaunchedEffect(shouldFillCutout) {
-                applyDisplayCutoutOnUsbState(shouldFillCutout)
+            LaunchedEffect(isUsbConnected, shouldFillCutout) {
+                applyDisplayCutoutOnUsbState(
+                    hideSystemBars = isUsbConnected || shouldFillCutout,
+                    enableFullCutout = shouldFillCutout
+                )
             }
 
             SideEffect {
@@ -355,10 +359,13 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun applyDisplayCutoutOnUsbState(enableFullCutout: Boolean) {
-        if (enableFullCutout) {
+    private fun applyDisplayCutoutOnUsbState(
+        hideSystemBars: Boolean,
+        enableFullCutout: Boolean = hideSystemBars
+    ) {
+        if (hideSystemBars) {
             runCatching {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                if (enableFullCutout && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                     val attrs = window.attributes
                     if (originalCutoutMode == null) {
                         originalCutoutMode = attrs.layoutInDisplayCutoutMode
@@ -397,7 +404,7 @@ class MainActivity : ComponentActivity() {
                     window.attributes = attrs
                 }
             }
-            WindowCompat.setDecorFitsSystemWindows(window, true)
+            WindowCompat.setDecorFitsSystemWindows(window, false)
             WindowInsetsControllerCompat(window, window.decorView)
                 .show(WindowInsetsCompat.Type.systemBars())
             isCutoutFillApplied = false
@@ -911,7 +918,6 @@ fun CarLifeBridgeApp(
         Row(
             modifier = Modifier
                 .fillMaxSize()
-                .then(if (!showPhoneTopBar) Modifier.statusBarsPadding() else Modifier)
                 .padding(innerPadding)
                 .consumeWindowInsets(innerPadding)
                 .windowInsetsPadding(
@@ -1559,7 +1565,7 @@ private fun OnboardingChecklistScreen(
         modifier = Modifier
             .fillMaxSize()
             .widthIn(max = 680.dp),
-        contentPadding = PaddingValues(16.dp),
+        contentPadding = PaddingValues(start = 16.dp, top = 6.dp, end = 16.dp, bottom = 16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
         // 1. Заголовочная карточка мастера подключения + выбор типа подключения
@@ -2572,7 +2578,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
         modifier = Modifier
             .fillMaxSize()
             .widthIn(max = 680.dp),
-        contentPadding = PaddingValues(16.dp),
+        contentPadding = PaddingValues(start = 16.dp, top = 6.dp, end = 16.dp, bottom = 16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
         // 1. Общие настройки — Оформление + Доступ к медиаплееру + Геолокация Яндекс Карт

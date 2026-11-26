@@ -744,7 +744,7 @@ fun CarLifeAppLauncherScreen(
                         isFloatingOverlay = false,
                         panelWidthDp = leftPanelWidthPx,
                         modifier = Modifier
-                            .padding(start = 0.dp, top = 0.dp, bottom = 0.dp)
+                            .padding(start = 4.dp, top = 4.dp, bottom = 6.dp)
                             .width(leftPanelWidthPx.dp)
                             .fillMaxHeight()
                     )
@@ -754,7 +754,7 @@ fun CarLifeAppLauncherScreen(
                         modifier = Modifier
                             .weight(1f)
                             .fillMaxHeight()
-                            .padding(start = 10.dp, top = 10.dp, end = 10.dp, bottom = 10.dp)
+                            .padding(start = 8.dp, top = 4.dp, end = 6.dp, bottom = 6.dp)
                     ) {
                         if (hasEverOpenedEmbeddedMap || isEmbeddedMapVisible) {
                             EmbeddedYandexMapsPane(
@@ -799,8 +799,8 @@ fun CarLifeAppLauncherScreen(
                 Column(
                     modifier = Modifier
                         .fillMaxSize()
-                        .padding(12.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                        .padding(start = 10.dp, top = 4.dp, end = 10.dp, bottom = 8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     CompactTopDockBar(
                         virtualDisplayId = virtualDisplayId,
@@ -1027,11 +1027,11 @@ private fun InstalledAppsGridPanel(
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(14.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
+                .padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             // VW MIB3 Header: «JETTA Connect» + filter chips («Авто», «Все (N)») + refresh
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,

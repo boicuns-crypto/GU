@@ -276,7 +276,7 @@ enum class AppMode(
     MIRRORING(
         id = "mirroring",
         title = "Зеркалирование (Экран телефона)",
-        subtitle = "Прямой захват экрана смартфона (MediaProjection, 1280×720@30fps). Тач 0x0006 идёт строго через CarLifeAccessibilityService."
+        subtitle = "Прямой захват экрана смартфона (MediaProjection, 1280×720@30fps). Тач 0x0006 идёт через службу управления экраном JETTA Connect."
     ),
     SHIZUKU_COCKPIT(
         id = "shizuku_cockpit",
@@ -309,7 +309,7 @@ enum class VideoSourceMode(
     VIRTUAL_DISPLAY(
         id = "virtual_display",
         title = "Виртуальный экран (VD + Лаунчер)",
-        subtitle = "Захват VirtualDisplay / MediaProjection + оверлей лаунчера CarLife (Presentation)"
+        subtitle = "Захват VirtualDisplay / MediaProjection + оверлей лаунчера JETTA Connect (Presentation)"
     ),
     CANVAS_TEST_CARD(
         id = "canvas_test_card",
@@ -495,12 +495,13 @@ class CockpitProjectionManager(
         val prev = lastKnownScreenSize
         if (prev != currentSize) {
             lastKnownScreenSize = currentSize
-            mirrorGlScaler?.updateGeometry(
-                newTargetWidth = _stats.value.width.coerceAtLeast(1),
-                newTargetHeight = _stats.value.height.coerceAtLeast(1),
-                newPhoneWidth = currentSize.first,
-                newPhoneHeight = currentSize.second
-            )
+            val targetW = _stats.value.width.coerceAtLeast(1)
+            val targetH = _stats.value.height.coerceAtLeast(1)
+            val vd = virtualDisplay
+            if (vd != null && virtualDisplayIsMirrorOnly) {
+                val targetDpi = virtualDisplayDpi.takeIf { it > 0 } ?: MIRROR_VIRTUAL_DISPLAY_DPI
+                runCatching { vd.resize(targetW, targetH, targetDpi) }
+            }
             _stats.update {
                 it.copy(
                     phoneScreenWidth = currentSize.first,
@@ -972,28 +973,13 @@ class CockpitProjectionManager(
                     )
                 }
             } else {
-                val (initPhoneW, initPhoneH) = lastKnownScreenSize
-                    ?: CarLifeAccessibilityService.instance?.getPhysicalScreenSize()
-                    ?: CarLifeAccessibilityService.computePhysicalScreenSize(appContext)
-                val targetVdSurface: Surface = if (wantMirrorOnlyFlags) {
-                    val scaler = FullScreenMirrorGlScaler(
-                        encoderOutputSurface = inputSurface,
-                        initialWidth = safeWidth,
-                        initialHeight = safeHeight,
-                        initialPhoneWidth = initPhoneW,
-                        initialPhoneHeight = initPhoneH
-                    )
-                    val glCaptureSurface = scaler.start()
-                    if (glCaptureSurface != null) {
-                        mirrorGlScaler = scaler
-                        glCaptureSurface
-                    } else {
-                        scaler.release()
-                        inputSurface
-                    }
-                } else {
-                    inputSurface
-                }
+                // Pass MediaCodec inputSurface directly to VirtualDisplay so Android's
+                // VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR fits currentWindowMetrics.bounds into
+                // safeWidth × safeHeight (800×480, 1024×600, 1024×800, 1280×720) with preserved
+                // aspect ratio and zero vertical/horizontal geometric distortion.
+                mirrorGlScaler?.release()
+                mirrorGlScaler = null
+                val targetVdSurface: Surface = inputSurface
 
                 if (usedMediaProjection && vDisplay != null) {
                     val flagsMatch =
@@ -2097,26 +2083,22 @@ class CockpitProjectionManager(
     suspend fun injectTouchPacket(packet: CarLifeTouchPacket): Boolean {
         val currentStats = _stats.value
         val touchCfg = TouchSettingsPreferences.config.value
+        val activeTargetW = currentStats.width.takeIf { it > 0 } ?: DEFAULT_WIDTH
+        val activeTargetH = currentStats.height.takeIf { it > 0 } ?: DEFAULT_HEIGHT
         val huTouchMaxX = packet.huWidth.takeIf { it > 0 }?.toFloat()
-            ?: CarLifeTouchDecoder.DEFAULT_HU_TOUCH_MAX_X
+            ?: activeTargetW.toFloat()
         val huTouchMaxY = packet.huHeight.takeIf { it > 0 }?.toFloat()
-            ?: CarLifeTouchDecoder.DEFAULT_HU_TOUCH_MAX_Y
+            ?: activeTargetH.toFloat()
 
         return withContext(Dispatchers.Main.immediate) {
             if (appMode == AppMode.MIRRORING) {
                 val a11yService = CarLifeAccessibilityService.instance
-                val cachedSize = lastKnownScreenSize
-                val (screenW, screenH) = if (cachedSize != null && packet.androidAction != MotionEvent.ACTION_DOWN) {
-                    cachedSize
-                } else {
-                    (a11yService?.getPhysicalScreenSize()
-                        ?: CarLifeAccessibilityService.computePhysicalScreenSize(appContext)).also {
-                        lastKnownScreenSize = it
-                    }
+                val (screenW, screenH) = (a11yService?.getPhysicalScreenSize()
+                    ?: CarLifeAccessibilityService.computePhysicalScreenSize(appContext)).also {
+                    lastKnownScreenSize = it
                 }
                 val captureW = currentStats.width.takeIf { it > 0 }?.toFloat() ?: huTouchMaxX
                 val captureH = currentStats.height.takeIf { it > 0 }?.toFloat() ?: huTouchMaxY
-                val isFullScreenGlActive = mirrorGlScaler?.isInitialized == true
                 val mapped = CarLifeAccessibilityService.mapHuTouchToPhysicalScreenDetailed(
                     rawX = packet.rawX,
                     rawY = packet.rawY,
@@ -2127,14 +2109,16 @@ class CockpitProjectionManager(
                     applyEdgeGuard = touchCfg.edgeBackGuardEnabled,
                     captureWidth = captureW,
                     captureHeight = captureH,
-                    isFullScreenStretched = isFullScreenGlActive
+                    isFullScreenStretched = false
                 )
                 val orientLabel = if (mapped.isLandscape) "Landscape" else "Portrait"
+                val targetWInt = captureW.toInt()
+                val targetHInt = captureH.toInt()
 
                 if (!mapped.isInsideActiveArea) {
                     if (packet.androidAction != MotionEvent.ACTION_MOVE) {
                         val skippedLabel =
-                            "Тач в чёрном поле HU(${packet.rawX},${packet.rawY}) пропущен ($screenW×$screenH $orientLabel)"
+                            "Тач в чёрном поле: Touch: HU(${packet.rawX},${packet.rawY}) [${targetWInt}×${targetHInt}] пропущен | Screen(${screenW}×${screenH} $orientLabel)"
                         _stats.update {
                             it.copy(
                                 phoneScreenWidth = screenW,
@@ -2163,15 +2147,12 @@ class CockpitProjectionManager(
                     (nowMs - lastMirrorTouchStatsUpdateMs) >= 250L
                 if (shouldPublishStats) {
                     lastMirrorTouchStatsUpdateMs = nowMs
-                    val gestureTag = when {
-                        packet.isDoubleClick -> "2xTAP"
-                        packet.isLongPress -> "LONG"
-                        else -> "TOUCH"
-                    }
+                    val baseDiag =
+                        "Touch: HU(${packet.rawX},${packet.rawY}) [${targetWInt}×${targetHInt}] -> Phone(${mapped.x.toInt()},${mapped.y.toInt()}) | Screen(${screenW}×${screenH})"
                     val statusLabel = if (a11yService != null) {
-                        "Mirror $gestureTag HU(${packet.rawX},${packet.rawY}) -> (${mapped.x.toInt()},${mapped.y.toInt()}) / ${screenW}×${screenH} $orientLabel"
+                        baseDiag
                     } else {
-                        "Touch 0x0006 получен, но CarLifeAccessibilityService ВЫКЛ!"
+                        "$baseDiag | CarLifeAccessibilityService ВЫКЛ!"
                     }
 
                     _stats.update {

@@ -2016,22 +2016,22 @@ class ExampleRobolectricTest {
     assertEquals(1f, crop1024x800.uScale, 0.001f)
     assertTrue("Top/bottom black bars should be stripped in 1024x800 landscape", crop1024x800.vOffset > 0.19f && crop1024x800.vScale < 0.62f)
 
-    // With isFullScreenStretched = true, even rawY=36 (top 5% of HU screen) is inside active area and maps to ~72px on 1440p phone
-    val stretchedTopTap = CarLifeAccessibilityService.mapHuTouchToPhysicalScreenDetailed(
-      rawX = 640,
-      rawY = 36,
-      huWidth = 1280f,
-      huHeight = 720f,
+    // Center tap (512, 300) at 1024x600 must also map to exact center (1560, 720) with preserved aspect ratio
+    val center1024x600 = CarLifeAccessibilityService.mapHuTouchToPhysicalScreenDetailed(
+      rawX = 512,
+      rawY = 300,
+      huWidth = 1024f,
+      huHeight = 600f,
       screenWidth = 3120,
       screenHeight = 1440,
       applyEdgeGuard = false,
       captureWidth = 1024f,
-      captureHeight = 800f,
-      isFullScreenStretched = true
+      captureHeight = 600f,
+      isFullScreenStretched = false
     )
-    assertTrue(stretchedTopTap.isInsideActiveArea)
-    assertEquals(1560f, stretchedTopTap.x, 1.5f)
-    assertEquals(72f, stretchedTopTap.y, 1.5f)
+    assertTrue(center1024x600.isInsideActiveArea)
+    assertEquals(1560f, center1024x600.x, 1.5f)
+    assertEquals(720f, center1024x600.y, 1.5f)
   }
 
   @Test

@@ -97,9 +97,9 @@ object SetupGuideCatalog {
     val steps: List<GuideStepSpec> = listOf(
         GuideStepSpec(
             stepNumber = 1,
-            badge = "ШАГ 1 • USB И CARLIFE",
+            badge = "ШАГ 1 • ПОДКЛЮЧЕНИЕ ПО USB",
             title = "Подключение к Jetta VS7",
-            summary = "Подключите смартфон качественным USB-кабелем к разъёму мультимедиа, откройте на ГУ раздел Baidu CarLife и выберите «Всегда открывать JETTA Connect».",
+            summary = "Подключите смартфон качественным USB-кабелем к разъёму мультимедиа на Jetta VS7, перейдите на ГУ в раздел подключения смартфона и выберите «Всегда открывать JETTA Connect».",
             highlights = listOf(
                 "Перед втыканием кабеля выдайте доступ «Весь экран» во вкладке «Подключение».",
                 "При первом запросе USB отметьте «Всегда открывать JETTA Connect» и нажмите «ОК»."
@@ -895,9 +895,9 @@ private fun Step1UsbConnectionMockup(modifier: Modifier = Modifier) {
                         border = BorderStroke(1.dp, vw.accentBlue)
                     ) {
                         Text(
-                            text = "Baidu CarLife",
+                            text = "Подключение по USB",
                             style = MaterialTheme.typography.labelSmall.copy(
-                                fontSize = 9.sp,
+                                fontSize = 8.5.sp,
                                 fontWeight = FontWeight.SemiBold
                             ),
                             color = vw.accentBlue,

@@ -2213,15 +2213,15 @@ class BridgeForegroundService : Service() {
 
         val statusText = when (state) {
             is UsbTransportState.Connected ->
-                "Connected to ${state.accessory.manufacturer} ${state.accessory.model} (FD #${state.fdNumber})"
+                "JETTA Connect — подключено по USB к ГУ Jetta VS7 (FD #${state.fdNumber})"
             is UsbTransportState.Connecting ->
-                "Opening AOA Direct-IO FileChannel (${state.accessory.manufacturer} ${state.accessory.model})..."
+                "JETTA Connect — установка USB-соединения с ГУ Jetta VS7..."
             is UsbTransportState.WaitingForPermission ->
-                "Awaiting USB AOA permission for ${state.accessory.model}"
+                "JETTA Connect — ожидание разрешения USB-подключения"
             is UsbTransportState.Error ->
                 state.reason
             UsbTransportState.Disconnected ->
-                "JETTA Connect — ожидание USB-подключения к ГУ Jetta VS7 (CarLife)"
+                "JETTA Connect — ожидание USB-подключения к ГУ Jetta VS7"
         }
 
         return NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)
