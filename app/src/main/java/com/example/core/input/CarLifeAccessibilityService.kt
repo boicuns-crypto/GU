@@ -730,7 +730,8 @@ class CarLifeAccessibilityService : AccessibilityService() {
             applyEdgeGuard: Boolean = true,
             captureWidth: Float = huWidth,
             captureHeight: Float = huHeight,
-            isFullScreenStretched: Boolean = false
+            isFullScreenStretched: Boolean = false,
+            isCenterCrop1to1: Boolean = false
         ): MappedPhysicalTouch {
             val safeHuW = huWidth.coerceAtLeast(1f)
             val safeHuH = huHeight.coerceAtLeast(1f)
@@ -742,6 +743,42 @@ class CarLifeAccessibilityService : AccessibilityService() {
 
             val maxX = (safeScreenW - 1f).coerceAtLeast(0f)
             val maxY = (safeScreenH - 1f).coerceAtLeast(0f)
+
+            if (isCenterCrop1to1 && isLandscape) {
+                val fitScale = minOf(safeCaptureW / safeScreenW, safeCaptureH / safeScreenH)
+                val drawnW = (safeScreenW * fitScale).coerceAtLeast(1f)
+                val drawnH = (safeScreenH * fitScale).coerceAtLeast(1f)
+                val offsetX = (safeCaptureW - drawnW) / 2f
+                val offsetY = (safeCaptureH - drawnH) / 2f
+
+                val uniformSpan = minOf(drawnW / safeCaptureW, drawnH / safeCaptureH).coerceIn(0.1f, 1f)
+                val cropW = safeCaptureW * uniformSpan
+                val cropH = safeCaptureH * uniformSpan
+                val cropLeft = (safeCaptureW - cropW) / 2f
+                val cropTop = (safeCaptureH - cropH) / 2f
+
+                val huNormX = (rawX.toFloat() / safeHuW).coerceIn(0f, 1f)
+                val huNormY = (rawY.toFloat() / safeHuH).coerceIn(0f, 1f)
+                val texX = cropLeft + huNormX * cropW
+                val texY = cropTop + huNormY * cropH
+
+                val normX = ((texX - offsetX) / drawnW).coerceIn(0f, 1f)
+                val normY = ((texY - offsetY) / drawnH).coerceIn(0f, 1f)
+
+                var physX = (normX * safeScreenW).coerceIn(0f, maxX)
+                val physY = (normY * safeScreenH).coerceIn(0f, maxY)
+                if (applyEdgeGuard && safeScreenW > EDGE_BACK_GUARD_PX * 4f) {
+                    physX = physX.coerceIn(EDGE_BACK_GUARD_PX, maxX - EDGE_BACK_GUARD_PX)
+                }
+                return MappedPhysicalTouch(
+                    x = physX,
+                    y = physY,
+                    isInsideActiveArea = true,
+                    isLandscape = screenWidth > screenHeight,
+                    screenWidth = screenWidth,
+                    screenHeight = screenHeight
+                )
+            }
 
             if (isFullScreenStretched && isLandscape) {
                 val normX = (rawX.toFloat() / safeHuW).coerceIn(0f, 1f)

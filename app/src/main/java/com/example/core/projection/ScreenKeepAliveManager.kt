@@ -24,6 +24,48 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
 /**
+ * Three selectable video frame scaling & aspect-ratio variants configured in
+ * «Параметры видеопотока H.264» (Settings):
+ * 1. [FIT_NATIVE]: Variant 1 — Renders Cockpit/Shizuku natively at Head Unit resolution (`16:9` / `targetWidth × targetHeight`),
+ *    and in Mirroring mode fits the smartphone screen `1:1` with zero cropping and zero vertical stretching.
+ * 2. [CENTER_CROP_FULLSCREEN]: Variant 2 — Fills 100% of the Head Unit height & width in Mirroring mode without top/bottom
+ *    black bars and without oval distortion (`1:1` uniform zoom, cropping only the extra 19.5:9 side margins where the
+ *    camera cutout and navigation bar sit).
+ * 3. [SHIZUKU_16_9]: Variant 3 — Temporarily switches the smartphone display to the Head Unit's aspect ratio (`16:9` / target aspect)
+ *    via Shizuku (`wm size`) while USB is connected, and automatically restores the native screen when USB disconnects.
+ */
+enum class MirrorVideoScaleMode(
+    val id: String,
+    val shortTitle: String,
+    val fullTitle: String,
+    val description: String
+) {
+    FIT_NATIVE(
+        id = "fit_native",
+        shortTitle = "1. Кокпит / 1:1",
+        fullTitle = "Вариант 1 • Кокпит на весь экран / Зеркало 1:1",
+        description = "В режимах «Кокпит» и «Shizuku» рендерит лаунчер сразу в родном разрешении ГУ (100% экрана без полос). В режиме «Зеркало» передаёт весь экран смартфона 1:1 без обрезки краёв и без растягивания."
+    ),
+    CENTER_CROP_FULLSCREEN(
+        id = "center_crop",
+        shortTitle = "2. Без полос (Crop)",
+        fullTitle = "Вариант 2 • Полный экран без полос (Умная обрезка краёв 1:1)",
+        description = "Заполняет 100% высоты и ширины ГУ без чёрных полос сверху/снизу и без искажения пропорций (круги остаются круглыми): лишние боковые края 19.5:9 (область камеры и полоса навигации) аккуратно обрезаются."
+    ),
+    SHIZUKU_16_9(
+        id = "shizuku_16_9",
+        shortTitle = "3. Shizuku 16:9",
+        fullTitle = "Вариант 3 • Полный экран 16:9 (через Shizuku wm size)",
+        description = "При подключении USB временно переключает экран смартфона в пропорции ГУ (16:9) через Shizuku — весь Android перестраивается на 100% экрана ГУ без полос и без обрезки. При отключении USB автоматически возвращает родной экран."
+    );
+
+    companion object {
+        fun fromId(id: String?): MirrorVideoScaleMode =
+            entries.firstOrNull { it.id == id } ?: CENTER_CROP_FULLSCREEN
+    }
+}
+
+/**
  * Persistent settings controlling display keep-awake, automatic 1% AMOLED physical brightness
  * on USB connect, automatic left-landscape rotation on USB connect, and screen-off survival
  * for Mirroring (`MediaProjection`) and USB Audio (`0x0003`).
@@ -69,7 +111,11 @@ data class ScreenKeepAliveConfig(
      * hides system bars while USB streaming is active (plus optional Shizuku `noCutout` overlay in Mirroring mode),
      * and restores default cutout/system bars cleanly upon USB disconnect or service shutdown.
      */
-    val fillCameraCutoutOnUsb: Boolean = true
+    val fillCameraCutoutOnUsb: Boolean = true,
+    /**
+     * Active H.264 video scaling / aspect-ratio variant across all 4 Head Unit resolutions.
+     */
+    val videoScaleMode: MirrorVideoScaleMode = MirrorVideoScaleMode.CENTER_CROP_FULLSCREEN
 )
 
 /**
@@ -111,6 +157,7 @@ object ScreenKeepAlivePreferences {
     private const val KEY_AUTO_WAKE_SCREEN_OFF = "screen_auto_wake_on_off"
     private const val KEY_AUTO_CONFIRM_MP = "screen_auto_confirm_media_projection"
     private const val KEY_FILL_CAMERA_CUTOUT_USB = "screen_fill_camera_cutout_on_usb"
+    private const val KEY_VIDEO_SCALE_MODE = "mirror_video_scale_mode_v1"
 
     private val _config = MutableStateFlow(ScreenKeepAliveConfig())
     val config: StateFlow<ScreenKeepAliveConfig> = _config.asStateFlow()
@@ -130,7 +177,10 @@ object ScreenKeepAlivePreferences {
             autoRotateLeftOnUsb = prefs.getBoolean(KEY_AUTO_ROTATE_LEFT_USB, true),
             autoWakeOnScreenOff = prefs.getBoolean(KEY_AUTO_WAKE_SCREEN_OFF, false),
             autoConfirmMediaProjection = prefs.getBoolean(KEY_AUTO_CONFIRM_MP, true),
-            fillCameraCutoutOnUsb = prefs.getBoolean(KEY_FILL_CAMERA_CUTOUT_USB, true)
+            fillCameraCutoutOnUsb = prefs.getBoolean(KEY_FILL_CAMERA_CUTOUT_USB, true),
+            videoScaleMode = MirrorVideoScaleMode.fromId(
+                prefs.getString(KEY_VIDEO_SCALE_MODE, MirrorVideoScaleMode.CENTER_CROP_FULLSCREEN.id)
+            )
         )
     }
 
@@ -157,6 +207,7 @@ object ScreenKeepAlivePreferences {
             .remove(KEY_AUTO_WAKE_SCREEN_OFF)
             .remove(KEY_AUTO_CONFIRM_MP)
             .remove(KEY_FILL_CAMERA_CUTOUT_USB)
+            .remove(KEY_VIDEO_SCALE_MODE)
             .apply()
         _config.value = ScreenKeepAliveConfig()
     }
@@ -172,6 +223,7 @@ object ScreenKeepAlivePreferences {
             .putBoolean(KEY_AUTO_WAKE_SCREEN_OFF, cfg.autoWakeOnScreenOff)
             .putBoolean(KEY_AUTO_CONFIRM_MP, cfg.autoConfirmMediaProjection)
             .putBoolean(KEY_FILL_CAMERA_CUTOUT_USB, cfg.fillCameraCutoutOnUsb)
+            .putString(KEY_VIDEO_SCALE_MODE, cfg.videoScaleMode.id)
             .apply()
     }
 }
@@ -569,6 +621,18 @@ class ScreenKeepAliveManager(
             isMirroringMode: Boolean,
             isShizukuReady: Boolean
         ): Boolean = fillCameraCutoutOnUsb &&
+            isUsbConnected &&
+            isStreamingOrProjecting &&
+            isMirroringMode &&
+            isShizukuReady
+
+        fun shouldApplyShizukuDisplayAspect(
+            videoScaleMode: MirrorVideoScaleMode,
+            isUsbConnected: Boolean,
+            isStreamingOrProjecting: Boolean,
+            isMirroringMode: Boolean,
+            isShizukuReady: Boolean
+        ): Boolean = videoScaleMode == MirrorVideoScaleMode.SHIZUKU_16_9 &&
             isUsbConnected &&
             isStreamingOrProjecting &&
             isMirroringMode &&

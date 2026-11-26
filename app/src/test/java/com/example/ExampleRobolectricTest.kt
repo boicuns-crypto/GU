@@ -453,6 +453,10 @@ class ExampleRobolectricTest {
 
       override fun setNoCutoutOverlayEnabled(enabled: Boolean): Boolean = true
 
+      override fun applyCustomDisplayAspect(targetWidth: Int, targetHeight: Int): Boolean = true
+
+      override fun restoreNativeDisplayAspect(): Boolean = true
+
       override fun destroy() = Unit
     }
 
@@ -1339,6 +1343,8 @@ class ExampleRobolectricTest {
 
       override fun sendKeyEvent(keyCode: Int, displayId: Int) = Unit
       override fun setNoCutoutOverlayEnabled(enabled: Boolean): Boolean = false
+      override fun applyCustomDisplayAspect(targetWidth: Int, targetHeight: Int): Boolean = false
+      override fun restoreNativeDisplayAspect(): Boolean = false
       override fun destroy() = Unit
     }
 
@@ -2067,6 +2073,122 @@ class ExampleRobolectricTest {
       com.example.feature.cockpit.LauncherFilterPreferences.FILTER_AUTO,
       com.example.feature.cockpit.LauncherFilterPreferences.loadSelectedFilter(context)
     )
+  }
+
+  @Test
+  fun `three MirrorVideoScaleMode variants persist, preserve 1-to-1 circular geometry in CENTER_CROP_FULLSCREEN, and map touch accurately`() {
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    try {
+      ScreenKeepAlivePreferences.clear(context)
+      val defaultCfg = ScreenKeepAlivePreferences.init(context)
+      assertEquals(
+        com.example.core.projection.MirrorVideoScaleMode.CENTER_CROP_FULLSCREEN,
+        defaultCfg.videoScaleMode
+      )
+
+      // Persist all 3 variants and verify reload + descriptions
+      for (mode in com.example.core.projection.MirrorVideoScaleMode.entries) {
+        assertTrue(mode.shortTitle.isNotBlank())
+        assertTrue(mode.fullTitle.isNotBlank())
+        assertTrue(mode.description.isNotBlank())
+        ScreenKeepAlivePreferences.updateConfig(context) { it.copy(videoScaleMode = mode) }
+        assertEquals(mode, ScreenKeepAlivePreferences.init(context).videoScaleMode)
+      }
+
+      // Verify 1:1 uniform Center-Crop (uScale == vScale) across all 4 HU resolutions on S26 Ultra (3120x1440)
+      val resolutions = listOf(
+        800 to 480,
+        1024 to 600,
+        1024 to 800,
+        1280 to 720
+      )
+      for ((huW, huH) in resolutions) {
+        val rect = com.example.core.projection.FullScreenMirrorGlScaler.computeCenterCrop1to1Rect(
+          captureWidth = huW,
+          captureHeight = huH,
+          screenWidth = 3120,
+          screenHeight = 1440
+        )
+        assertEquals(
+          "uScale and vScale must be strictly equal for 1:1 circular proportions at ${huW}x${huH}",
+          rect.uScale,
+          rect.vScale,
+          0.0001f
+        )
+        assertEquals(rect.uOffset, rect.vOffset, 0.0001f)
+        assertTrue("Uniform span must crop top/bottom letterbox bars at ${huW}x${huH}", rect.uScale < 0.9f)
+
+        // Center touch on Head Unit must map to exact phone center (1560, 720)
+        val centerTouch = CarLifeAccessibilityService.mapHuTouchToPhysicalScreenDetailed(
+          rawX = huW / 2,
+          rawY = huH / 2,
+          huWidth = huW.toFloat(),
+          huHeight = huH.toFloat(),
+          screenWidth = 3120,
+          screenHeight = 1440,
+          applyEdgeGuard = false,
+          captureWidth = huW.toFloat(),
+          captureHeight = huH.toFloat(),
+          isCenterCrop1to1 = true
+        )
+        assertTrue(centerTouch.isInsideActiveArea)
+        assertEquals(1560f, centerTouch.x, 1.5f)
+        assertEquals(720f, centerTouch.y, 1.5f)
+
+        // Top and bottom edges of Head Unit in CENTER_CROP_FULLSCREEN map to top (0) and bottom (1440) of phone screen
+        val topTouch = CarLifeAccessibilityService.mapHuTouchToPhysicalScreenDetailed(
+          rawX = huW / 2,
+          rawY = 0,
+          huWidth = huW.toFloat(),
+          huHeight = huH.toFloat(),
+          screenWidth = 3120,
+          screenHeight = 1440,
+          applyEdgeGuard = false,
+          captureWidth = huW.toFloat(),
+          captureHeight = huH.toFloat(),
+          isCenterCrop1to1 = true
+        )
+        assertTrue(topTouch.isInsideActiveArea)
+        assertEquals(0f, topTouch.y, 1.5f)
+
+        val bottomTouch = CarLifeAccessibilityService.mapHuTouchToPhysicalScreenDetailed(
+          rawX = huW / 2,
+          rawY = huH,
+          huWidth = huW.toFloat(),
+          huHeight = huH.toFloat(),
+          screenWidth = 3120,
+          screenHeight = 1440,
+          applyEdgeGuard = false,
+          captureWidth = huW.toFloat(),
+          captureHeight = huH.toFloat(),
+          isCenterCrop1to1 = true
+        )
+        assertTrue(bottomTouch.isInsideActiveArea)
+        assertEquals(1440f, bottomTouch.y, 1.5f)
+      }
+
+      // Shizuku aspect policy activates only for SHIZUKU_16_9 when USB + Mirroring + Shizuku are ready
+      assertTrue(
+        ScreenKeepAliveManager.shouldApplyShizukuDisplayAspect(
+          videoScaleMode = com.example.core.projection.MirrorVideoScaleMode.SHIZUKU_16_9,
+          isUsbConnected = true,
+          isStreamingOrProjecting = true,
+          isMirroringMode = true,
+          isShizukuReady = true
+        )
+      )
+      assertFalse(
+        ScreenKeepAliveManager.shouldApplyShizukuDisplayAspect(
+          videoScaleMode = com.example.core.projection.MirrorVideoScaleMode.CENTER_CROP_FULLSCREEN,
+          isUsbConnected = true,
+          isStreamingOrProjecting = true,
+          isMirroringMode = true,
+          isShizukuReady = true
+        )
+      )
+    } finally {
+      ScreenKeepAlivePreferences.clear(context)
+    }
   }
 }
 

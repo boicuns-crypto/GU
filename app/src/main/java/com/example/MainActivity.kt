@@ -33,6 +33,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -134,6 +135,7 @@ import com.example.core.input.CarLifeAccessibilityService
 import com.example.core.input.TouchSettingsPreferences
 import com.example.core.projection.AppMode
 import com.example.core.projection.MediaProjectionTokenStore
+import com.example.core.projection.MirrorVideoScaleMode
 import com.example.core.projection.ScreenKeepAliveManager
 import com.example.core.projection.ScreenKeepAlivePreferences
 import com.example.core.shizuku.CarLifeShizukuManager
@@ -177,6 +179,7 @@ class MainActivity : ComponentActivity() {
             if (intent.action == UsbManager.ACTION_USB_ACCESSORY_DETACHED) {
                 restoreDefaultWindowCutoutAndBars()
                 CarLifeShizukuManager.setNoCutoutOverlayEnabledAsync(false)
+                CarLifeShizukuManager.restoreNativeDisplayAspectAsync()
             }
         }
     }
@@ -248,17 +251,18 @@ class MainActivity : ComponentActivity() {
             val keepAliveConfig by ScreenKeepAlivePreferences.config.collectAsStateWithLifecycle()
             val isDarkTheme = resolveIsDarkTheme(activeThemeMode)
             val isUsbConnected = runtimeState.transportState is UsbTransportState.Connected
+            val isStreamingOrProjecting = runtimeState.isVideoChannelReadyForStreaming ||
+                runtimeState.projectionStats.isRunning
             val shouldFillCutout = ScreenKeepAliveManager.shouldApplyDisplayCutoutFill(
                 fillCameraCutoutOnUsb = keepAliveConfig.fillCameraCutoutOnUsb,
                 isUsbConnected = isUsbConnected,
-                isStreamingOrProjecting = runtimeState.isVideoChannelReadyForStreaming ||
-                    runtimeState.projectionStats.isRunning
+                isStreamingOrProjecting = isStreamingOrProjecting
             )
 
-            LaunchedEffect(isUsbConnected, shouldFillCutout) {
+            LaunchedEffect(isUsbConnected, isStreamingOrProjecting, shouldFillCutout) {
                 applyDisplayCutoutOnUsbState(
-                    hideSystemBars = isUsbConnected || shouldFillCutout,
-                    enableFullCutout = shouldFillCutout
+                    hideSystemBars = isUsbConnected || isStreamingOrProjecting || shouldFillCutout,
+                    enableFullCutout = shouldFillCutout || isUsbConnected || isStreamingOrProjecting
                 )
             }
 
@@ -315,19 +319,45 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        reapplyImmersiveBarsIfActive()
         if (!AppEditionConfig.isMirrorOnly) {
             MediaPlayerController.refreshSessions()
             val snapshot = CarLifeShizukuManager.refreshStatus(this)
             val appMode = BridgeTelemetryBus.runtimeState.value.appMode
             val cfg = ScreenKeepAlivePreferences.config.value
             val needShizukuForMirroring = appMode == AppMode.MIRRORING &&
-                cfg.fillCameraCutoutOnUsb
+                (cfg.fillCameraCutoutOnUsb || cfg.videoScaleMode == MirrorVideoScaleMode.SHIZUKU_16_9)
             if ((appMode == AppMode.SHIZUKU_COCKPIT || needShizukuForMirroring) &&
                 snapshot.isBinderAlive &&
                 snapshot.hasPermission
             ) {
                 CarLifeShizukuManager.bindUserServiceIfReady(this)
             }
+        }
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) {
+            reapplyImmersiveBarsIfActive()
+        }
+    }
+
+    private fun reapplyImmersiveBarsIfActive() {
+        val state = BridgeTelemetryBus.runtimeState.value
+        val cfg = ScreenKeepAlivePreferences.config.value
+        val isUsbConnected = state.transportState is UsbTransportState.Connected
+        val isStreamingOrProjecting = state.isVideoChannelReadyForStreaming || state.projectionStats.isRunning
+        val shouldFillCutout = ScreenKeepAliveManager.shouldApplyDisplayCutoutFill(
+            fillCameraCutoutOnUsb = cfg.fillCameraCutoutOnUsb,
+            isUsbConnected = isUsbConnected,
+            isStreamingOrProjecting = isStreamingOrProjecting
+        )
+        if (isUsbConnected || isStreamingOrProjecting || shouldFillCutout) {
+            applyDisplayCutoutOnUsbState(
+                hideSystemBars = true,
+                enableFullCutout = true
+            )
         }
     }
 
@@ -717,6 +747,7 @@ fun CarLifeBridgeApp(
     val lifecycleOwner = LocalLifecycleOwner.current
 
     val runtimeState by BridgeTelemetryBus.runtimeState.collectAsStateWithLifecycle()
+    val keepAliveConfig by ScreenKeepAlivePreferences.config.collectAsStateWithLifecycle()
     val mediaState by MediaPlayerController.mediaState.collectAsStateWithLifecycle()
     val a11yEnabled by CarLifeAccessibilityService.isServiceEnabled.collectAsStateWithLifecycle()
     val hasMediaProjectionToken by MediaProjectionTokenStore.hasValidToken.collectAsStateWithLifecycle()
@@ -915,21 +946,52 @@ fun CarLifeBridgeApp(
             }
         }
     ) { innerPadding ->
-        Row(
+        BoxWithConstraints(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding)
                 .consumeWindowInsets(innerPadding)
-                .windowInsetsPadding(
-                    WindowInsets.safeDrawing.only(
-                        if (isLandscape) {
-                            WindowInsetsSides.Horizontal + WindowInsetsSides.Bottom
+        ) {
+            val isUsbOrStreamingActive =
+                runtimeState.transportState is UsbTransportState.Connected ||
+                    runtimeState.isVideoChannelReadyForStreaming ||
+                    runtimeState.projectionStats.isRunning
+            val applyCenterCropSafeBounds = isLandscape &&
+                runtimeState.appMode == AppMode.MIRRORING &&
+                keepAliveConfig.videoScaleMode == MirrorVideoScaleMode.CENTER_CROP_FULLSCREEN &&
+                isUsbOrStreamingActive
+            val targetAspect = runtimeState.configuredWidth.coerceAtLeast(1).toFloat() /
+                runtimeState.configuredHeight.coerceAtLeast(1).toFloat()
+            val sideCropPaddingDp = if (applyCenterCropSafeBounds && maxHeight > 0.dp) {
+                val targetVisibleWidth = maxHeight * targetAspect
+                if (maxWidth > targetVisibleWidth) {
+                    ((maxWidth - targetVisibleWidth) / 2f).coerceAtLeast(0.dp)
+                } else {
+                    0.dp
+                }
+            } else {
+                0.dp
+            }
+
+            Row(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .then(
+                        if (sideCropPaddingDp > 0.dp) {
+                            Modifier.padding(horizontal = sideCropPaddingDp)
                         } else {
-                            WindowInsetsSides.Horizontal
+                            Modifier.windowInsetsPadding(
+                                WindowInsets.safeDrawing.only(
+                                    if (isLandscape) {
+                                        WindowInsetsSides.Horizontal + WindowInsetsSides.Bottom
+                                    } else {
+                                        WindowInsetsSides.Horizontal
+                                    }
+                                )
+                            )
                         }
                     )
-                )
-        ) {
+            ) {
             if (isLandscape) {
                 Surface(
                     modifier = Modifier
@@ -1151,6 +1213,7 @@ fun CarLifeBridgeApp(
                         onOpenConnectionTab = { selectedTab = 1 }
                     )
                 }
+            }
             }
         }
     }
@@ -3770,10 +3833,14 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
             }
         }
 
-        // 6. Параметры видеопотока H.264 (только разрешение и битрейт, без экспериментальных шапок)
+        // 6. Параметры видеопотока H.264 (разрешение, битрейт и 3 варианта масштабирования без полос и искажений)
         item {
+            val keepAliveConfig by ScreenKeepAlivePreferences.config.collectAsStateWithLifecycle()
+            val selectedScaleMode = keepAliveConfig.videoScaleMode
             Card(
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("h264_video_stream_params_card"),
                 shape = RoundedCornerShape(14.dp),
                 colors = CardDefaults.cardColors(containerColor = colorScheme.surface),
                 elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
@@ -3874,6 +3941,114 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                             onClick = { onSelectBitrate(2000) },
                             modifier = Modifier.weight(1f)
                         )
+                    }
+
+                    HorizontalDivider(
+                        thickness = 1.dp,
+                        color = colorScheme.outline.copy(alpha = 0.5f)
+                    )
+
+                    Text(
+                        text = "Масштабирование экрана на ГУ (3 варианта без растягивания)",
+                        style = MaterialTheme.typography.labelMedium.tabular(),
+                        color = colorScheme.onSurfaceVariant
+                    )
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        MirrorVideoScaleMode.entries.forEach { scaleOption ->
+                            SelectableOptionButton(
+                                label = scaleOption.shortTitle,
+                                selected = selectedScaleMode == scaleOption,
+                                testTag = "video_scale_mode_${scaleOption.id}_btn",
+                                onClick = {
+                                    ScreenKeepAlivePreferences.updateConfig(context) {
+                                        it.copy(videoScaleMode = scaleOption)
+                                    }
+                                    val updateIntent = Intent(context, BridgeForegroundService::class.java).apply {
+                                        action = BridgeForegroundService.ACTION_UPDATE_SCREEN_KEEP_ALIVE
+                                    }
+                                    safeStartService(context, updateIntent)
+                                },
+                                modifier = Modifier.weight(1f)
+                            )
+                        }
+                    }
+
+                    Surface(
+                        color = colorScheme.background,
+                        shape = RoundedCornerShape(10.dp),
+                        border = BorderStroke(1.dp, colorScheme.outline)
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(12.dp),
+                            verticalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Text(
+                                text = selectedScaleMode.fullTitle,
+                                style = MaterialTheme.typography.labelLarge.copy(
+                                    fontWeight = FontWeight.SemiBold
+                                ),
+                                color = vw.accentBlue,
+                                modifier = Modifier.testTag("video_scale_mode_active_title")
+                            )
+                            Text(
+                                text = selectedScaleMode.description,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = colorScheme.onSurfaceVariant,
+                                modifier = Modifier.testTag("video_scale_mode_active_desc")
+                            )
+
+                            if (selectedScaleMode == MirrorVideoScaleMode.FIT_NATIVE &&
+                                activeAppMode == AppMode.MIRRORING &&
+                                !AppEditionConfig.isMirrorOnly
+                            ) {
+                                OutlinedButton(
+                                    onClick = {
+                                        BridgeTelemetryBus.setAppMode(AppMode.COCKPIT, context)
+                                        val modeIntent = Intent(context, BridgeForegroundService::class.java).apply {
+                                            action = BridgeForegroundService.ACTION_SET_APP_MODE
+                                            putExtra(BridgeForegroundService.EXTRA_APP_MODE, AppMode.COCKPIT.id)
+                                        }
+                                        safeStartService(context, modeIntent)
+                                    },
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .heightIn(min = 42.dp)
+                                        .testTag("switch_to_cockpit_from_scale_btn"),
+                                    shape = RoundedCornerShape(10.dp)
+                                ) {
+                                    Text(
+                                        text = "Включить режим «Кокпит» (нативный экран ГУ без полос)",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        fontWeight = FontWeight.SemiBold
+                                    )
+                                }
+                            }
+
+                            if (selectedScaleMode == MirrorVideoScaleMode.SHIZUKU_16_9) {
+                                OutlinedButton(
+                                    onClick = {
+                                        CarLifeShizukuManager.restoreNativeDisplayAspectAsync(force = true)
+                                    },
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .heightIn(min = 42.dp)
+                                        .testTag("restore_native_display_aspect_btn"),
+                                    shape = RoundedCornerShape(10.dp)
+                                ) {
+                                    Text(
+                                        text = "Восстановить родной экран телефона (wm size reset)",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        fontWeight = FontWeight.SemiBold
+                                    )
+                                }
+                            }
+                        }
                     }
                 }
             }

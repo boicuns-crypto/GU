@@ -1314,6 +1314,7 @@ class BridgeForegroundService : Service() {
                         lastProtocolEvent = "Video Config Set: ${width}×${height} @ ${bitrate / 1000} kbps"
                     )
                 }
+                syncScreenKeepAliveState(force = true)
                 if (projectionManager.stats.value.isRunning) {
                     val wasReady = isVideoChannelReadyForStreaming
                     serviceScope.launch {
@@ -1409,7 +1410,8 @@ class BridgeForegroundService : Service() {
                     val shizukuSnap = CarLifeShizukuManager.refreshStatus(applicationContext)
                     val keepAliveCfg = ScreenKeepAlivePreferences.config.value
                     val needShizukuForMirroring = mode == AppMode.MIRRORING &&
-                        keepAliveCfg.fillCameraCutoutOnUsb &&
+                        (keepAliveCfg.fillCameraCutoutOnUsb ||
+                            keepAliveCfg.videoScaleMode == com.example.core.projection.MirrorVideoScaleMode.SHIZUKU_16_9) &&
                         shizukuSnap.isBinderAlive &&
                         shizukuSnap.hasPermission
                     if (mode == AppMode.SHIZUKU_COCKPIT || needShizukuForMirroring) {
@@ -1421,6 +1423,9 @@ class BridgeForegroundService : Service() {
                     if (mode != AppMode.MIRRORING) {
                         if (CarLifeShizukuManager.noCutoutOverlayEnabledByBridge) {
                             CarLifeShizukuManager.setNoCutoutOverlayEnabledAsync(false)
+                        }
+                        if (CarLifeShizukuManager.customDisplayAspectAppliedByBridge) {
+                            CarLifeShizukuManager.restoreNativeDisplayAspectAsync()
                         }
                     }
                 }
@@ -1657,6 +1662,10 @@ class BridgeForegroundService : Service() {
 
             ACTION_UPDATE_SCREEN_KEEP_ALIVE -> {
                 ScreenKeepAlivePreferences.init(applicationContext)
+                val cfg = ScreenKeepAlivePreferences.config.value
+                if (::projectionManager.isInitialized) {
+                    projectionManager.onVideoScaleModeChanged(cfg.videoScaleMode)
+                }
                 syncScreenKeepAliveState(force = true)
             }
 
@@ -1669,6 +1678,7 @@ class BridgeForegroundService : Service() {
                 }
                 serviceScope.launch {
                     runCatching { CarLifeShizukuManager.setNoCutoutOverlayEnabled(false) }
+                    runCatching { CarLifeShizukuManager.restoreNativeDisplayAspect(force = true) }
                     audioCaptureManager.stopCapture(
                         sendMediaStop = usbTransport.state.value is UsbTransportState.Connected
                     )
@@ -1706,7 +1716,14 @@ class BridgeForegroundService : Service() {
             isMirroringMode = mirroringMode,
             isShizukuReady = isShizukuReady
         )
-        if (shouldApplyShizukuCutout && CarLifeShizukuManager.userService == null) {
+        val shouldApplyShizukuAspect = ScreenKeepAliveManager.shouldApplyShizukuDisplayAspect(
+            videoScaleMode = cfg.videoScaleMode,
+            isUsbConnected = usbConnected,
+            isStreamingOrProjecting = isStreamingOrProjecting,
+            isMirroringMode = mirroringMode,
+            isShizukuReady = isShizukuReady
+        )
+        if ((shouldApplyShizukuCutout || shouldApplyShizukuAspect) && CarLifeShizukuManager.userService == null) {
             CarLifeShizukuManager.bindUserServiceIfReady(applicationContext)
         }
 
@@ -1716,6 +1733,29 @@ class BridgeForegroundService : Service() {
             }
         } else if (CarLifeShizukuManager.noCutoutOverlayEnabledByBridge) {
             CarLifeShizukuManager.setNoCutoutOverlayEnabledAsync(false)
+        }
+
+        if (shouldApplyShizukuAspect) {
+            val targetPair = activeWidth to activeHeight
+            if (CarLifeShizukuManager.userService != null &&
+                (!CarLifeShizukuManager.customDisplayAspectAppliedByBridge ||
+                    CarLifeShizukuManager.lastAppliedAspectTarget != targetPair)
+            ) {
+                CarLifeShizukuManager.applyCustomDisplayAspectAsync(
+                    targetWidth = activeWidth,
+                    targetHeight = activeHeight
+                ) {
+                    if (::projectionManager.isInitialized) {
+                        projectionManager.recalculatePhysicalScreenBounds(requestSyncOnChange = true)
+                    }
+                }
+            }
+        } else if (CarLifeShizukuManager.customDisplayAspectAppliedByBridge) {
+            CarLifeShizukuManager.restoreNativeDisplayAspectAsync {
+                if (::projectionManager.isInitialized) {
+                    projectionManager.recalculatePhysicalScreenBounds(requestSyncOnChange = true)
+                }
+            }
         }
 
         val currentTuple = Triple(true, usbConnected, mirroringMode)

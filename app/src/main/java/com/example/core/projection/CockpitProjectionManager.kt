@@ -489,14 +489,27 @@ class CockpitProjectionManager(
         refreshPhysicalScreenOrientation(requestSyncOnChange = requestSyncOnChange)
     }
 
+    fun onVideoScaleModeChanged(mode: MirrorVideoScaleMode) {
+        mirrorGlScaler?.updateScaleMode(mode)
+        recalculatePhysicalScreenBounds(requestSyncOnChange = true)
+    }
+
     private fun refreshPhysicalScreenOrientation(requestSyncOnChange: Boolean) {
         val currentSize = CarLifeAccessibilityService.instance?.getPhysicalScreenSize()
             ?: CarLifeAccessibilityService.computePhysicalScreenSize(appContext)
         val prev = lastKnownScreenSize
+        val targetW = _stats.value.width.coerceAtLeast(1)
+        val targetH = _stats.value.height.coerceAtLeast(1)
+        val activeScaleMode = ScreenKeepAlivePreferences.config.value.videoScaleMode
+        mirrorGlScaler?.updateGeometry(
+            newTargetWidth = targetW,
+            newTargetHeight = targetH,
+            newPhoneWidth = currentSize.first,
+            newPhoneHeight = currentSize.second,
+            newScaleMode = activeScaleMode
+        )
         if (prev != currentSize) {
             lastKnownScreenSize = currentSize
-            val targetW = _stats.value.width.coerceAtLeast(1)
-            val targetH = _stats.value.height.coerceAtLeast(1)
             val vd = virtualDisplay
             if (vd != null && virtualDisplayIsMirrorOnly) {
                 val targetDpi = virtualDisplayDpi.takeIf { it > 0 } ?: MIRROR_VIRTUAL_DISPLAY_DPI
@@ -512,6 +525,8 @@ class CockpitProjectionManager(
             if (requestSyncOnChange && prev != null && isVideoChannelReadyForStreaming) {
                 requestEncoderSyncFrameOnly()
             }
+        } else if (requestSyncOnChange && isVideoChannelReadyForStreaming) {
+            requestEncoderSyncFrameOnly()
         }
     }
 
@@ -973,13 +988,30 @@ class CockpitProjectionManager(
                     )
                 }
             } else {
-                // Pass MediaCodec inputSurface directly to VirtualDisplay so Android's
-                // VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR fits currentWindowMetrics.bounds into
-                // safeWidth × safeHeight (800×480, 1024×600, 1024×800, 1280×720) with preserved
-                // aspect ratio and zero vertical/horizontal geometric distortion.
-                mirrorGlScaler?.release()
-                mirrorGlScaler = null
-                val targetVdSurface: Surface = inputSurface
+                val (initPhoneW, initPhoneH) = lastKnownScreenSize
+                    ?: CarLifeAccessibilityService.instance?.getPhysicalScreenSize()
+                    ?: CarLifeAccessibilityService.computePhysicalScreenSize(appContext)
+                val activeScaleMode = ScreenKeepAlivePreferences.config.value.videoScaleMode
+                val targetVdSurface: Surface = if (wantMirrorOnlyFlags) {
+                    val scaler = FullScreenMirrorGlScaler(
+                        encoderOutputSurface = inputSurface,
+                        initialWidth = safeWidth,
+                        initialHeight = safeHeight,
+                        initialPhoneWidth = initPhoneW,
+                        initialPhoneHeight = initPhoneH,
+                        initialScaleMode = activeScaleMode
+                    )
+                    val glCaptureSurface = scaler.start()
+                    if (glCaptureSurface != null) {
+                        mirrorGlScaler = scaler
+                        glCaptureSurface
+                    } else {
+                        scaler.release()
+                        inputSurface
+                    }
+                } else {
+                    inputSurface
+                }
 
                 if (usedMediaProjection && vDisplay != null) {
                     val flagsMatch =
@@ -2099,6 +2131,10 @@ class CockpitProjectionManager(
                 }
                 val captureW = currentStats.width.takeIf { it > 0 }?.toFloat() ?: huTouchMaxX
                 val captureH = currentStats.height.takeIf { it > 0 }?.toFloat() ?: huTouchMaxY
+                val activeScaleMode = ScreenKeepAlivePreferences.config.value.videoScaleMode
+                val isCenterCropActive =
+                    (mirrorGlScaler?.isInitialized == true) &&
+                        (activeScaleMode == MirrorVideoScaleMode.CENTER_CROP_FULLSCREEN)
                 val mapped = CarLifeAccessibilityService.mapHuTouchToPhysicalScreenDetailed(
                     rawX = packet.rawX,
                     rawY = packet.rawY,
@@ -2109,7 +2145,8 @@ class CockpitProjectionManager(
                     applyEdgeGuard = touchCfg.edgeBackGuardEnabled,
                     captureWidth = captureW,
                     captureHeight = captureH,
-                    isFullScreenStretched = false
+                    isFullScreenStretched = false,
+                    isCenterCrop1to1 = isCenterCropActive
                 )
                 val orientLabel = if (mapped.isLandscape) "Landscape" else "Portrait"
                 val targetWInt = captureW.toInt()

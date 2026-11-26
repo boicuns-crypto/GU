@@ -744,7 +744,7 @@ fun CarLifeAppLauncherScreen(
                         isFloatingOverlay = false,
                         panelWidthDp = leftPanelWidthPx,
                         modifier = Modifier
-                            .padding(start = 4.dp, top = 4.dp, bottom = 6.dp)
+                            .padding(start = 4.dp, top = 4.dp, bottom = 4.dp)
                             .width(leftPanelWidthPx.dp)
                             .fillMaxHeight()
                     )
@@ -754,7 +754,7 @@ fun CarLifeAppLauncherScreen(
                         modifier = Modifier
                             .weight(1f)
                             .fillMaxHeight()
-                            .padding(start = 8.dp, top = 4.dp, end = 6.dp, bottom = 6.dp)
+                            .padding(start = 6.dp, top = 4.dp, end = 4.dp, bottom = 4.dp)
                     ) {
                         if (hasEverOpenedEmbeddedMap || isEmbeddedMapVisible) {
                             EmbeddedYandexMapsPane(
@@ -1027,7 +1027,7 @@ private fun InstalledAppsGridPanel(
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(horizontal = 12.dp, vertical = 8.dp),
+                .padding(horizontal = 12.dp, vertical = 10.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             // VW MIB3 Header: «JETTA Connect» + filter chips («Авто», «Все (N)») + refresh
@@ -1066,18 +1066,24 @@ private fun InstalledAppsGridPanel(
                             testTag = "filter_all_apps_chip",
                             onClick = { onSelectFilter(LauncherFilterPreferences.FILTER_ALL) }
                         )
-                        IconButton(
-                            onClick = onRefreshApps,
+                        Surface(
                             modifier = Modifier
-                                .size(48.dp)
-                                .testTag("refresh_apps_button")
+                                .size(34.dp)
+                                .clip(RoundedCornerShape(10.dp))
+                                .clickable(onClick = onRefreshApps)
+                                .testTag("refresh_apps_button"),
+                            color = colorScheme.surfaceVariant,
+                            shape = RoundedCornerShape(10.dp),
+                            border = BorderStroke(1.dp, colorScheme.outline)
                         ) {
-                            Icon(
-                                imageVector = Icons.Default.Refresh,
-                                contentDescription = "Обновить список приложений",
-                                tint = vw.accentBlue,
-                                modifier = Modifier.size(20.dp)
-                            )
+                            Box(contentAlignment = Alignment.Center) {
+                                Icon(
+                                    imageVector = Icons.Default.Refresh,
+                                    contentDescription = "Обновить список приложений",
+                                    tint = vw.accentBlue,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                            }
                         }
                     }
                 }

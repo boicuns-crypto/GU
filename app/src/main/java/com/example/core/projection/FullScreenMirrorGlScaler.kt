@@ -42,7 +42,8 @@ class FullScreenMirrorGlScaler(
     initialWidth: Int,
     initialHeight: Int,
     initialPhoneWidth: Int,
-    initialPhoneHeight: Int
+    initialPhoneHeight: Int,
+    initialScaleMode: MirrorVideoScaleMode = MirrorVideoScaleMode.CENTER_CROP_FULLSCREEN
 ) : SurfaceTexture.OnFrameAvailableListener {
 
     @Volatile
@@ -59,6 +60,10 @@ class FullScreenMirrorGlScaler(
 
     @Volatile
     var phoneScreenHeight: Int = initialPhoneHeight.coerceAtLeast(1)
+        private set
+
+    @Volatile
+    var scaleMode: MirrorVideoScaleMode = initialScaleMode
         private set
 
     private var glThread: HandlerThread? = null
@@ -142,13 +147,15 @@ class FullScreenMirrorGlScaler(
         newTargetWidth: Int,
         newTargetHeight: Int,
         newPhoneWidth: Int,
-        newPhoneHeight: Int
+        newPhoneHeight: Int,
+        newScaleMode: MirrorVideoScaleMode = scaleMode
     ) {
         val safeW = newTargetWidth.coerceAtLeast(1)
         val safeH = newTargetHeight.coerceAtLeast(1)
         val sizeChanged = (safeW != targetWidth || safeH != targetHeight)
         targetWidth = safeW
         targetHeight = safeH
+        scaleMode = newScaleMode
         if (newPhoneWidth > 0 && newPhoneHeight > 0) {
             phoneScreenWidth = newPhoneWidth
             phoneScreenHeight = newPhoneHeight
@@ -160,6 +167,10 @@ class FullScreenMirrorGlScaler(
         }
     }
 
+    fun updateScaleMode(newScaleMode: MirrorVideoScaleMode) {
+        scaleMode = newScaleMode
+    }
+
     override fun onFrameAvailable(st: SurfaceTexture?) {
         if (released.get() || !isInitialized) return
         val activeSt = surfaceTexture ?: return
@@ -169,12 +180,16 @@ class FullScreenMirrorGlScaler(
 
             val outW = targetWidth.coerceAtLeast(1)
             val outH = targetHeight.coerceAtLeast(1)
-            val crop = computeNormalizedActiveCropRect(
-                captureWidth = outW,
-                captureHeight = outH,
-                screenWidth = phoneScreenWidth,
-                screenHeight = phoneScreenHeight
-            )
+            val crop = when (scaleMode) {
+                MirrorVideoScaleMode.CENTER_CROP_FULLSCREEN -> computeCenterCrop1to1Rect(
+                    captureWidth = outW,
+                    captureHeight = outH,
+                    screenWidth = phoneScreenWidth,
+                    screenHeight = phoneScreenHeight
+                )
+                MirrorVideoScaleMode.FIT_NATIVE,
+                MirrorVideoScaleMode.SHIZUKU_16_9 -> ActiveCropRect(0f, 0f, 1f, 1f)
+            }
 
             GLES20.glViewport(0, 0, outW, outH)
             GLES20.glClearColor(0f, 0f, 0f, 1f)
@@ -455,6 +470,48 @@ class FullScreenMirrorGlScaler(
                 vOffset = vOffset,
                 uScale = uScale,
                 vScale = vScale
+            )
+        }
+
+        /**
+         * Variant 2 ([MirrorVideoScaleMode.CENTER_CROP_FULLSCREEN]):
+         * Computes a strictly 1:1 aspect-ratio-preserving (`uScale == vScale`) center-crop UV sub-rectangle.
+         *
+         * Because the input `VirtualDisplay` texture and the output encoder surface share the same
+         * `captureWidth × captureHeight` dimensions, setting `uScale = vScale = uniformSpan` magnifies
+         * horizontal and vertical pixels by the exact same factor:
+         * - Top and bottom letterbox black bars are 100% removed.
+         * - Circular buttons and icons remain strictly circular (zero oval distortion).
+         * - Only the excess left/right edges of a `19.5:9` phone screen (where the camera cutout and
+         *   system navigation bar sit) are cropped out.
+         */
+        fun computeCenterCrop1to1Rect(
+            captureWidth: Int,
+            captureHeight: Int,
+            screenWidth: Int,
+            screenHeight: Int
+        ): ActiveCropRect {
+            val safeCapW = captureWidth.coerceAtLeast(1).toFloat()
+            val safeCapH = captureHeight.coerceAtLeast(1).toFloat()
+            val safeScrW = screenWidth.coerceAtLeast(1).toFloat()
+            val safeScrH = screenHeight.coerceAtLeast(1).toFloat()
+
+            if (safeScrW < safeScrH) {
+                return ActiveCropRect(0f, 0f, 1f, 1f)
+            }
+
+            val fitScale = minOf(safeCapW / safeScrW, safeCapH / safeScrH)
+            val drawnW = (safeScrW * fitScale).coerceIn(1f, safeCapW)
+            val drawnH = (safeScrH * fitScale).coerceIn(1f, safeCapH)
+
+            val uniformSpan = minOf(drawnW / safeCapW, drawnH / safeCapH).coerceIn(0.1f, 1f)
+            val offset = ((1f - uniformSpan) * 0.5f).coerceIn(0f, 0.45f)
+
+            return ActiveCropRect(
+                uOffset = offset,
+                vOffset = offset,
+                uScale = uniformSpan,
+                vScale = uniformSpan
             )
         }
     }
