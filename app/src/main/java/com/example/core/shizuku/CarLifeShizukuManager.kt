@@ -57,6 +57,14 @@ object CarLifeShizukuManager {
     var noCutoutOverlayEnabledByBridge: Boolean = false
         private set
 
+    @Volatile
+    var customDisplayAspectAppliedByBridge: Boolean = false
+        private set
+
+    @Volatile
+    var lastAppliedAspectTarget: Pair<Int, Int>? = null
+        private set
+
     private val listenersInitialized = AtomicBoolean(false)
     private val bindingInProgress = AtomicBoolean(false)
     private val asyncExecutor = Executors.newSingleThreadExecutor { runnable ->
@@ -363,14 +371,89 @@ object CarLifeShizukuManager {
         }
     }
 
+    fun applyCustomDisplayAspect(targetWidth: Int, targetHeight: Int): Boolean {
+        val service = userService ?: return false
+        return runCatching {
+            val ok = service.applyCustomDisplayAspect(targetWidth, targetHeight)
+            if (ok) {
+                customDisplayAspectAppliedByBridge = true
+                lastAppliedAspectTarget = targetWidth to targetHeight
+            }
+            ok
+        }.onFailure { e ->
+            Log.w(TAG, "applyCustomDisplayAspect(${targetWidth}x${targetHeight}) IPC failed: ${e.message}")
+            handleIpcFailure()
+        }.getOrDefault(false)
+    }
+
+    fun applyCustomDisplayAspectAsync(
+        targetWidth: Int,
+        targetHeight: Int,
+        onComplete: ((Boolean) -> Unit)? = null
+    ) {
+        if (userService == null) {
+            onComplete?.invoke(false)
+            return
+        }
+        asyncExecutor.execute {
+            val ok = applyCustomDisplayAspect(targetWidth, targetHeight)
+            onComplete?.invoke(ok)
+        }
+    }
+
+    fun restoreNativeDisplayAspect(force: Boolean = false): Boolean {
+        if (!force && !customDisplayAspectAppliedByBridge) {
+            return true
+        }
+        val service = userService ?: run {
+            customDisplayAspectAppliedByBridge = false
+            lastAppliedAspectTarget = null
+            return false
+        }
+        return runCatching {
+            val ok = service.restoreNativeDisplayAspect()
+            customDisplayAspectAppliedByBridge = false
+            lastAppliedAspectTarget = null
+            ok
+        }.onFailure { e ->
+            Log.w(TAG, "restoreNativeDisplayAspect IPC failed: ${e.message}")
+            customDisplayAspectAppliedByBridge = false
+            lastAppliedAspectTarget = null
+            handleIpcFailure()
+        }.getOrDefault(false)
+    }
+
+    fun restoreNativeDisplayAspectAsync(
+        force: Boolean = false,
+        onComplete: ((Boolean) -> Unit)? = null
+    ) {
+        if (!force && !customDisplayAspectAppliedByBridge) {
+            onComplete?.invoke(true)
+            return
+        }
+        if (userService == null) {
+            customDisplayAspectAppliedByBridge = false
+            lastAppliedAspectTarget = null
+            onComplete?.invoke(false)
+            return
+        }
+        asyncExecutor.execute {
+            val ok = restoreNativeDisplayAspect(force = force)
+            onComplete?.invoke(ok)
+        }
+    }
+
     fun cleanupAndResetThenUnbind(context: Context? = appContext) {
         val ctx = context?.applicationContext ?: context ?: appContext
         if (userService == null) {
             noCutoutOverlayEnabledByBridge = false
+            customDisplayAspectAppliedByBridge = false
+            lastAppliedAspectTarget = null
             unbindUserService(ctx)
             return
         }
         asyncExecutor.execute {
+            runCatching { restoreNativeDisplayAspect(force = false) }
             runCatching { setNoCutoutOverlayEnabled(false) }
             unbindUserService(ctx)
         }
@@ -437,6 +520,8 @@ object CarLifeShizukuManager {
         userService = null
         autoBindWhenReady = false
         noCutoutOverlayEnabledByBridge = false
+        customDisplayAspectAppliedByBridge = false
+        lastAppliedAspectTarget = null
         bindingInProgress.set(false)
         _status.value = ShizukuStatusState()
     }

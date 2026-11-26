@@ -2219,7 +2219,7 @@ class BridgeForegroundService : Service() {
             is UsbTransportState.Error ->
                 state.reason
             UsbTransportState.Disconnected ->
-                "JETTA Connect — ожидание USB-подключения к ГУ Jetta VS7 (CarLife)"
+                "JETTA Connect — ожидание USB-подключения к ГУ Jetta VS7"
         }
 
         return NotificationCompat.Builder(this, NOTIFICATION_CHANNEL_ID)

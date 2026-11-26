@@ -1793,6 +1793,17 @@ class ExampleRobolectricTest {
       (1..6).map { "guide_step_$it" },
       steps.map { it.drawableName }
     )
+    assertEquals("ШАГ 1 • ПОДКЛЮЧЕНИЕ ПО USB", steps[0].badge)
+    assertEquals(
+      "Подключите смартфон качественным USB-кабелем к разъёму мультимедиа на Jetta VS7, перейдите на ГУ в раздел подключения смартфона и выберите «Всегда открывать JETTA Connect».",
+      steps[0].summary
+    )
+    assertTrue(steps.none { step ->
+      step.badge.contains("CarLife", ignoreCase = true) ||
+        step.title.contains("CarLife", ignoreCase = true) ||
+        step.summary.contains("CarLife", ignoreCase = true) ||
+        step.highlights.any { it.contains("CarLife", ignoreCase = true) }
+    })
     assertTrue(steps.all { it.badge.isNotBlank() && it.title.isNotBlank() && it.summary.isNotBlank() && it.highlights.isNotEmpty() })
     assertEquals(0, SetupGuideCatalog.resolveOptionalGuideDrawableId(context, 0))
     assertEquals(0, SetupGuideCatalog.resolveOptionalGuideDrawableId(context, 1))

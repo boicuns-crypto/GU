@@ -137,6 +137,39 @@ enum class AppLaunchMode(
 }
 
 /**
+ * Persistent SharedPreferences store for the selected Launcher app filter (`Авто` vs `Все`),
+ * defaulting to [FILTER_AUTO] (`1`) on startup.
+ */
+object LauncherFilterPreferences {
+    const val PREFS_NAME = "carlife_bridge_prefs"
+    const val KEY_LAUNCHER_APP_FILTER = "launcher_app_filter"
+    const val FILTER_ALL = 0
+    const val FILTER_AUTO = 1
+
+    fun loadSelectedFilter(context: Context): Int {
+        return runCatching {
+            val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            when (val raw = prefs.all[KEY_LAUNCHER_APP_FILTER]) {
+                is Int -> if (raw == FILTER_ALL) FILTER_ALL else FILTER_AUTO
+                is String -> if (raw.equals("ALL", ignoreCase = true) || raw == "0") FILTER_ALL else FILTER_AUTO
+                else -> FILTER_AUTO
+            }
+        }.getOrDefault(FILTER_AUTO)
+    }
+
+    fun saveSelectedFilter(context: Context, filter: Int) {
+        val normalized = if (filter == FILTER_ALL) FILTER_ALL else FILTER_AUTO
+        runCatching {
+            context.applicationContext
+                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putInt(KEY_LAUNCHER_APP_FILTER, normalized)
+                .apply()
+        }
+    }
+}
+
+/**
  * Right-pane content mode in Standard Cockpit (`Presentation`, `x = 250..1280`).
  */
 enum class CockpitRightPane {
@@ -614,7 +647,13 @@ fun CarLifeAppLauncherScreen(
     val activeRightPane by CockpitUiStateController.activeRightPane.collectAsState()
     val mapController = remember { EmbeddedYandexMapsController() }
 
-    var selectedFilter by remember { mutableIntStateOf(0) } // 0 = All, 1 = Priority/Nav & Media
+    var selectedFilter by remember {
+        mutableIntStateOf(LauncherFilterPreferences.loadSelectedFilter(context))
+    } // 1 = AUTO (default), 0 = ALL
+    val updateSelectedFilter: (Int) -> Unit = { newFilter ->
+        selectedFilter = newFilter
+        LauncherFilterPreferences.saveSelectedFilter(context, newFilter)
+    }
     var hasEverOpenedEmbeddedMap by remember { mutableStateOf(false) }
 
     LaunchedEffect(activeRightPane) {
@@ -636,7 +675,7 @@ fun CarLifeAppLauncherScreen(
 
     val filteredApps = remember(apps, selectedFilter) {
         when (selectedFilter) {
-            1 -> apps.filter { it.isAutomotivePriority }.ifEmpty { apps }
+            LauncherFilterPreferences.FILTER_AUTO -> apps.filter { it.isAutomotivePriority }.ifEmpty { apps }
             else -> apps
         }
     }
@@ -644,7 +683,6 @@ fun CarLifeAppLauncherScreen(
     val isEmbeddedMapVisible = activeRightPane == CockpitRightPane.EMBEDDED_MAP
 
     val handleHomeAction = {
-        selectedFilter = 0
         CockpitUiStateController.showGrid()
         onHomePressed()
     }
@@ -685,12 +723,13 @@ fun CarLifeAppLauncherScreen(
             modifier = Modifier.fillMaxSize()
         ) {
             val isWideScreen = maxWidth >= 560.dp
+            val leftPanelWidthPx = computeVwLeftPanelWidthPx(maxWidth.value.toInt())
 
             if (isWideScreen) {
                 Row(
                     modifier = Modifier.fillMaxSize()
                 ) {
-                    // Exact 250 px (250.dp at 160 dpi) Permanent VW Left Panel (x = 0..250)
+                    // Permanent VW Left Panel (250 px at 1280×720, 220 px at 1024×800/600, 190 px at 800×480)
                     VwCockpitLeftPanel(
                         virtualDisplayId = virtualDisplayId,
                         mediaState = mediaState,
@@ -703,9 +742,10 @@ fun CarLifeAppLauncherScreen(
                         onPreviousTrack = onPreviousTrack,
                         onRequestNotificationAccess = onRequestNotificationAccess,
                         isFloatingOverlay = false,
+                        panelWidthDp = leftPanelWidthPx,
                         modifier = Modifier
-                            .padding(start = 0.dp, top = 0.dp, bottom = 0.dp)
-                            .width(VW_LEFT_PANEL_WIDTH_PX.dp)
+                            .padding(start = 4.dp, top = 4.dp, bottom = 4.dp)
+                            .width(leftPanelWidthPx.dp)
                             .fillMaxHeight()
                     )
 
@@ -714,7 +754,7 @@ fun CarLifeAppLauncherScreen(
                         modifier = Modifier
                             .weight(1f)
                             .fillMaxHeight()
-                            .padding(start = 10.dp, top = 10.dp, end = 10.dp, bottom = 10.dp)
+                            .padding(start = 6.dp, top = 4.dp, end = 4.dp, bottom = 4.dp)
                     ) {
                         if (hasEverOpenedEmbeddedMap || isEmbeddedMapVisible) {
                             EmbeddedYandexMapsPane(
@@ -734,7 +774,7 @@ fun CarLifeAppLauncherScreen(
                                 totalAppCount = apps.size,
                                 selectedFilter = selectedFilter,
                                 isWideScreen = true,
-                                onSelectFilter = { selectedFilter = it },
+                                onSelectFilter = updateSelectedFilter,
                                 onRefreshApps = {
                                     scope.launch {
                                         CarLifeLauncherRepository.loadInstalledApps(context)
@@ -759,8 +799,8 @@ fun CarLifeAppLauncherScreen(
                 Column(
                     modifier = Modifier
                         .fillMaxSize()
-                        .padding(12.dp),
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                        .padding(start = 10.dp, top = 4.dp, end = 10.dp, bottom = 8.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     CompactTopDockBar(
                         virtualDisplayId = virtualDisplayId,
@@ -798,7 +838,7 @@ fun CarLifeAppLauncherScreen(
                                 totalAppCount = apps.size,
                                 selectedFilter = selectedFilter,
                                 isWideScreen = false,
-                                onSelectFilter = { selectedFilter = it },
+                                onSelectFilter = updateSelectedFilter,
                                 onRefreshApps = {
                                     scope.launch {
                                         CarLifeLauncherRepository.loadInstalledApps(context)
@@ -987,25 +1027,27 @@ private fun InstalledAppsGridPanel(
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(14.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            // VW MIB3 Header: «JETTA Connect • Приложения» + filter chips + refresh
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            // VW MIB3 Header: «JETTA Connect» + filter chips («Авто», «Все (N)») + refresh
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
-                        text = "JETTA Connect • Приложения",
+                        text = "JETTA Connect",
                         style = MaterialTheme.typography.titleMedium.copy(
                             fontWeight = FontWeight.SemiBold
                         ),
                         color = colorScheme.onSurface,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.weight(1f)
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag("launcher_panel_title")
                     )
 
                     Row(
@@ -1013,29 +1055,35 @@ private fun InstalledAppsGridPanel(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         FilterTabChip(
-                            label = "Все ($totalAppCount)",
-                            selected = selectedFilter == 0,
-                            testTag = "filter_all_apps_chip",
-                            onClick = { onSelectFilter(0) }
+                            label = "Авто",
+                            selected = selectedFilter == LauncherFilterPreferences.FILTER_AUTO,
+                            testTag = "filter_auto_apps_chip",
+                            onClick = { onSelectFilter(LauncherFilterPreferences.FILTER_AUTO) }
                         )
                         FilterTabChip(
-                            label = "Авто",
-                            selected = selectedFilter == 1,
-                            testTag = "filter_auto_apps_chip",
-                            onClick = { onSelectFilter(1) }
+                            label = "Все ($totalAppCount)",
+                            selected = selectedFilter == LauncherFilterPreferences.FILTER_ALL,
+                            testTag = "filter_all_apps_chip",
+                            onClick = { onSelectFilter(LauncherFilterPreferences.FILTER_ALL) }
                         )
-                        IconButton(
-                            onClick = onRefreshApps,
+                        Surface(
                             modifier = Modifier
-                                .size(48.dp)
-                                .testTag("refresh_apps_button")
+                                .size(34.dp)
+                                .clip(RoundedCornerShape(10.dp))
+                                .clickable(onClick = onRefreshApps)
+                                .testTag("refresh_apps_button"),
+                            color = colorScheme.surfaceVariant,
+                            shape = RoundedCornerShape(10.dp),
+                            border = BorderStroke(1.dp, colorScheme.outline)
                         ) {
-                            Icon(
-                                imageVector = Icons.Default.Refresh,
-                                contentDescription = "Обновить список приложений",
-                                tint = vw.accentBlue,
-                                modifier = Modifier.size(20.dp)
-                            )
+                            Box(contentAlignment = Alignment.Center) {
+                                Icon(
+                                    imageVector = Icons.Default.Refresh,
+                                    contentDescription = "Обновить список приложений",
+                                    tint = vw.accentBlue,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                            }
                         }
                     }
                 }

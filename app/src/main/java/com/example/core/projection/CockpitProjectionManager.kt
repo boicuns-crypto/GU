@@ -275,7 +275,7 @@ enum class AppMode(
     MIRRORING(
         id = "mirroring",
         title = "Зеркалирование (Экран телефона)",
-        subtitle = "Прямой захват экрана смартфона (MediaProjection, 1280×720@30fps). Тач 0x0006 идёт строго через CarLifeAccessibilityService."
+        subtitle = "Прямой захват экрана смартфона (MediaProjection, 1280×720@30fps). Тач 0x0006 идёт строго через службу Спец. возможностей JETTA Connect."
     ),
     SHIZUKU_COCKPIT(
         id = "shizuku_cockpit",
@@ -308,7 +308,7 @@ enum class VideoSourceMode(
     VIRTUAL_DISPLAY(
         id = "virtual_display",
         title = "Виртуальный экран (VD + Лаунчер)",
-        subtitle = "Захват VirtualDisplay / MediaProjection + оверлей лаунчера CarLife (Presentation)"
+        subtitle = "Захват VirtualDisplay / MediaProjection + оверлей лаунчера JETTA Connect (Presentation)"
     ),
     CANVAS_TEST_CARD(
         id = "canvas_test_card",
