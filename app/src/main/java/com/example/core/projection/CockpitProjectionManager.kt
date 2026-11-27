@@ -1778,7 +1778,7 @@ class CockpitProjectionManager(
         canvas.drawRoundRect(gridPanelRect, 20f * scale, 20f * scale, borderPaint)
 
         canvas.drawText(
-            "JETTA Connect • Приложения",
+            "JETTA Connect",
             gridPanelRect.left + 18f * scale,
             gridPanelRect.top + 36f * scale,
             titlePaint

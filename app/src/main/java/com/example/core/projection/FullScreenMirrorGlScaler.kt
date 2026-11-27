@@ -187,8 +187,7 @@ class FullScreenMirrorGlScaler(
                     screenWidth = phoneScreenWidth,
                     screenHeight = phoneScreenHeight
                 )
-                MirrorVideoScaleMode.FIT_NATIVE,
-                MirrorVideoScaleMode.SHIZUKU_16_9 -> ActiveCropRect(0f, 0f, 1f, 1f)
+                MirrorVideoScaleMode.FIT_NATIVE -> ActiveCropRect(0f, 0f, 1f, 1f)
             }
 
             GLES20.glViewport(0, 0, outW, outH)

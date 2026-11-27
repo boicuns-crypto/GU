@@ -727,7 +727,8 @@ fun CarLifeAppLauncherScreen(
 
             if (isWideScreen) {
                 Row(
-                    modifier = Modifier.fillMaxSize()
+                    modifier = Modifier.fillMaxSize(),
+                    verticalAlignment = Alignment.Top
                 ) {
                     // Permanent VW Left Panel (250 px at 1280×720, 220 px at 1024×800/600, 190 px at 800×480)
                     VwCockpitLeftPanel(
@@ -744,7 +745,7 @@ fun CarLifeAppLauncherScreen(
                         isFloatingOverlay = false,
                         panelWidthDp = leftPanelWidthPx,
                         modifier = Modifier
-                            .padding(start = 4.dp, top = 4.dp, bottom = 4.dp)
+                            .padding(start = 4.dp, top = 4.dp, bottom = 8.dp)
                             .width(leftPanelWidthPx.dp)
                             .fillMaxHeight()
                     )
@@ -754,7 +755,7 @@ fun CarLifeAppLauncherScreen(
                         modifier = Modifier
                             .weight(1f)
                             .fillMaxHeight()
-                            .padding(start = 6.dp, top = 4.dp, end = 4.dp, bottom = 4.dp)
+                            .padding(start = 6.dp, top = 4.dp, end = 4.dp, bottom = 8.dp)
                     ) {
                         if (hasEverOpenedEmbeddedMap || isEmbeddedMapVisible) {
                             EmbeddedYandexMapsPane(
@@ -1018,7 +1019,7 @@ private fun InstalledAppsGridPanel(
     val vw = MaterialTheme.vwColors
 
     Card(
-        modifier = modifier,
+        modifier = modifier.fillMaxHeight(),
         shape = RoundedCornerShape(14.dp),
         colors = CardDefaults.cardColors(containerColor = colorScheme.surface),
         elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),

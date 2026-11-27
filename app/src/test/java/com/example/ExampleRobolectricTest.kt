@@ -1697,10 +1697,39 @@ class ExampleRobolectricTest {
       assertTrue(cfg.keepAliveOnScreenOff)
       assertTrue(cfg.fillCameraCutoutOnUsb)
 
-      // Ensure ICarLifeShizukuService has no setMirroringAspect16by9 or resetDisplaySize methods
+      // Ensure ICarLifeShizukuService has no wm size methods
       val aidlMethodNames = ICarLifeShizukuService::class.java.declaredMethods.map { it.name }
       assertFalse(aidlMethodNames.contains("setMirroringAspect16by9"))
       assertFalse(aidlMethodNames.contains("resetDisplaySize"))
+      assertFalse(aidlMethodNames.contains("applyCustomDisplayAspect"))
+      assertFalse(aidlMethodNames.contains("restoreNativeDisplayAspect"))
+      assertEquals(2, com.example.core.projection.MirrorVideoScaleMode.entries.size)
+
+      // Launcher filter defaults to AUTO (1) and persists to SharedPreferences
+      context.getSharedPreferences(com.example.feature.cockpit.LauncherFilterPreferences.PREFS_NAME, Context.MODE_PRIVATE)
+        .edit()
+        .remove(com.example.feature.cockpit.LauncherFilterPreferences.KEY_LAUNCHER_APP_FILTER)
+        .commit()
+      assertEquals(
+        com.example.feature.cockpit.LauncherFilterPreferences.FILTER_AUTO,
+        com.example.feature.cockpit.LauncherFilterPreferences.loadSelectedFilter(context)
+      )
+      com.example.feature.cockpit.LauncherFilterPreferences.saveSelectedFilter(
+        context,
+        com.example.feature.cockpit.LauncherFilterPreferences.FILTER_ALL
+      )
+      assertEquals(
+        com.example.feature.cockpit.LauncherFilterPreferences.FILTER_ALL,
+        com.example.feature.cockpit.LauncherFilterPreferences.loadSelectedFilter(context)
+      )
+      com.example.feature.cockpit.LauncherFilterPreferences.saveSelectedFilter(
+        context,
+        com.example.feature.cockpit.LauncherFilterPreferences.FILTER_AUTO
+      )
+      assertEquals(
+        com.example.feature.cockpit.LauncherFilterPreferences.FILTER_AUTO,
+        com.example.feature.cockpit.LauncherFilterPreferences.loadSelectedFilter(context)
+      )
 
       // CockpitProjectionManager calculates physical screen bounds strictly from native phone metrics
       val projManager = CockpitProjectionManager(context = context, onEncodedVideoNal = { _, _, _ -> })

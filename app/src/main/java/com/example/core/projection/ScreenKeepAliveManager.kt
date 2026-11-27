@@ -24,15 +24,12 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
 /**
- * Three selectable video frame scaling & aspect-ratio variants configured in
- * «Параметры видеопотока H.264» (Settings):
- * 1. [FIT_NATIVE]: Variant 1 — Renders Cockpit/Shizuku natively at Head Unit resolution (`16:9` / `targetWidth × targetHeight`),
+ * Selectable video frame scaling variants configured in «Параметры видеопотока H.264» (Settings):
+ * 1. [FIT_NATIVE]: Variant 1 — Renders Cockpit/Shizuku natively at Head Unit resolution (`targetWidth × targetHeight`),
  *    and in Mirroring mode fits the smartphone screen `1:1` with zero cropping and zero vertical stretching.
  * 2. [CENTER_CROP_FULLSCREEN]: Variant 2 — Fills 100% of the Head Unit height & width in Mirroring mode without top/bottom
  *    black bars and without oval distortion (`1:1` uniform zoom, cropping only the extra 19.5:9 side margins where the
  *    camera cutout and navigation bar sit).
- * 3. [SHIZUKU_16_9]: Variant 3 — Temporarily switches the smartphone display to the Head Unit's aspect ratio (`16:9` / target aspect)
- *    via Shizuku (`wm size`) while USB is connected, and automatically restores the native screen when USB disconnects.
  */
 enum class MirrorVideoScaleMode(
     val id: String,
@@ -51,12 +48,6 @@ enum class MirrorVideoScaleMode(
         shortTitle = "2. Без полос (Crop)",
         fullTitle = "Вариант 2 • Полный экран без полос (Умная обрезка краёв 1:1)",
         description = "Заполняет 100% высоты и ширины ГУ без чёрных полос сверху/снизу и без искажения пропорций (круги остаются круглыми): лишние боковые края 19.5:9 (область камеры и полоса навигации) аккуратно обрезаются."
-    ),
-    SHIZUKU_16_9(
-        id = "shizuku_16_9",
-        shortTitle = "3. Shizuku 16:9",
-        fullTitle = "Вариант 3 • Полный экран 16:9 (через Shizuku wm size)",
-        description = "При подключении USB временно переключает экран смартфона в пропорции ГУ (16:9) через Shizuku — весь Android перестраивается на 100% экрана ГУ без полос и без обрезки. При отключении USB автоматически возвращает родной экран."
     );
 
     companion object {
@@ -621,18 +612,6 @@ class ScreenKeepAliveManager(
             isMirroringMode: Boolean,
             isShizukuReady: Boolean
         ): Boolean = fillCameraCutoutOnUsb &&
-            isUsbConnected &&
-            isStreamingOrProjecting &&
-            isMirroringMode &&
-            isShizukuReady
-
-        fun shouldApplyShizukuDisplayAspect(
-            videoScaleMode: MirrorVideoScaleMode,
-            isUsbConnected: Boolean,
-            isStreamingOrProjecting: Boolean,
-            isMirroringMode: Boolean,
-            isShizukuReady: Boolean
-        ): Boolean = videoScaleMode == MirrorVideoScaleMode.SHIZUKU_16_9 &&
             isUsbConnected &&
             isStreamingOrProjecting &&
             isMirroringMode &&

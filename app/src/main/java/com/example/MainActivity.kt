@@ -179,7 +179,6 @@ class MainActivity : ComponentActivity() {
             if (intent.action == UsbManager.ACTION_USB_ACCESSORY_DETACHED) {
                 restoreDefaultWindowCutoutAndBars()
                 CarLifeShizukuManager.setNoCutoutOverlayEnabledAsync(false)
-                CarLifeShizukuManager.restoreNativeDisplayAspectAsync()
             }
         }
     }
@@ -261,8 +260,8 @@ class MainActivity : ComponentActivity() {
 
             LaunchedEffect(isUsbConnected, isStreamingOrProjecting, shouldFillCutout) {
                 applyDisplayCutoutOnUsbState(
-                    hideSystemBars = isUsbConnected || isStreamingOrProjecting || shouldFillCutout,
-                    enableFullCutout = shouldFillCutout || isUsbConnected || isStreamingOrProjecting
+                    hideSystemBars = shouldFillCutout,
+                    enableFullCutout = shouldFillCutout
                 )
             }
 
@@ -325,8 +324,7 @@ class MainActivity : ComponentActivity() {
             val snapshot = CarLifeShizukuManager.refreshStatus(this)
             val appMode = BridgeTelemetryBus.runtimeState.value.appMode
             val cfg = ScreenKeepAlivePreferences.config.value
-            val needShizukuForMirroring = appMode == AppMode.MIRRORING &&
-                (cfg.fillCameraCutoutOnUsb || cfg.videoScaleMode == MirrorVideoScaleMode.SHIZUKU_16_9)
+            val needShizukuForMirroring = appMode == AppMode.MIRRORING && cfg.fillCameraCutoutOnUsb
             if ((appMode == AppMode.SHIZUKU_COCKPIT || needShizukuForMirroring) &&
                 snapshot.isBinderAlive &&
                 snapshot.hasPermission
@@ -353,7 +351,7 @@ class MainActivity : ComponentActivity() {
             isUsbConnected = isUsbConnected,
             isStreamingOrProjecting = isStreamingOrProjecting
         )
-        if (isUsbConnected || isStreamingOrProjecting || shouldFillCutout) {
+        if (shouldFillCutout) {
             applyDisplayCutoutOnUsbState(
                 hideSystemBars = true,
                 enableFullCutout = true
@@ -877,7 +875,7 @@ fun CarLifeBridgeApp(
     Scaffold(
         modifier = Modifier.fillMaxSize(),
         containerColor = colorScheme.background,
-        contentWindowInsets = WindowInsets.safeDrawing,
+        contentWindowInsets = WindowInsets(0, 0, 0, 0),
         topBar = {
             if (showPhoneTopBar) {
                 VwPhoneTopBar(
@@ -950,7 +948,7 @@ fun CarLifeBridgeApp(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding)
-                .consumeWindowInsets(innerPadding)
+                .then(if (!showPhoneTopBar) Modifier.statusBarsPadding() else Modifier)
         ) {
             val isUsbOrStreamingActive =
                 runtimeState.transportState is UsbTransportState.Connected ||
@@ -990,7 +988,8 @@ fun CarLifeBridgeApp(
                                 )
                             )
                         }
-                    )
+                    ),
+                verticalAlignment = Alignment.Top
             ) {
             if (isLandscape) {
                 Surface(
@@ -3949,7 +3948,7 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                     )
 
                     Text(
-                        text = "Масштабирование экрана на ГУ (3 варианта без растягивания)",
+                        text = "Масштабирование экрана на ГУ (2 варианта без растягивания)",
                         style = MaterialTheme.typography.labelMedium.tabular(),
                         color = colorScheme.onSurfaceVariant
                     )
@@ -4024,25 +4023,6 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                 ) {
                                     Text(
                                         text = "Включить режим «Кокпит» (нативный экран ГУ без полос)",
-                                        style = MaterialTheme.typography.labelMedium,
-                                        fontWeight = FontWeight.SemiBold
-                                    )
-                                }
-                            }
-
-                            if (selectedScaleMode == MirrorVideoScaleMode.SHIZUKU_16_9) {
-                                OutlinedButton(
-                                    onClick = {
-                                        CarLifeShizukuManager.restoreNativeDisplayAspectAsync(force = true)
-                                    },
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .heightIn(min = 42.dp)
-                                        .testTag("restore_native_display_aspect_btn"),
-                                    shape = RoundedCornerShape(10.dp)
-                                ) {
-                                    Text(
-                                        text = "Восстановить родной экран телефона (wm size reset)",
                                         style = MaterialTheme.typography.labelMedium,
                                         fontWeight = FontWeight.SemiBold
                                     )
