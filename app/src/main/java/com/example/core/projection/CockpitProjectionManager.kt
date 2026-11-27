@@ -77,6 +77,7 @@ import com.example.feature.cockpit.CockpitUiStateController
 import com.example.feature.cockpit.MediaControllerRepository
 import com.example.feature.cockpit.MediaPlayerController
 import com.example.feature.cockpit.VW_LEFT_PANEL_WIDTH_PX
+import com.example.feature.cockpit.computeVwLeftPanelWidthPx
 import com.example.protocol.carlife.CarLifeFrameCodec
 import com.example.protocol.carlife.CarLifeHardKey
 import com.example.protocol.carlife.CarLifeTouchDecoder
@@ -323,6 +324,16 @@ enum class VideoSourceMode(
 }
 
 /**
+ * Fit-center content rectangle of the smartphone screen inside the encoded H.264 frame (`encWidth × encHeight`).
+ */
+data class FitCenterContentRect(
+    val contentOffsetX: Float = 0f,
+    val contentOffsetY: Float = 0f,
+    val contentWidth: Float = 1280f,
+    val contentHeight: Float = 720f
+)
+
+/**
  * Live telemetry of the Video Source + Hardware H.264 MediaCodec + Touch Injection pipeline.
  */
 data class ProjectionPipelineStats(
@@ -347,6 +358,10 @@ data class ProjectionPipelineStats(
     val phoneScreenWidth: Int = 0,
     val phoneScreenHeight: Int = 0,
     val isPhoneLandscape: Boolean = false,
+    val contentOffsetX: Float = 0f,
+    val contentOffsetY: Float = 0f,
+    val contentWidth: Float = 1280f,
+    val contentHeight: Float = 720f,
     val bitRateMbps: Int = 2,
     val bitRateKbps: Int = 2000,
     val encodedNalFrames: Long = 0L,
@@ -493,11 +508,21 @@ class CockpitProjectionManager(
         val prev = lastKnownScreenSize
         if (prev != currentSize) {
             lastKnownScreenSize = currentSize
-            _stats.update {
-                it.copy(
+            _stats.update { current ->
+                val fitRect = computeFitCenterContentRect(
+                    encWidth = current.width.coerceAtLeast(1),
+                    encHeight = current.height.coerceAtLeast(1),
+                    screenWidth = currentSize.first,
+                    screenHeight = currentSize.second
+                )
+                current.copy(
                     phoneScreenWidth = currentSize.first,
                     phoneScreenHeight = currentSize.second,
-                    isPhoneLandscape = currentSize.first > currentSize.second
+                    isPhoneLandscape = currentSize.first > currentSize.second,
+                    contentOffsetX = fitRect.contentOffsetX,
+                    contentOffsetY = fitRect.contentOffsetY,
+                    contentWidth = fitRect.contentWidth,
+                    contentHeight = fitRect.contentHeight
                 )
             }
             if (requestSyncOnChange && prev != null && isVideoChannelReadyForStreaming) {
@@ -560,7 +585,7 @@ class CockpitProjectionManager(
         ).also { shizukuLeftPanelOverlay = it }
         overlay.show(
             display = display,
-            panelWidthPx = VW_LEFT_PANEL_WIDTH_PX,
+            panelWidthPx = computeVwLeftPanelWidthPx(_stats.value.width),
             displayHeightPx = heightPx
         )
     }
@@ -810,7 +835,7 @@ class CockpitProjectionManager(
         val effectiveDpi = if (targetAppMode == AppMode.MIRRORING || sourceMode == VideoSourceMode.SCREEN_MIRRORING) {
             MIRROR_VIRTUAL_DISPLAY_DPI
         } else {
-            FIXED_VIRTUAL_DISPLAY_DPI
+            computeCockpitDensityDpi(safeWidth)
         }
         return startProjection(safeWidth, safeHeight, safeFps, safeBitRate, effectiveDpi, sourceMode, targetAppMode)
     }
@@ -844,12 +869,13 @@ class CockpitProjectionManager(
         val safeHeight = if (height in 272..2160) height else 720
         val safeFps = if (frameRate in 15..60) frameRate else 30
         val safeBitRate = bitRate.coerceIn(400_000, 12_000_000)
-        // Use 160 dpi for VirtualDisplay Cockpit / Shizuku and 180 dpi (inside 160–200) for MediaProjection Mirroring
-        // so Android SurfaceFlinger does not render excessive QHD+ pixels from S26 Ultra.
+        // Auto-select Cockpit / Shizuku VirtualDisplay DPI from HU width:
+        // <= 1024 -> 160 dpi, > 1024 (e.g. 1280x720) -> 200 dpi.
+        // Mirroring uses 180 dpi for smooth aspect-preserving fit-center rendering.
         val effectiveDpi = if (targetAppMode == AppMode.MIRRORING || sourceMode == VideoSourceMode.SCREEN_MIRRORING) {
             densityDpi.coerceIn(160, 200).let { if (it == FIXED_VIRTUAL_DISPLAY_DPI) MIRROR_VIRTUAL_DISPLAY_DPI else it }
         } else {
-            FIXED_VIRTUAL_DISPLAY_DPI
+            computeCockpitDensityDpi(safeWidth)
         }
 
         if (sourceMode == VideoSourceMode.VIRTUAL_DISPLAY && CarLifeLauncherRepository.installedApps.value.isEmpty()) {
@@ -1189,6 +1215,12 @@ class CockpitProjectionManager(
 
                     val (livePhoneW, livePhoneH) = CarLifeAccessibilityService.instance?.getPhysicalScreenSize()
                         ?: CarLifeAccessibilityService.computePhysicalScreenSize(appContext)
+                    val fitRect = computeFitCenterContentRect(
+                        encWidth = safeWidth,
+                        encHeight = safeHeight,
+                        screenWidth = livePhoneW,
+                        screenHeight = livePhoneH
+                    )
 
                     _stats.update {
                         it.copy(
@@ -1208,6 +1240,10 @@ class CockpitProjectionManager(
                             phoneScreenWidth = livePhoneW,
                             phoneScreenHeight = livePhoneH,
                             isPhoneLandscape = livePhoneW > livePhoneH,
+                            contentOffsetX = fitRect.contentOffsetX,
+                            contentOffsetY = fitRect.contentOffsetY,
+                            contentWidth = fitRect.contentWidth,
+                            contentHeight = fitRect.contentHeight,
                             bitRateMbps = (safeBitRate / 1_000_000).coerceAtLeast(1),
                             bitRateKbps = safeBitRate / 1_000,
                             activeCockpitWidget = when {
@@ -1873,12 +1909,13 @@ class CockpitProjectionManager(
             try {
                 return withContext(Dispatchers.Main.immediate) {
                     val baseDisplayContext = runCatching { appContext.createDisplayContext(display) }.getOrElse { appContext }
-                    // Synchronize Presentation densityDpi = 160 and exact targetWidth x targetHeight (1280x720)
+                    val effectiveDpi = computeCockpitDensityDpi(targetWidth)
+                    // Synchronize Presentation densityDpi (160 for <=1024, 200 for >1024) and exact encWidth x encHeight
                     val fixedConfig = Configuration(baseDisplayContext.resources.configuration).apply {
-                        densityDpi = FIXED_VIRTUAL_DISPLAY_DPI
-                        screenWidthDp = targetWidth
-                        screenHeightDp = targetHeight
-                        smallestScreenWidthDp = minOf(targetWidth, targetHeight)
+                        densityDpi = effectiveDpi
+                        screenWidthDp = (targetWidth * 160 / effectiveDpi).coerceAtLeast(320)
+                        screenHeightDp = (targetHeight * 160 / effectiveDpi).coerceAtLeast(240)
+                        smallestScreenWidthDp = minOf(screenWidthDp, screenHeightDp)
                     }
                     val displayContext = runCatching {
                         baseDisplayContext.createConfigurationContext(fixedConfig)
@@ -2060,10 +2097,14 @@ class CockpitProjectionManager(
     suspend fun injectTouchPacket(packet: CarLifeTouchPacket): Boolean {
         val currentStats = _stats.value
         val touchCfg = TouchSettingsPreferences.config.value
-        val huTouchMaxX = packet.huWidth.takeIf { it > 0 }?.toFloat()
-            ?: CarLifeTouchDecoder.DEFAULT_HU_TOUCH_MAX_X
-        val huTouchMaxY = packet.huHeight.takeIf { it > 0 }?.toFloat()
-            ?: CarLifeTouchDecoder.DEFAULT_HU_TOUCH_MAX_Y
+        val encWidth = currentStats.width.coerceAtLeast(1)
+        val encHeight = currentStats.height.coerceAtLeast(1)
+        val touchBaseW = packet.huWidth.takeIf { it > 0 }?.toFloat() ?: encWidth.toFloat()
+        val touchBaseH = packet.huHeight.takeIf { it > 0 }?.toFloat() ?: encHeight.toFloat()
+
+        // Convert raw HU coordinates (huX, huY) into encoded video frame coordinates (frameX, frameY)
+        val frameX = ((packet.rawX.toFloat() / touchBaseW) * encWidth.toFloat()).coerceIn(0f, encWidth.toFloat())
+        val frameY = ((packet.rawY.toFloat() / touchBaseH) * encHeight.toFloat()).coerceIn(0f, encHeight.toFloat())
 
         return withContext(Dispatchers.Main.immediate) {
             if (appMode == AppMode.MIRRORING) {
@@ -2077,38 +2118,27 @@ class CockpitProjectionManager(
                         lastKnownScreenSize = it
                     }
                 }
-                val mapped = CarLifeAccessibilityService.mapHuTouchToPhysicalScreenDetailed(
-                    rawX = packet.rawX,
-                    rawY = packet.rawY,
-                    huWidth = huTouchMaxX,
-                    huHeight = huTouchMaxY,
+                val fitRect = computeFitCenterContentRect(
+                    encWidth = encWidth,
+                    encHeight = encHeight,
+                    screenWidth = screenW,
+                    screenHeight = screenH
+                )
+                val (phoneX, phoneY) = mapFrameTouchToPhoneScreen(
+                    frameX = frameX,
+                    frameY = frameY,
+                    fitRect = fitRect,
                     screenWidth = screenW,
                     screenHeight = screenH,
                     applyEdgeGuard = touchCfg.edgeBackGuardEnabled
                 )
-                val orientLabel = if (mapped.isLandscape) "Landscape" else "Portrait"
-
-                if (!mapped.isInsideActiveArea) {
-                    if (packet.androidAction != MotionEvent.ACTION_MOVE) {
-                        val skippedLabel =
-                            "Тач в чёрном поле HU(${packet.rawX},${packet.rawY}) пропущен ($screenW×$screenH $orientLabel)"
-                        _stats.update {
-                            it.copy(
-                                phoneScreenWidth = screenW,
-                                phoneScreenHeight = screenH,
-                                isPhoneLandscape = mapped.isLandscape,
-                                lastTouchDiagnostic = skippedLabel
-                            )
-                        }
-                    }
-                    return@withContext false
-                }
+                val isLandscape = screenW > screenH
 
                 val a11yDispatched = a11yService?.handleMotionStream(
                     displayId = Display.DEFAULT_DISPLAY,
                     action = packet.androidAction,
-                    x = mapped.x,
-                    y = mapped.y,
+                    x = phoneX,
+                    y = phoneY,
                     synthesizeClickUp = packet.synthesizeClickUp,
                     isDoubleClick = packet.isDoubleClick,
                     isLongPress = packet.isLongPress
@@ -2117,30 +2147,29 @@ class CockpitProjectionManager(
                 val nowMs = SystemClock.elapsedRealtime()
                 val shouldPublishStats = packet.androidAction != MotionEvent.ACTION_MOVE ||
                     a11yService == null ||
-                    (nowMs - lastMirrorTouchStatsUpdateMs) >= 250L
+                    (nowMs - lastMirrorTouchStatsUpdateMs) >= 120L
                 if (shouldPublishStats) {
                     lastMirrorTouchStatsUpdateMs = nowMs
-                    val gestureTag = when {
-                        packet.isDoubleClick -> "2xTAP"
-                        packet.isLongPress -> "LONG"
-                        else -> "TOUCH"
-                    }
-                    val statusLabel = if (a11yService != null) {
-                        "Mirror $gestureTag HU(${packet.rawX},${packet.rawY}) -> (${mapped.x.toInt()},${mapped.y.toInt()}) / ${screenW}×${screenH} $orientLabel"
+                    val diagLine = if (a11yService != null) {
+                        "HU(${packet.rawX}, ${packet.rawY}) → Target(${phoneX.toInt()}, ${phoneY.toInt()}) [Зеркалирование]"
                     } else {
-                        "Touch 0x0006 получен, но CarLifeAccessibilityService ВЫКЛ!"
+                        "HU(${packet.rawX}, ${packet.rawY}) → Target(${phoneX.toInt()}, ${phoneY.toInt()}) [Зеркалирование • CarLifeAccessibilityService ВЫКЛ]"
                     }
 
                     _stats.update {
                         it.copy(
                             injectedTouches = it.injectedTouches + 1L,
-                            lastTouchPoint = mapped.x to mapped.y,
+                            lastTouchPoint = phoneX to phoneY,
                             phoneScreenWidth = screenW,
                             phoneScreenHeight = screenH,
-                            isPhoneLandscape = mapped.isLandscape,
-                            lastTouchDiagnostic = statusLabel,
-                            activeCockpitWidget = statusLabel,
-                            statusMessage = statusLabel
+                            isPhoneLandscape = isLandscape,
+                            contentOffsetX = fitRect.contentOffsetX,
+                            contentOffsetY = fitRect.contentOffsetY,
+                            contentWidth = fitRect.contentWidth,
+                            contentHeight = fitRect.contentHeight,
+                            lastTouchDiagnostic = diagLine,
+                            activeCockpitWidget = diagLine,
+                            statusMessage = diagLine
                         )
                     }
                 }
@@ -2149,16 +2178,9 @@ class CockpitProjectionManager(
 
             if (appMode == AppMode.SHIZUKU_COCKPIT) {
                 val vDisplayId = virtualDisplay?.display?.displayId ?: currentStats.virtualDisplayId
-                val targetWidth = currentStats.width.coerceAtLeast(1)
-                val targetHeight = currentStats.height.coerceAtLeast(1)
-                val (scaledX, scaledY) = CarLifeTouchDecoder.scaleTouchCoordinates(
-                    rawX = packet.rawX,
-                    rawY = packet.rawY,
-                    currentSurfaceWidth = targetWidth,
-                    currentSurfaceHeight = targetHeight,
-                    huTouchMaxX = huTouchMaxX,
-                    huTouchMaxY = huTouchMaxY
-                )
+                val scaledX = frameX
+                val scaledY = frameY
+                val leftPanelBoundaryPx = computeVwLeftPanelWidthPx(encWidth).toFloat()
 
                 // Suppress sub-deadzone coordinate micro-jitter on ACTION_MOVE
                 if (packet.androidAction == MotionEvent.ACTION_MOVE && !lastShizukuMoveX.isNaN()) {
@@ -2180,7 +2202,7 @@ class CockpitProjectionManager(
                 val downTime = when (packet.androidAction) {
                     MotionEvent.ACTION_DOWN -> {
                         lastDownTime.set(nowUptime)
-                        shizukuTouchDownInLeftPanel = scaledX < VW_LEFT_PANEL_WIDTH_PX.toFloat()
+                        shizukuTouchDownInLeftPanel = scaledX < leftPanelBoundaryPx
                         nowUptime
                     }
                     MotionEvent.ACTION_MOVE,
@@ -2196,14 +2218,14 @@ class CockpitProjectionManager(
                 }
                 val eventTime = maxOf(downTime, nowUptime)
                 val routeToLeftPanel = shizukuTouchDownInLeftPanel ||
-                    (packet.androidAction == MotionEvent.ACTION_DOWN && scaledX < VW_LEFT_PANEL_WIDTH_PX.toFloat())
+                    (packet.androidAction == MotionEvent.ACTION_DOWN && scaledX < leftPanelBoundaryPx)
                 if (packet.androidAction == MotionEvent.ACTION_UP || packet.androidAction == MotionEvent.ACTION_CANCEL) {
                     shizukuTouchDownInLeftPanel = false
                 }
 
                 // Smart touch routing for SHIZUKU_COCKPIT:
-                // 1) x < 250 -> Left VW Panel (Overlay when Navigator/2GIS is open, or Presentation when Launcher Grid is open)
-                // 2) x >= 250 -> Presentation decorView if Launcher Grid is active, otherwise Shizuku injectTouch -> VirtualDisplay
+                // 1) x < leftPanelBoundaryPx -> Left VW Panel (Overlay when Navigator/2GIS is open, or Presentation when Launcher Grid is open)
+                // 2) x >= leftPanelBoundaryPx -> Presentation decorView if Launcher Grid is active, otherwise Shizuku injectTouch -> VirtualDisplay
                 val leftPanelTargetView = if (routeToLeftPanel) {
                     shizukuLeftPanelViewForTesting
                         ?: shizukuLeftPanelOverlay?.rootView
@@ -2220,6 +2242,7 @@ class CockpitProjectionManager(
                     null
                 }
 
+                val diagLine = "HU(${packet.rawX}, ${packet.rawY}) → Target(${scaledX.toInt()}, ${scaledY.toInt()}) [Кокпит + Shizuku]"
                 val directPanelView = leftPanelTargetView ?: launcherRightTargetView
                 if (directPanelView != null) {
                     val dispatched = dispatchSynthesizedMotionEvent(
@@ -2242,17 +2265,13 @@ class CockpitProjectionManager(
                             y = scaledY
                         )
                     }
-                    val zoneLabel = if (routeToLeftPanel) {
-                        "VW Left Panel (${scaledX.toInt()}, ${scaledY.toInt()})"
-                    } else {
-                        "Shizuku Launcher Grid (${scaledX.toInt()}, ${scaledY.toInt()})"
-                    }
                     _stats.update {
                         it.copy(
                             injectedTouches = it.injectedTouches + 1L,
                             lastTouchPoint = scaledX to scaledY,
-                            activeCockpitWidget = zoneLabel,
-                            statusMessage = zoneLabel
+                            lastTouchDiagnostic = diagLine,
+                            activeCockpitWidget = diagLine,
+                            statusMessage = diagLine
                         )
                     }
                     return@withContext dispatched
@@ -2279,8 +2298,8 @@ class CockpitProjectionManager(
                     )
                 }
 
-                val statusLabel = if (shizukuDispatched) {
-                    "Shizuku Touch (${scaledX.toInt()}, ${scaledY.toInt()}) -> VD #$vDisplayId"
+                val shizukuStatusMsg = if (shizukuDispatched) {
+                    "Shizuku Touch ($diagLine) -> VD #$vDisplayId"
                 } else {
                     "Touch 0x0006 получен, но Shizuku UserService (${CarLifeShizukuManager.status.value.statusLabel})"
                 }
@@ -2289,30 +2308,31 @@ class CockpitProjectionManager(
                     it.copy(
                         injectedTouches = it.injectedTouches + 1L,
                         lastTouchPoint = scaledX to scaledY,
-                        activeCockpitWidget = statusLabel,
-                        statusMessage = statusLabel
+                        lastTouchDiagnostic = diagLine,
+                        activeCockpitWidget = diagLine,
+                        statusMessage = shizukuStatusMsg
                     )
                 }
                 return@withContext shizukuDispatched
             }
 
             // AppMode.COCKPIT: Strictly dispatch to presentation.window.decorView.dispatchTouchEvent(event)
-            // preserving lastDownTime from ACTION_DOWN to ACTION_UP. Never invoke CarLifeAccessibilityService.
+            // on main thread, preserving lastDownTime from ACTION_DOWN to ACTION_UP. Never invoke CarLifeAccessibilityService.
             val vDisplayId = virtualDisplay?.display?.displayId ?: Display.DEFAULT_DISPLAY
             val decorView = cockpitPresentation?.window?.decorView
-            val currentSurfaceWidth = decorView?.width?.takeIf { it > 0 }
-                ?: currentStats.width.coerceAtLeast(1)
-            val currentSurfaceHeight = decorView?.height?.takeIf { it > 0 }
-                ?: currentStats.height.coerceAtLeast(1)
+            val currentSurfaceWidth = decorView?.width?.takeIf { it > 0 } ?: encWidth
+            val currentSurfaceHeight = decorView?.height?.takeIf { it > 0 } ?: encHeight
 
-            val (scaledX, scaledY) = CarLifeTouchDecoder.scaleTouchCoordinates(
-                rawX = packet.rawX,
-                rawY = packet.rawY,
-                currentSurfaceWidth = currentSurfaceWidth,
-                currentSurfaceHeight = currentSurfaceHeight,
-                huTouchMaxX = huTouchMaxX,
-                huTouchMaxY = huTouchMaxY
-            )
+            val scaledX = if (currentSurfaceWidth == encWidth) {
+                frameX
+            } else {
+                (frameX * (currentSurfaceWidth.toFloat() / encWidth.toFloat())).coerceIn(0f, currentSurfaceWidth.toFloat())
+            }
+            val scaledY = if (currentSurfaceHeight == encHeight) {
+                frameY
+            } else {
+                (frameY * (currentSurfaceHeight.toFloat() / encHeight.toFloat())).coerceIn(0f, currentSurfaceHeight.toFloat())
+            }
 
             // Suppress sub-deadzone coordinate micro-jitter on ACTION_MOVE
             if (packet.androidAction == MotionEvent.ACTION_MOVE && !lastCockpitMoveX.isNaN()) {
@@ -2383,18 +2403,14 @@ class CockpitProjectionManager(
                 )
             }
 
-            val zoneHit = if (scaledX < currentSurfaceWidth * 0.25f) {
-                "Dock Bar (${scaledX.toInt()}, ${scaledY.toInt()}) on VD #$vDisplayId"
-            } else {
-                "App Grid (${scaledX.toInt()}, ${scaledY.toInt()}) on VD #$vDisplayId"
-            }
-
+            val diagLine = "HU(${packet.rawX}, ${packet.rawY}) → Target(${scaledX.toInt()}, ${scaledY.toInt()}) [Кокпит]"
             _stats.update {
                 it.copy(
                     injectedTouches = it.injectedTouches + 1L,
                     lastTouchPoint = scaledX to scaledY,
-                    activeCockpitWidget = zoneHit,
-                    statusMessage = "Cockpit Touch -> $zoneHit"
+                    lastTouchDiagnostic = diagLine,
+                    activeCockpitWidget = diagLine,
+                    statusMessage = "Cockpit Touch -> $diagLine"
                 )
             }
             viewDispatched
@@ -3201,9 +3217,72 @@ class CockpitProjectionManager(
         const val DEFAULT_HEIGHT = 720
         const val DEFAULT_BITRATE_BPS = 2_000_000
         const val FIXED_VIRTUAL_DISPLAY_DPI = DisplayMetrics.DENSITY_MEDIUM // 160 dpi
+        const val HD_VIRTUAL_DISPLAY_DPI = 200 // 200 dpi for 1280×720+ Cockpit / Shizuku displays
         const val MIRROR_VIRTUAL_DISPLAY_DPI = 180 // 160..200 dpi for smooth QHD+ -> 720p mirroring
         const val SAMSUNG_QP_P_MAX_KEY = "video-qp-p-max"
         const val SAMSUNG_QP_P_MAX_VALUE = 36
+
+        /**
+         * Auto-selects Cockpit / Cockpit+Shizuku VirtualDisplay DPI from the negotiated encoder width:
+         * - `<= 1024` (e.g. `800×480`, `1024×600`, `1024×800`) → `160 dpi`
+         * - `> 1024` (e.g. `1280×720`) → `200 dpi`
+         */
+        fun computeCockpitDensityDpi(encWidth: Int): Int =
+            if (encWidth <= 1024) FIXED_VIRTUAL_DISPLAY_DPI else HD_VIRTUAL_DISPLAY_DPI
+
+        /**
+         * Computes the `fit-center` content rectangle of the smartphone physical screen inside the
+         * encoded H.264 frame (`encWidth × encHeight`), preserving aspect ratio without stretching.
+         */
+        fun computeFitCenterContentRect(
+            encWidth: Int,
+            encHeight: Int,
+            screenWidth: Int,
+            screenHeight: Int
+        ): FitCenterContentRect {
+            val safeEncW = encWidth.coerceAtLeast(1).toFloat()
+            val safeEncH = encHeight.coerceAtLeast(1).toFloat()
+            val safeScreenW = screenWidth.coerceAtLeast(1).toFloat()
+            val safeScreenH = screenHeight.coerceAtLeast(1).toFloat()
+            val scale = minOf(safeEncW / safeScreenW, safeEncH / safeScreenH)
+            val contentW = (safeScreenW * scale).coerceAtLeast(1f)
+            val contentH = (safeScreenH * scale).coerceAtLeast(1f)
+            val offsetX = (safeEncW - contentW) / 2f
+            val offsetY = (safeEncH - contentH) / 2f
+            return FitCenterContentRect(
+                contentOffsetX = offsetX,
+                contentOffsetY = offsetY,
+                contentWidth = contentW,
+                contentHeight = contentH
+            )
+        }
+
+        /**
+         * Maps encoded-frame coordinates `(frameX, frameY)` to smartphone screen pixels `(phoneX, phoneY)`
+         * using `fit-center` bounds and clamping outside clicks (`coerceIn(0f, 1f)`).
+         */
+        fun mapFrameTouchToPhoneScreen(
+            frameX: Float,
+            frameY: Float,
+            fitRect: FitCenterContentRect,
+            screenWidth: Int,
+            screenHeight: Int,
+            applyEdgeGuard: Boolean = true
+        ): Pair<Float, Float> {
+            val safeScreenW = screenWidth.coerceAtLeast(1).toFloat()
+            val safeScreenH = screenHeight.coerceAtLeast(1).toFloat()
+            val normX = ((frameX - fitRect.contentOffsetX) / fitRect.contentWidth.coerceAtLeast(1f)).coerceIn(0f, 1f)
+            val normY = ((frameY - fitRect.contentOffsetY) / fitRect.contentHeight.coerceAtLeast(1f)).coerceIn(0f, 1f)
+            var phoneX = (normX * safeScreenW).coerceIn(0f, (safeScreenW - 1f).coerceAtLeast(0f))
+            val phoneY = (normY * safeScreenH).coerceIn(0f, (safeScreenH - 1f).coerceAtLeast(0f))
+            if (applyEdgeGuard && safeScreenW > CarLifeAccessibilityService.EDGE_BACK_GUARD_PX * 4f) {
+                phoneX = phoneX.coerceIn(
+                    CarLifeAccessibilityService.EDGE_BACK_GUARD_PX,
+                    (safeScreenW - 1f) - CarLifeAccessibilityService.EDGE_BACK_GUARD_PX
+                )
+            }
+            return phoneX to phoneY
+        }
 
         /**
          * Builds the preferred H.264 [MediaFormat] matching `MediaFormatUtils.smali` with strict

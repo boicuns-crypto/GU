@@ -137,6 +137,7 @@ import com.example.core.projection.AppMode
 import com.example.core.projection.MediaProjectionTokenStore
 import com.example.core.projection.MirrorVideoScaleMode
 import com.example.core.projection.ScreenKeepAliveManager
+import com.example.core.projection.CockpitProjectionManager
 import com.example.core.projection.ScreenKeepAlivePreferences
 import com.example.core.shizuku.CarLifeShizukuManager
 import com.example.core.shizuku.ShizukuStatusState
@@ -1147,22 +1148,45 @@ fun CarLifeBridgeApp(
                         mediaState = mediaState,
                         checklistStatus = checklistStatus,
                         permissions = permissionsSnapshot,
+                        isAutoHuResolution = runtimeState.isAutoHuResolution,
                         configuredWidth = runtimeState.configuredWidth,
                         configuredHeight = runtimeState.configuredHeight,
                         configuredBitrateKbps = runtimeState.configuredBitrateBps / 1_000,
+                        onSelectAutoResolution = {
+                            val currentBitrate = runtimeState.configuredBitrateBps
+                            BridgeTelemetryBus.setVideoResolutionPreference(
+                                isAuto = true,
+                                context = context
+                            )
+                            val updated = BridgeTelemetryBus.runtimeState.value
+                            configuredWidth = updated.configuredWidth
+                            configuredHeight = updated.configuredHeight
+                            CarLifeLauncherRepository.markLauncherActiveOnDisplay(
+                                displayId = updated.projectionStats.virtualDisplayId,
+                                width = updated.configuredWidth,
+                                height = updated.configuredHeight,
+                                bitrateBps = currentBitrate
+                            )
+                            val cfgIntent = Intent(context, BridgeForegroundService::class.java).apply {
+                                action = BridgeForegroundService.ACTION_SET_VIDEO_CONFIG
+                                putExtra(BridgeForegroundService.EXTRA_AUTO_HU_RESOLUTION, true)
+                                putExtra(BridgeForegroundService.EXTRA_BITRATE, currentBitrate)
+                            }
+                            safeStartService(context, cfgIntent)
+                        },
                         onSelectResolution = { w, h ->
                             configuredWidth = w
                             configuredHeight = h
                             val currentBitrate = runtimeState.configuredBitrateBps
+                            BridgeTelemetryBus.setVideoResolutionPreference(
+                                isAuto = false,
+                                width = w,
+                                height = h,
+                                context = context
+                            )
                             BridgeTelemetryBus.updateState {
                                 it.copy(
-                                    configuredWidth = w,
-                                    configuredHeight = h,
-                                    projectionStats = it.projectionStats.copy(width = w, height = h),
-                                    controlSession = it.controlSession.copy(
-                                        negotiatedVideoWidth = w,
-                                        negotiatedVideoHeight = h
-                                    )
+                                    projectionStats = it.projectionStats.copy(width = w, height = h)
                                 )
                             }
                             CarLifeLauncherRepository.markLauncherActiveOnDisplay(
@@ -1173,6 +1197,7 @@ fun CarLifeBridgeApp(
                             )
                             val cfgIntent = Intent(context, BridgeForegroundService::class.java).apply {
                                 action = BridgeForegroundService.ACTION_SET_VIDEO_CONFIG
+                                putExtra(BridgeForegroundService.EXTRA_AUTO_HU_RESOLUTION, false)
                                 putExtra(BridgeForegroundService.EXTRA_WIDTH, w)
                                 putExtra(BridgeForegroundService.EXTRA_HEIGHT, h)
                                 putExtra(BridgeForegroundService.EXTRA_BITRATE, currentBitrate)
@@ -1195,6 +1220,7 @@ fun CarLifeBridgeApp(
                             )
                             val cfgIntent = Intent(context, BridgeForegroundService::class.java).apply {
                                 action = BridgeForegroundService.ACTION_SET_VIDEO_CONFIG
+                                putExtra(BridgeForegroundService.EXTRA_AUTO_HU_RESOLUTION, runtimeState.isAutoHuResolution)
                                 putExtra(BridgeForegroundService.EXTRA_WIDTH, w)
                                 putExtra(BridgeForegroundService.EXTRA_HEIGHT, h)
                                 putExtra(BridgeForegroundService.EXTRA_BITRATE, bps)
@@ -2601,9 +2627,11 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
     mediaState: MediaState,
     checklistStatus: SetupChecklistStatus,
     permissions: AppPermissionsSnapshot = AppPermissionsSnapshot(),
+    isAutoHuResolution: Boolean = true,
     configuredWidth: Int,
     configuredHeight: Int,
     configuredBitrateKbps: Int,
+    onSelectAutoResolution: () -> Unit = {},
     onSelectResolution: (Int, Int) -> Unit,
     onSelectBitrate: (Int) -> Unit,
     onOpenOverlaySettings: () -> Unit,
@@ -3869,10 +3897,23 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                         )
                     }
 
+                    val activeCockpitDpi = CockpitProjectionManager.computeCockpitDensityDpi(configuredWidth)
                     Text(
-                        text = "Разрешение экрана ГУ (по умолчанию 1280×720 • 160 dpi)",
+                        text = if (isAutoHuResolution) {
+                            "Разрешение экрана ГУ: Авто (от ГУ) • Кодек ${configuredWidth}×${configuredHeight} • ${activeCockpitDpi} dpi"
+                        } else {
+                            "Разрешение экрана ГУ (ручной выбор): ${configuredWidth}×${configuredHeight} • ${activeCockpitDpi} dpi"
+                        },
                         style = MaterialTheme.typography.labelMedium.tabular(),
                         color = colorScheme.onSurfaceVariant
+                    )
+
+                    SelectableOptionButton(
+                        label = "Авто (от ГУ) — по умолчанию",
+                        selected = isAutoHuResolution,
+                        testTag = "res_auto_hu_btn",
+                        onClick = onSelectAutoResolution,
+                        modifier = Modifier.fillMaxWidth()
                     )
 
                     Row(
@@ -3881,28 +3922,28 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                     ) {
                         SelectableOptionButton(
                             label = "800 × 480",
-                            selected = configuredWidth == 800 && configuredHeight == 480,
+                            selected = !isAutoHuResolution && configuredWidth == 800 && configuredHeight == 480,
                             testTag = "res_480p_btn",
                             onClick = { onSelectResolution(800, 480) },
                             modifier = Modifier.weight(1f)
                         )
                         SelectableOptionButton(
                             label = "1024 × 600",
-                            selected = configuredWidth == 1024 && configuredHeight == 600,
+                            selected = !isAutoHuResolution && configuredWidth == 1024 && configuredHeight == 600,
                             testTag = "res_600p_btn",
                             onClick = { onSelectResolution(1024, 600) },
                             modifier = Modifier.weight(1f)
                         )
                         SelectableOptionButton(
                             label = "1024 × 800",
-                            selected = configuredWidth == 1024 && configuredHeight == 800,
+                            selected = !isAutoHuResolution && configuredWidth == 1024 && configuredHeight == 800,
                             testTag = "res_800p_btn",
                             onClick = { onSelectResolution(1024, 800) },
                             modifier = Modifier.weight(1f)
                         )
                         SelectableOptionButton(
                             label = "1280 × 720",
-                            selected = configuredWidth == 1280 && configuredHeight == 720,
+                            selected = !isAutoHuResolution && configuredWidth == 1280 && configuredHeight == 720,
                             testTag = "res_720p_btn",
                             onClick = { onSelectResolution(1280, 720) },
                             modifier = Modifier.weight(1f)
@@ -4072,23 +4113,50 @@ private fun UnifiedSettingsAndDiagnosticsScreen(
                                 color = colorScheme.onSurfaceVariant
                             )
                             Spacer(modifier = Modifier.height(6.dp))
+                            val huReqW = state.controlSession.huRequestedWidth
+                            val huReqH = state.controlSession.huRequestedHeight
+                            val huReqFps = state.controlSession.huRequestedFps
+                            val encW = state.projectionStats.width.takeIf { it > 0 } ?: state.configuredWidth
+                            val encH = state.projectionStats.height.takeIf { it > 0 } ?: state.configuredHeight
                             Surface(
                                 color = colorScheme.surfaceVariant,
                                 shape = RoundedCornerShape(8.dp),
                                 border = BorderStroke(1.dp, colorScheme.outline.copy(alpha = 0.7f))
                             ) {
-                                Text(
-                                    text = "Последняя клавиша руля: ${state.lastSteeringWheelKeyEvent}",
-                                    style = MaterialTheme.typography.labelSmall.tabular(),
-                                    fontFamily = JetBrainsMonoFamily,
-                                    color = vw.accentBlue,
-                                    maxLines = 2,
-                                    overflow = TextOverflow.Ellipsis,
+                                Column(
                                     modifier = Modifier
                                         .fillMaxWidth()
-                                        .padding(horizontal = 10.dp, vertical = 6.dp)
-                                        .testTag("last_steering_wheel_key_text")
-                                )
+                                        .padding(horizontal = 10.dp, vertical = 6.dp),
+                                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                                ) {
+                                    Text(
+                                        text = "Видео ГУ: Запрос ГУ: ${huReqW}×${huReqH}@${huReqFps} → Кодек: ${encW}×${encH}",
+                                        style = MaterialTheme.typography.labelSmall.tabular(),
+                                        fontFamily = JetBrainsMonoFamily,
+                                        color = colorScheme.onSurface,
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.testTag("diag_hu_video_negotiation_text")
+                                    )
+                                    Text(
+                                        text = "Последний тач: ${state.projectionStats.lastTouchDiagnostic}",
+                                        style = MaterialTheme.typography.labelSmall.tabular(),
+                                        fontFamily = JetBrainsMonoFamily,
+                                        color = vw.accentBlue,
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.testTag("diag_last_touch_mapping_text")
+                                    )
+                                    Text(
+                                        text = "Последняя клавиша руля: ${state.lastSteeringWheelKeyEvent}",
+                                        style = MaterialTheme.typography.labelSmall.tabular(),
+                                        fontFamily = JetBrainsMonoFamily,
+                                        color = colorScheme.onSurfaceVariant,
+                                        maxLines = 2,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.testTag("last_steering_wheel_key_text")
+                                    )
+                                }
                             }
                         }
                         Icon(

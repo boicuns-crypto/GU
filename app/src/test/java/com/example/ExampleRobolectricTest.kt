@@ -1940,7 +1940,172 @@ class ExampleRobolectricTest {
     )
     assertTrue(shizukuReady.allMandatoryReady)
   }
+
+  @Test
+  fun `video encoder init auto-negotiation aligns HU resolution to 16px, defaults fps 0 to 30, and supports manual override`() {
+    val sm = com.example.protocol.carlife.CarLifeControlStateMachine()
+    assertTrue("Auto HU resolution must be enabled by default", sm.useAutoHuResolution)
+
+    // 1. HU sends 1024x600@0 via 0x00018007 -> fps defaults to 30, height aligns down to 592 (16px multiple)
+    val huInitBody = com.example.protocol.carlife.CarlifeVideoEncoderInfoProto(
+      width = 1024,
+      height = 600,
+      frameRate = 0
+    ).encode()
+    val initFrame = com.example.protocol.carlife.CarLifeFrameCodec.createCommandFrame(
+      channel = com.example.protocol.carlife.CarLifeChannel.CONTROL,
+      serviceType = com.example.protocol.carlife.CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT,
+      commandBody = huInitBody
+    )
+    val res1 = sm.onControlFrame(initFrame)
+    assertEquals(1024, res1.updatedState.huRequestedWidth)
+    assertEquals(600, res1.updatedState.huRequestedHeight)
+    assertEquals(30, res1.updatedState.huRequestedFps)
+    assertEquals(1024, res1.updatedState.negotiatedVideoWidth)
+    assertEquals(592, res1.updatedState.negotiatedVideoHeight)
+    assertEquals(30, res1.updatedState.negotiatedFps)
+
+    val replyCmd = res1.outboundFrames.single().parseCommandMessageOrNull()!!
+    assertEquals(com.example.protocol.carlife.CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT_DONE, replyCmd.serviceType)
+    val replyInfo = com.example.protocol.carlife.CarlifeVideoEncoderInfoProto.decodeRaw(replyCmd.body)
+    assertEquals(1024, replyInfo.width)
+    assertEquals(592, replyInfo.height)
+    assertEquals(30, replyInfo.frameRate)
+
+    // 2. Legacy RX 0x00010002 with 0x0@0 falls back cleanly to 1280x720@30
+    val emptyInitFrame = com.example.protocol.carlife.CarLifeFrameCodec.createCommandFrame(
+      channel = com.example.protocol.carlife.CarLifeChannel.CONTROL,
+      serviceType = com.example.protocol.carlife.CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT_LEGACY,
+      commandBody = ByteArray(0)
+    )
+    val res2 = sm.onControlFrame(emptyInitFrame)
+    assertEquals(0, res2.updatedState.huRequestedWidth)
+    assertEquals(0, res2.updatedState.huRequestedHeight)
+    assertEquals(30, res2.updatedState.huRequestedFps)
+    assertEquals(1280, res2.updatedState.negotiatedVideoWidth)
+    assertEquals(720, res2.updatedState.negotiatedVideoHeight)
+
+    // 3. Manual preset override ignores HU request while still saving raw HU values
+    sm.setPreferredResolution(800, 480)
+    sm.setAutoHuResolution(false)
+    val hu1280Frame = com.example.protocol.carlife.CarLifeFrameCodec.createCommandFrame(
+      channel = com.example.protocol.carlife.CarLifeChannel.CONTROL,
+      serviceType = com.example.protocol.carlife.CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT,
+      commandBody = com.example.protocol.carlife.CarlifeVideoEncoderInfoProto(1280, 720, 25).encode()
+    )
+    val res3 = sm.onControlFrame(hu1280Frame)
+    assertEquals(1280, res3.updatedState.huRequestedWidth)
+    assertEquals(720, res3.updatedState.huRequestedHeight)
+    assertEquals(25, res3.updatedState.huRequestedFps)
+    assertEquals(800, res3.updatedState.negotiatedVideoWidth)
+    assertEquals(480, res3.updatedState.negotiatedVideoHeight)
+    assertEquals(25, res3.updatedState.negotiatedFps)
+  }
+
+  @Test
+  fun `cockpit DPI auto-selection, fit-center touch clamping, and 0x0006000x touch packet decoding work accurately`() {
+    // 1. DPI auto-selection from HU width
+    assertEquals(160, CockpitProjectionManager.computeCockpitDensityDpi(800))
+    assertEquals(160, CockpitProjectionManager.computeCockpitDensityDpi(1024))
+    assertEquals(200, CockpitProjectionManager.computeCockpitDensityDpi(1280))
+
+    // 2. Fit-center bounds for portrait phone (1080x2400) inside 1280x720 frame
+    val fitRect = CockpitProjectionManager.computeFitCenterContentRect(
+      encWidth = 1280,
+      encHeight = 720,
+      screenWidth = 1080,
+      screenHeight = 2400
+    )
+    assertEquals(720f, fitRect.contentHeight, 0.5f)
+    assertEquals(324f, fitRect.contentWidth, 0.5f)
+    assertEquals(478f, fitRect.contentOffsetX, 0.5f)
+    assertEquals(0f, fitRect.contentOffsetY, 0.5f)
+
+    // Center tap maps to exact phone center (540, 1200)
+    val (cx, cy) = CockpitProjectionManager.mapFrameTouchToPhoneScreen(
+      frameX = 640f,
+      frameY = 360f,
+      fitRect = fitRect,
+      screenWidth = 1080,
+      screenHeight = 2400,
+      applyEdgeGuard = false
+    )
+    assertEquals(540f, cx, 1.5f)
+    assertEquals(1200f, cy, 1.5f)
+
+    // Tap outside fit-center area (left pillarbox x = 10) clamps cleanly to x = 0 instead of dropping
+    val (clampedX, clampedY) = CockpitProjectionManager.mapFrameTouchToPhoneScreen(
+      frameX = 10f,
+      frameY = 360f,
+      fitRect = fitRect,
+      screenWidth = 1080,
+      screenHeight = 2400,
+      applyEdgeGuard = false
+    )
+    assertEquals(0f, clampedX, 0.5f)
+    assertEquals(1200f, clampedY, 1.5f)
+
+    // 3. Touch decoder accepts both 0x0006000x (alt) and 0x0006800x packets with HU grid base
+    val singleClickBody = com.example.protocol.carlife.CarLifeWireProtobuf.Writer(16)
+      .writeVarintField(1, 512)
+      .writeVarintField(2, 300)
+      .toByteArray()
+    val singleClickAltFrame = com.example.protocol.carlife.CarLifeFrameCodec.createCommandFrame(
+      channel = com.example.protocol.carlife.CarLifeChannel.TOUCH,
+      serviceType = com.example.protocol.carlife.CarLifeMsgType.MSG_TOUCH_SINGLE_CLICK_ALT,
+      commandBody = singleClickBody
+    )
+    val decodedClick = com.example.protocol.carlife.CarLifeTouchDecoder.decodeTouchChannelFrame(
+      frame = singleClickAltFrame,
+      targetWidth = 1024,
+      targetHeight = 592,
+      defaultHuWidth = 1024,
+      defaultHuHeight = 600
+    ) as com.example.protocol.carlife.CarLifeInputEvent.Touch
+    assertEquals(com.example.protocol.carlife.CarLifeTouchEventType.SINGLE_CLICK, decodedClick.type)
+    assertEquals(512, decodedClick.rawX)
+    assertEquals(300, decodedClick.rawY)
+    assertEquals(1024, decodedClick.huWidth)
+    assertEquals(600, decodedClick.huHeight)
+    assertEquals(512f, decodedClick.scaledX, 1f)
+    assertEquals(296f, decodedClick.scaledY, 1f)
+
+    val touchActionAltBody = com.example.protocol.carlife.CarLifeWireProtobuf.Writer(16)
+      .writeVarintField(1, 2) // MOVE
+      .writeVarintField(2, 400)
+      .writeVarintField(3, 240)
+      .toByteArray()
+    val touchActionAltFrame = com.example.protocol.carlife.CarLifeFrameCodec.createCommandFrame(
+      channel = com.example.protocol.carlife.CarLifeChannel.TOUCH,
+      serviceType = com.example.protocol.carlife.CarLifeMsgType.MSG_TOUCH_ACTION_ALT,
+      commandBody = touchActionAltBody
+    )
+    val decodedMove = com.example.protocol.carlife.CarLifeTouchDecoder.decodeTouchChannelFrame(
+      frame = touchActionAltFrame,
+      targetWidth = 800,
+      targetHeight = 480,
+      defaultHuWidth = 800,
+      defaultHuHeight = 480
+    ) as com.example.protocol.carlife.CarLifeInputEvent.Touch
+    assertEquals(com.example.protocol.carlife.CarLifeTouchEventType.MOVE, decodedMove.type)
+    assertEquals(400f, decodedMove.scaledX, 1f)
+    assertEquals(240f, decodedMove.scaledY, 1f)
+
+    // 4. VideoResolutionPreferences defaults to Auto (from HU) and persists manual selection
+    val context = ApplicationProvider.getApplicationContext<Context>()
+    com.example.core.usb.VideoResolutionPreferences.clear(context)
+    try {
+      assertTrue(com.example.core.usb.VideoResolutionPreferences.isAutoHuResolution(context))
+      com.example.core.usb.VideoResolutionPreferences.save(context, isAuto = false, manualWidth = 1024, manualHeight = 600)
+      assertFalse(com.example.core.usb.VideoResolutionPreferences.isAutoHuResolution(context))
+      assertEquals(1024, com.example.core.usb.VideoResolutionPreferences.loadManualWidth(context))
+      assertEquals(600, com.example.core.usb.VideoResolutionPreferences.loadManualHeight(context))
+    } finally {
+      com.example.core.usb.VideoResolutionPreferences.clear(context)
+    }
+  }
 }
+
 
 
 

@@ -62,6 +62,10 @@ data class CarLifeControlSessionState(
     val huProtocolMajor: Int = 0,
     val huProtocolMinor: Int = 0,
     val huDeviceInfo: CarlifeDeviceInfoProto? = null,
+    val huRequestedWidth: Int = 0,
+    val huRequestedHeight: Int = 0,
+    val huRequestedFps: Int = 0,
+    val isAutoHuResolution: Boolean = true,
     val negotiatedVideoWidth: Int = 1280,
     val negotiatedVideoHeight: Int = 720,
     val negotiatedFps: Int = 30,
@@ -88,10 +92,12 @@ class CarLifeControlStateMachine(
     private val mobileDeviceInfo: CarlifeDeviceInfoProto = CarlifeDeviceInfoProto(),
     @Volatile var preferredVideoWidth: Int = 1280,
     @Volatile var preferredVideoHeight: Int = 720,
+    @Volatile var useAutoHuResolution: Boolean = true,
     @Volatile var handshakeTestProfile: HandshakeTestProfile = HandshakeTestProfile.TEST_4_AUDIO_VIDEO_NO_SCREEN
 ) {
     private val _sessionState = MutableStateFlow(
         CarLifeControlSessionState(
+            isAutoHuResolution = useAutoHuResolution,
             negotiatedVideoWidth = preferredVideoWidth,
             negotiatedVideoHeight = preferredVideoHeight
         )
@@ -100,9 +106,35 @@ class CarLifeControlStateMachine(
 
     fun reset() {
         _sessionState.value = CarLifeControlSessionState(
+            isAutoHuResolution = useAutoHuResolution,
             negotiatedVideoWidth = preferredVideoWidth,
             negotiatedVideoHeight = preferredVideoHeight
         )
+    }
+
+    fun setAutoHuResolution(enabled: Boolean) {
+        useAutoHuResolution = enabled
+        _sessionState.update { current ->
+            if (enabled) {
+                val (encW, encH, encFps) = resolveNegotiatedEncoderConfig(
+                    rawHuWidth = current.huRequestedWidth,
+                    rawHuHeight = current.huRequestedHeight,
+                    rawHuFps = current.huRequestedFps
+                )
+                current.copy(
+                    isAutoHuResolution = true,
+                    negotiatedVideoWidth = encW,
+                    negotiatedVideoHeight = encH,
+                    negotiatedFps = encFps
+                )
+            } else {
+                current.copy(
+                    isAutoHuResolution = false,
+                    negotiatedVideoWidth = preferredVideoWidth.coerceIn(480, 3840),
+                    negotiatedVideoHeight = preferredVideoHeight.coerceIn(272, 2160)
+                )
+            }
+        }
     }
 
     fun setPreferredResolution(width: Int, height: Int) {
@@ -115,6 +147,36 @@ class CarLifeControlStateMachine(
                 negotiatedVideoWidth = safeW,
                 negotiatedVideoHeight = safeH
             )
+        }
+    }
+
+    /**
+     * Resolves the actual encoder `(encWidth, encHeight, encFps)` based on Auto (from HU) vs Manual preset:
+     * - Auto mode (`useAutoHuResolution == true`): takes valid HU resolution (fallback `1280×720`) and aligns
+     *   both width and height down to multiples of `16` (`(v / 16) * 16`) for hardware H.264 MediaCodec stability.
+     * - Manual mode (`useAutoHuResolution == false`): uses the user-selected manual preset (`preferredVideoWidth × preferredVideoHeight`).
+     * - Frame rate: if HU sent `0` or out-of-range, defaults to `30` (or `60` if `force60FpsOnMqb`).
+     */
+    fun resolveNegotiatedEncoderConfig(
+        rawHuWidth: Int,
+        rawHuHeight: Int,
+        rawHuFps: Int
+    ): Triple<Int, Int, Int> {
+        val effectiveFps = when {
+            force60FpsOnMqb -> 60
+            rawHuFps in 15..60 -> rawHuFps
+            else -> 30
+        }
+        return if (useAutoHuResolution) {
+            val baseW = if (rawHuWidth in 480..3840) rawHuWidth else 1280
+            val baseH = if (rawHuHeight in 272..2160) rawHuHeight else 720
+            val encW = CarlifeVideoEncoderInfoProto.alignToMultipleOf16(baseW, 480, 3840)
+            val encH = CarlifeVideoEncoderInfoProto.alignToMultipleOf16(baseH, 272, 2160)
+            Triple(encW, encH, effectiveFps)
+        } else {
+            val encW = preferredVideoWidth.coerceIn(480, 3840)
+            val encH = preferredVideoHeight.coerceIn(272, 2160)
+            Triple(encW, encH, effectiveFps)
         }
     }
 
@@ -277,9 +339,11 @@ class CarLifeControlStateMachine(
             CarLifeMsgType.MSG_CMD_HU_BT_OOB_INFO,
             CarLifeMsgType.MSG_CMD_HU_BT_OOB_INFO_ALT -> handleBtOobInfo()
             CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT,
-            CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT_ALT -> handleVideoEncoderInit(cmd.body)
+            CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT_ALT,
+            CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT_LEGACY -> handleVideoEncoderInit(cmd.body)
             CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START,
-            CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_ALT -> handleVideoEncoderStart(frame.totalFrameBytes)
+            CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_ALT,
+            CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_LEGACY -> handleVideoEncoderStart(frame.totalFrameBytes)
             CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_PAUSE,
             CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_PAUSE_ALT -> handleVideoEncoderPause()
             CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_RESET -> handleVideoEncoderReset()
@@ -648,41 +712,44 @@ class CarLifeControlStateMachine(
     }
 
     private fun handleVideoEncoderInit(body: ByteArray): ControlTransitionResult {
-        val requested = CarlifeVideoEncoderInfoProto.decode(body)
-        val negotiatedWidth = if (force60FpsOnMqb && requested.width in 480..3840) {
-            requested.width
-        } else {
-            preferredVideoWidth.coerceIn(480, 3840)
-        }
-        val negotiatedHeight = if (force60FpsOnMqb && requested.height in 272..2160) {
-            requested.height
-        } else {
-            preferredVideoHeight.coerceIn(272, 2160)
-        }
-        val negotiatedFps = if (force60FpsOnMqb) 60 else 30
+        val rawRequested = CarlifeVideoEncoderInfoProto.decodeRaw(body)
+        val huReqW = rawRequested.width
+        val huReqH = rawRequested.height
+        val huReqFps = rawRequested.frameRate // already defaults 0 -> 30 inside decodeRaw
+
+        val (encWidth, encHeight, encFps) = resolveNegotiatedEncoderConfig(
+            rawHuWidth = huReqW,
+            rawHuHeight = huReqH,
+            rawHuFps = huReqFps
+        )
 
         val negotiatedProto = CarlifeVideoEncoderInfoProto(
-            width = negotiatedWidth,
-            height = negotiatedHeight,
-            frameRate = negotiatedFps
+            width = encWidth,
+            height = encHeight,
+            frameRate = encFps
         )
         val encodedNegotiated = negotiatedProto.encode()
 
-        // Reply with MSG_CMD_VIDEO_ENCODER_INIT_DONE (0x00010008);
-        // SPS/PPS + IDR streaming begins upon VIDEO_ENCODER_INIT / VIDEO_ENCODER_START.
+        // Reply with MSG_CMD_VIDEO_ENCODER_INIT_DONE (0x00010008) carrying the ACTUAL encoder
+        // dimensions (encWidth, encHeight, encFps) used by hardware MediaCodec.
         val initDoneFrame = CarLifeFrameCodec.createCommandFrame(
             channel = CarLifeChannel.CONTROL,
             serviceType = CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT_DONE, // 0x00010008
             commandBody = encodedNegotiated
         )
 
-        val summary = "Video Init (0x00018007): ${negotiatedProto.width}x${negotiatedProto.height}@${negotiatedProto.frameRate}fps -> TX INIT_DONE (0x00010008)"
+        val modeTag = if (useAutoHuResolution) "Авто (от ГУ)" else "Ручной"
+        val summary = "Video Init [$modeTag]: ГУ=${huReqW}×${huReqH}@${huReqFps} → Кодек=${encWidth}×${encHeight}@${encFps}fps → TX INIT_DONE (0x00010008)"
         _sessionState.update {
             it.copy(
                 phase = CarLifeSessionPhase.VIDEO_INITIALIZED,
-                negotiatedVideoWidth = negotiatedProto.width,
-                negotiatedVideoHeight = negotiatedProto.height,
-                negotiatedFps = negotiatedProto.frameRate,
+                huRequestedWidth = huReqW,
+                huRequestedHeight = huReqH,
+                huRequestedFps = huReqFps,
+                isAutoHuResolution = useAutoHuResolution,
+                negotiatedVideoWidth = encWidth,
+                negotiatedVideoHeight = encHeight,
+                negotiatedFps = encFps,
                 lastControlAction = summary
             )
         }

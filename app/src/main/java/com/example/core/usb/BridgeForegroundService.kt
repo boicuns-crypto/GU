@@ -134,6 +134,7 @@ data class BridgeRuntimeState(
     val videoSourceMode: VideoSourceMode = VideoSourceMode.SCREEN_MIRRORING,
     val appLaunchMode: AppLaunchMode = AppLaunchMode.VIRTUAL_DISPLAY_IF_AVAILABLE,
     val handshakeTestProfile: HandshakeTestProfile = HandshakeTestProfile.TEST_4_AUDIO_VIDEO_NO_SCREEN,
+    val isAutoHuResolution: Boolean = true,
     val configuredWidth: Int = 1280,
     val configuredHeight: Int = 720,
     val configuredBitrateBps: Int = 2_000_000,
@@ -177,9 +178,20 @@ object BridgeTelemetryBus {
             AppModePreferences.loadAppMode(context)
         }
         val savedMuteSpeaker = AudioCapturePreferences.loadMutePhoneSpeaker(context)
+        val savedAutoRes = VideoResolutionPreferences.isAutoHuResolution(context)
+        val savedManualW = VideoResolutionPreferences.loadManualWidth(context)
+        val savedManualH = VideoResolutionPreferences.loadManualHeight(context)
         applyAppModeState(saved, eventNote = "Восстановлен режим: ${saved.title}")
         _runtimeState.update {
             it.copy(
+                isAutoHuResolution = savedAutoRes,
+                configuredWidth = if (savedAutoRes) it.configuredWidth else savedManualW,
+                configuredHeight = if (savedAutoRes) it.configuredHeight else savedManualH,
+                controlSession = it.controlSession.copy(
+                    isAutoHuResolution = savedAutoRes,
+                    negotiatedVideoWidth = if (savedAutoRes) it.controlSession.negotiatedVideoWidth else savedManualW,
+                    negotiatedVideoHeight = if (savedAutoRes) it.controlSession.negotiatedVideoHeight else savedManualH
+                ),
                 mutePhoneSpeakerDuringUsbAudio = savedMuteSpeaker,
                 audioCaptureStats = it.audioCaptureStats.copy(
                     mutePhoneSpeakerDuringUsbAudio = savedMuteSpeaker
@@ -187,6 +199,54 @@ object BridgeTelemetryBus {
             )
         }
         return saved
+    }
+
+    fun setVideoResolutionPreference(
+        isAuto: Boolean,
+        width: Int = _runtimeState.value.configuredWidth,
+        height: Int = _runtimeState.value.configuredHeight,
+        context: Context? = null
+    ) {
+        if (context != null) {
+            VideoResolutionPreferences.save(context, isAuto = isAuto, manualWidth = width, manualHeight = height)
+        }
+        _runtimeState.update { current ->
+            val targetW = if (isAuto) {
+                val reqW = current.controlSession.huRequestedWidth
+                if (reqW in 480..3840) {
+                    com.example.protocol.carlife.CarlifeVideoEncoderInfoProto.alignToMultipleOf16(reqW, 480, 3840)
+                } else {
+                    1280
+                }
+            } else {
+                width.coerceIn(480, 3840)
+            }
+            val targetH = if (isAuto) {
+                val reqH = current.controlSession.huRequestedHeight
+                if (reqH in 272..2160) {
+                    com.example.protocol.carlife.CarlifeVideoEncoderInfoProto.alignToMultipleOf16(reqH, 272, 2160)
+                } else {
+                    720
+                }
+            } else {
+                height.coerceIn(272, 2160)
+            }
+            current.copy(
+                isAutoHuResolution = isAuto,
+                configuredWidth = targetW,
+                configuredHeight = targetH,
+                controlSession = current.controlSession.copy(
+                    isAutoHuResolution = isAuto,
+                    negotiatedVideoWidth = targetW,
+                    negotiatedVideoHeight = targetH
+                ),
+                lastProtocolEvent = if (isAuto) {
+                    "Разрешение видео: Авто (от ГУ) → ${targetW}×${targetH}"
+                } else {
+                    "Разрешение видео (ручное): ${targetW}×${targetH}"
+                }
+            )
+        }
     }
 
     fun setAppMode(mode: AppMode, context: Context? = null) {
@@ -420,6 +480,50 @@ object BridgeTelemetryBus {
 }
 
 /**
+ * Persists user's H.264 resolution mode (`Авто (от ГУ)` by default vs manual preset) in `SharedPreferences`.
+ */
+object VideoResolutionPreferences {
+    private const val PREFS_NAME = "carlife_video_resolution_prefs"
+    private const val KEY_AUTO_HU_RESOLUTION = "auto_hu_resolution"
+    private const val KEY_MANUAL_WIDTH = "manual_width"
+    private const val KEY_MANUAL_HEIGHT = "manual_height"
+
+    fun isAutoHuResolution(context: Context): Boolean =
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getBoolean(KEY_AUTO_HU_RESOLUTION, true)
+
+    fun loadManualWidth(context: Context): Int =
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getInt(KEY_MANUAL_WIDTH, 1280)
+            .coerceIn(480, 3840)
+
+    fun loadManualHeight(context: Context): Int =
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getInt(KEY_MANUAL_HEIGHT, 720)
+            .coerceIn(272, 2160)
+
+    fun save(context: Context, isAuto: Boolean, manualWidth: Int, manualHeight: Int) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_AUTO_HU_RESOLUTION, isAuto)
+            .apply {
+                if (!isAuto) {
+                    putInt(KEY_MANUAL_WIDTH, manualWidth.coerceIn(480, 3840))
+                    putInt(KEY_MANUAL_HEIGHT, manualHeight.coerceIn(272, 2160))
+                }
+            }
+            .apply()
+    }
+
+    fun clear(context: Context) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .clear()
+            .apply()
+    }
+}
+
+/**
  * Foreground Service (`connectedDevice|microphone` type) with `PARTIAL_WAKE_LOCK` orchestrating:
  * - **Core 1**: [UsbAccessoryTransport] + [CarLifeControlStateMachine] (USB AOA + Control Handshake + Heartbeat)
  * - **Core 2**: [CockpitProjectionManager] (`MediaCodec` H.264 + `VirtualDisplay` + `CockpitPresentation` + `dispatchTouchEvent`)
@@ -471,10 +575,16 @@ class BridgeForegroundService : Service() {
     private var activeHandshakeSessionTimestampMs: Long = -1L
 
     @Volatile
+    private var isAutoHuResolution: Boolean = true
+
+    @Volatile
     private var activeWidth: Int = 1280
 
     @Volatile
     private var activeHeight: Int = 720
+
+    @Volatile
+    private var activeFps: Int = 30
 
     @Volatile
     private var activeBitrateBps: Int = 2_000_000
@@ -814,6 +924,12 @@ class BridgeForegroundService : Service() {
         val currentNestedMode = initialRuntime.useNestedVideoMsgHeader
         activeAppMode = initialRuntime.appMode
         activeVideoSourceMode = initialRuntime.videoSourceMode
+        isAutoHuResolution = initialRuntime.isAutoHuResolution
+        activeWidth = initialRuntime.configuredWidth
+        activeHeight = initialRuntime.configuredHeight
+        controlStateMachine.useAutoHuResolution = isAutoHuResolution
+        controlStateMachine.setPreferredResolution(activeWidth, activeHeight)
+        controlStateMachine.setAutoHuResolution(isAutoHuResolution)
         CarLifeFrameCodec.useNestedVideoMsgHeader = currentNestedMode
         isVideoChannelReadyForStreaming = false
 
@@ -1299,35 +1415,73 @@ class BridgeForegroundService : Service() {
             }
 
             ACTION_SET_VIDEO_CONFIG -> {
-                val width = intent.getIntExtra(EXTRA_WIDTH, activeWidth).coerceIn(480, 3840)
-                val height = intent.getIntExtra(EXTRA_HEIGHT, activeHeight).coerceIn(272, 2160)
+                val hasAutoFlag = intent.hasExtra(EXTRA_AUTO_HU_RESOLUTION)
+                val requestedAuto = if (hasAutoFlag) {
+                    intent.getBooleanExtra(EXTRA_AUTO_HU_RESOLUTION, isAutoHuResolution)
+                } else {
+                    isAutoHuResolution
+                }
                 val bitrate = intent.getIntExtra(EXTRA_BITRATE, activeBitrateBps).coerceIn(400_000, 12_000_000)
-                activeWidth = width
-                activeHeight = height
                 activeBitrateBps = bitrate
-                controlStateMachine.setPreferredResolution(width, height)
+                isAutoHuResolution = requestedAuto
+
+                val targetWidth: Int
+                val targetHeight: Int
+                val targetFps: Int
+                if (requestedAuto) {
+                    VideoResolutionPreferences.save(applicationContext, isAuto = true, manualWidth = activeWidth, manualHeight = activeHeight)
+                    controlStateMachine.setAutoHuResolution(true)
+                    val sess = controlStateMachine.sessionState.value
+                    val (encW, encH, encFps) = controlStateMachine.resolveNegotiatedEncoderConfig(
+                        rawHuWidth = sess.huRequestedWidth,
+                        rawHuHeight = sess.huRequestedHeight,
+                        rawHuFps = sess.huRequestedFps
+                    )
+                    targetWidth = encW
+                    targetHeight = encH
+                    targetFps = encFps
+                } else {
+                    val manualW = intent.getIntExtra(EXTRA_WIDTH, activeWidth).coerceIn(480, 3840)
+                    val manualH = intent.getIntExtra(EXTRA_HEIGHT, activeHeight).coerceIn(272, 2160)
+                    VideoResolutionPreferences.save(applicationContext, isAuto = false, manualWidth = manualW, manualHeight = manualH)
+                    controlStateMachine.setPreferredResolution(manualW, manualH)
+                    controlStateMachine.setAutoHuResolution(false)
+                    targetWidth = manualW
+                    targetHeight = manualH
+                    targetFps = activeFps
+                }
+
+                activeWidth = targetWidth
+                activeHeight = targetHeight
+                activeFps = targetFps
                 BridgeTelemetryBus.updateState {
                     it.copy(
-                        configuredWidth = width,
-                        configuredHeight = height,
+                        isAutoHuResolution = isAutoHuResolution,
+                        configuredWidth = targetWidth,
+                        configuredHeight = targetHeight,
                         configuredBitrateBps = bitrate,
-                        lastProtocolEvent = "Video Config Set: ${width}×${height} @ ${bitrate / 1000} kbps"
+                        controlSession = controlStateMachine.sessionState.value,
+                        lastProtocolEvent = if (isAutoHuResolution) {
+                            "Video Config: Авто (от ГУ) → ${targetWidth}×${targetHeight} @ ${bitrate / 1000} kbps"
+                        } else {
+                            "Video Config Set: ${targetWidth}×${targetHeight} @ ${bitrate / 1000} kbps"
+                        }
                     )
                 }
                 if (projectionManager.stats.value.isRunning) {
                     val wasReady = isVideoChannelReadyForStreaming
                     serviceScope.launch {
                         projectionManager.startProjection(
-                            width = width,
-                            height = height,
-                            frameRate = 30,
+                            width = targetWidth,
+                            height = targetHeight,
+                            frameRate = targetFps,
                             bitRate = bitrate,
                             sourceMode = activeVideoSourceMode,
                             targetAppMode = activeAppMode
                         )
                         if (wasReady && usbTransport.state.value is UsbTransportState.Connected) {
                             triggerAutoVideoEncoderStart(
-                                reason = "Resolution/Bitrate Updated (${width}×${height})",
+                                reason = "Resolution/Bitrate Updated (${targetWidth}×${targetHeight})",
                                 includeForegroundAndScreenOn = true
                             )
                         }
@@ -1802,8 +1956,10 @@ class BridgeForegroundService : Service() {
                 // Send mandatory Audio-Init (0x0003 & 0x0004) BEFORE INIT_DONE/START_DONE if HU explicitly sent VIDEO_INIT/START
                 if ((cmd?.serviceType == CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT ||
                         cmd?.serviceType == CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT_ALT ||
+                        cmd?.serviceType == CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT_LEGACY ||
                         cmd?.serviceType == CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START ||
-                        cmd?.serviceType == CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_ALT) &&
+                        cmd?.serviceType == CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_ALT ||
+                        cmd?.serviceType == CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_LEGACY) &&
                     !hasSentAudioInitInSession
                 ) {
                     sendAudioMultiplexerInitPackets()
@@ -1874,40 +2030,54 @@ class BridgeForegroundService : Service() {
                     }
 
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT,
-                    CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT_ALT -> {
-                        // HU sent 0x00018007 (VIDEO_ENCODER_INIT): ensure encoder is running
-                        // and unlock 0x0002 streaming with an immediate SYNC_FRAME.
-                        val targetW = activeWidth.coerceIn(480, 3840)
-                        val targetH = activeHeight.coerceIn(272, 2160)
-                        controlStateMachine.setPreferredResolution(targetW, targetH)
+                    CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT_ALT,
+                    CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_INIT_LEGACY -> {
+                        // HU sent VIDEO_ENCODER_INIT: use negotiated encWidth × encHeight @ encFps
+                        // (Auto from HU aligned to 16, or manual override), configure MediaCodec & VirtualDisplay,
+                        // and wait for MSG_CMD_VIDEO_ENCODER_START to open the 0x0002 stream gate (if not already open).
+                        val negotiated = transition.updatedState
+                        val targetW = negotiated.negotiatedVideoWidth.coerceIn(480, 3840)
+                        val targetH = negotiated.negotiatedVideoHeight.coerceIn(272, 2160)
+                        val targetFps = negotiated.negotiatedFps.coerceIn(15, 60)
+                        activeWidth = targetW
+                        activeHeight = targetH
+                        activeFps = targetFps
+                        BridgeTelemetryBus.updateState {
+                            it.copy(
+                                configuredWidth = targetW,
+                                configuredHeight = targetH,
+                                controlSession = negotiated
+                            )
+                        }
                         projectionManager.ensureProjectionStarted(
                             width = targetW,
                             height = targetH,
-                            frameRate = 30,
+                            frameRate = targetFps,
                             bitRate = activeBitrateBps,
                             sourceMode = activeVideoSourceMode,
                             targetAppMode = activeAppMode
                         )
-                        if (!isVideoChannelReadyForStreaming) {
-                            resetVideoLogFlags()
-                            setVideoStreamingReady(true)
-                            projectionManager.unlockVideoChannelAndRequestSyncFrame()
-                        } else {
+                        if (isVideoChannelReadyForStreaming) {
                             projectionManager.requestInstantIdrKeyFrame()
                         }
                     }
 
                     CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START,
-                    CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_ALT -> {
-                        // HU sent 0x00018009 (VIDEO_ENCODER_START): ensure encoder is running,
-                        // open 0x0002 gate immediately, and push SPS/PPS + IDR.
-                        val targetW = activeWidth.coerceIn(480, 3840)
-                        val targetH = activeHeight.coerceIn(272, 2160)
-                        controlStateMachine.setPreferredResolution(targetW, targetH)
+                    CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_ALT,
+                    CarLifeMsgType.MSG_CMD_VIDEO_ENCODER_START_LEGACY -> {
+                        // HU sent VIDEO_ENCODER_START: ensure encoder runs at negotiated dimensions,
+                        // open 0x0002 streaming gate immediately, and push SPS/PPS + IDR.
+                        val negotiated = transition.updatedState
+                        val targetW = negotiated.negotiatedVideoWidth.coerceIn(480, 3840)
+                        val targetH = negotiated.negotiatedVideoHeight.coerceIn(272, 2160)
+                        val targetFps = negotiated.negotiatedFps.coerceIn(15, 60)
+                        activeWidth = targetW
+                        activeHeight = targetH
+                        activeFps = targetFps
                         projectionManager.ensureProjectionStarted(
                             width = targetW,
                             height = targetH,
-                            frameRate = 30,
+                            frameRate = targetFps,
                             bitRate = activeBitrateBps,
                             sourceMode = activeVideoSourceMode,
                             targetAppMode = activeAppMode
@@ -1969,12 +2139,17 @@ class BridgeForegroundService : Service() {
                 lastHuConfirmationSource = "0x0006 Touch/HardKey"
                 huConfirmationSeq.incrementAndGet()
                 val projStats = projectionManager.stats.value
+                val ctrlSession = controlStateMachine.sessionState.value
+                val encWidth = projStats.width.coerceAtLeast(1)
+                val encHeight = projStats.height.coerceAtLeast(1)
+                val touchBaseW = if (ctrlSession.huRequestedWidth > 0) ctrlSession.huRequestedWidth else encWidth
+                val touchBaseH = if (ctrlSession.huRequestedHeight > 0) ctrlSession.huRequestedHeight else encHeight
                 val decodedEvent = CarLifeTouchDecoder.decodeTouchChannelFrame(
                     frame = frame,
-                    targetWidth = projStats.width.coerceAtLeast(1),
-                    targetHeight = projStats.height.coerceAtLeast(1),
-                    defaultHuWidth = CarLifeTouchDecoder.DEFAULT_HU_TOUCH_MAX_X.toInt(),
-                    defaultHuHeight = CarLifeTouchDecoder.DEFAULT_HU_TOUCH_MAX_Y.toInt()
+                    targetWidth = encWidth,
+                    targetHeight = encHeight,
+                    defaultHuWidth = touchBaseW,
+                    defaultHuHeight = touchBaseH
                 )
                 when (decodedEvent) {
                     is CarLifeInputEvent.Touch -> {
@@ -2036,14 +2211,7 @@ class BridgeForegroundService : Service() {
                 }
 
                 val eventSummary = when (decodedEvent) {
-                    is CarLifeInputEvent.Touch -> when (activeAppMode) {
-                        AppMode.MIRRORING ->
-                            "Touch ${decodedEvent.type.label}: HU(${decodedEvent.rawX},${decodedEvent.rawY}) -> Mirroring (AccessibilityService)"
-                        AppMode.SHIZUKU_COCKPIT ->
-                            "Touch ${decodedEvent.type.label}: HU(${decodedEvent.rawX},${decodedEvent.rawY}) -> Shizuku VD #${projStats.virtualDisplayId} (${decodedEvent.scaledX.toInt()},${decodedEvent.scaledY.toInt()})"
-                        AppMode.COCKPIT ->
-                            "Touch ${decodedEvent.type.label}: HU(${decodedEvent.rawX},${decodedEvent.rawY}) -> Cockpit VD(${decodedEvent.scaledX.toInt()},${decodedEvent.scaledY.toInt()})"
-                    }
+                    is CarLifeInputEvent.Touch -> projectionManager.stats.value.lastTouchDiagnostic
                     is CarLifeInputEvent.HardKey -> {
                         val steeringCfg = TouchSettingsPreferences.steeringWheelConfig.value
                         CarLifeHardKey.formatDiagnosticToast(
@@ -2293,6 +2461,7 @@ class BridgeForegroundService : Service() {
 
         const val EXTRA_RESULT_CODE = "extra_result_code"
         const val EXTRA_RESULT_DATA = "extra_result_data"
+        const val EXTRA_AUTO_HU_RESOLUTION = "extra_auto_hu_resolution"
         const val EXTRA_WIDTH = "extra_width"
         const val EXTRA_HEIGHT = "extra_height"
         const val EXTRA_FPS = "extra_fps"

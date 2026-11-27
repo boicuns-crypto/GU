@@ -323,7 +323,22 @@ data class CarlifeVideoEncoderInfoProto(
         .toByteArray()
 
     companion object {
-        fun decode(bytes: ByteArray): CarlifeVideoEncoderInfoProto {
+        /**
+         * Aligns encoder width/height down to a multiple of 16 (`(v / 16) * 16`) for hardware H.264 MediaCodec compatibility.
+         */
+        fun alignToMultipleOf16(value: Int, minVal: Int, maxVal: Int): Int {
+            val clamped = value.coerceIn(minVal, maxVal)
+            val aligned = (clamped / 16) * 16
+            return aligned.coerceAtLeast((minVal / 16) * 16)
+        }
+
+        /**
+         * Decodes raw `CarlifeVideoEncoderInfo` Protobuf fields from Head Unit (`0x00018007` / `0x00010002`):
+         * - Field 1 (`width`, varint): preserved as-is (`0` if absent/invalid).
+         * - Field 2 (`height`, varint): preserved as-is (`0` if absent/invalid).
+         * - Field 3 (`frameRate`, varint): if `<= 0`, defaults to `30`.
+         */
+        fun decodeRaw(bytes: ByteArray): CarlifeVideoEncoderInfoProto {
             var width = 0
             var height = 0
             var fps = 0
@@ -336,9 +351,19 @@ data class CarlifeVideoEncoderInfoProto(
                     else -> reader.skipField()
                 }
             }
-            val validWidth = if (width in 480..3840) width else 1280
-            val validHeight = if (height in 272..2160) height else 720
-            val validFps = if (fps in 15..60) fps else 30
+            val effectiveFps = if (fps > 0) fps else 30
+            return CarlifeVideoEncoderInfoProto(
+                width = width.coerceAtLeast(0),
+                height = height.coerceAtLeast(0),
+                frameRate = effectiveFps
+            )
+        }
+
+        fun decode(bytes: ByteArray): CarlifeVideoEncoderInfoProto {
+            val raw = decodeRaw(bytes)
+            val validWidth = if (raw.width in 480..3840) raw.width else 1280
+            val validHeight = if (raw.height in 272..2160) raw.height else 720
+            val validFps = if (raw.frameRate in 15..60) raw.frameRate else 30
             return CarlifeVideoEncoderInfoProto(
                 width = validWidth,
                 height = validHeight,

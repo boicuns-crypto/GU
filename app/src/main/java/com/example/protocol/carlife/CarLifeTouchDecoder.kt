@@ -186,7 +186,8 @@ object CarLifeTouchDecoder {
         val cmd = frame.parseCommandMessageOrNull() ?: return null
 
         return when (cmd.serviceType) {
-            CarLifeMsgType.MSG_TOUCH_ACTION -> decodeTouchActionProto(
+            CarLifeMsgType.MSG_TOUCH_ACTION,
+            CarLifeMsgType.MSG_TOUCH_ACTION_ALT -> decodeTouchActionProto(
                 body = cmd.body,
                 targetWidth = targetWidth,
                 targetHeight = targetHeight,
@@ -194,7 +195,8 @@ object CarLifeTouchDecoder {
                 defaultHuHeight = defaultHuHeight
             )
 
-            CarLifeMsgType.MSG_TOUCH_ACTION_DOWN -> decodeSinglePoint(
+            CarLifeMsgType.MSG_TOUCH_ACTION_DOWN,
+            CarLifeMsgType.MSG_TOUCH_ACTION_DOWN_ALT -> decodeSinglePoint(
                 type = CarLifeTouchEventType.DOWN,
                 body = cmd.body,
                 targetWidth = targetWidth,
@@ -203,7 +205,8 @@ object CarLifeTouchDecoder {
                 huHeight = defaultHuHeight
             )
 
-            CarLifeMsgType.MSG_TOUCH_ACTION_MOVE -> decodeSinglePoint(
+            CarLifeMsgType.MSG_TOUCH_ACTION_MOVE,
+            CarLifeMsgType.MSG_TOUCH_ACTION_MOVE_ALT -> decodeSinglePoint(
                 type = CarLifeTouchEventType.MOVE,
                 body = cmd.body,
                 targetWidth = targetWidth,
@@ -212,7 +215,8 @@ object CarLifeTouchDecoder {
                 huHeight = defaultHuHeight
             )
 
-            CarLifeMsgType.MSG_TOUCH_ACTION_UP -> decodeSinglePoint(
+            CarLifeMsgType.MSG_TOUCH_ACTION_UP,
+            CarLifeMsgType.MSG_TOUCH_ACTION_UP_ALT -> decodeSinglePoint(
                 type = CarLifeTouchEventType.UP,
                 body = cmd.body,
                 targetWidth = targetWidth,
@@ -221,7 +225,8 @@ object CarLifeTouchDecoder {
                 huHeight = defaultHuHeight
             )
 
-            CarLifeMsgType.MSG_TOUCH_SINGLE_CLICK -> decodeSinglePoint(
+            CarLifeMsgType.MSG_TOUCH_SINGLE_CLICK,
+            CarLifeMsgType.MSG_TOUCH_SINGLE_CLICK_ALT -> decodeSinglePoint(
                 type = CarLifeTouchEventType.SINGLE_CLICK,
                 body = cmd.body,
                 targetWidth = targetWidth,
@@ -230,7 +235,8 @@ object CarLifeTouchDecoder {
                 huHeight = defaultHuHeight
             )
 
-            CarLifeMsgType.MSG_TOUCH_DOUBLE_CLICK -> decodeSinglePoint(
+            CarLifeMsgType.MSG_TOUCH_DOUBLE_CLICK,
+            CarLifeMsgType.MSG_TOUCH_DOUBLE_CLICK_ALT -> decodeSinglePoint(
                 type = CarLifeTouchEventType.DOUBLE_CLICK,
                 body = cmd.body,
                 targetWidth = targetWidth,
@@ -239,7 +245,8 @@ object CarLifeTouchDecoder {
                 huHeight = defaultHuHeight
             )
 
-            CarLifeMsgType.MSG_TOUCH_LONG_PRESS -> decodeSinglePoint(
+            CarLifeMsgType.MSG_TOUCH_LONG_PRESS,
+            CarLifeMsgType.MSG_TOUCH_LONG_PRESS_ALT -> decodeSinglePoint(
                 type = CarLifeTouchEventType.LONG_PRESS,
                 body = cmd.body,
                 targetWidth = targetWidth,
@@ -336,16 +343,25 @@ object CarLifeTouchDecoder {
         var width = defaultHuWidth
         var height = defaultHuHeight
 
-        val reader = CarLifeWireProtobuf.Reader(body)
-        while (reader.readTag()) {
-            when (reader.lastFieldNumber) {
-                1 -> actionCode = reader.readVarint32()
-                2 -> x = reader.readVarint32()
-                3 -> y = reader.readVarint32()
-                4 -> width = reader.readVarint32().takeIf { it > 0 } ?: defaultHuWidth
-                5 -> height = reader.readVarint32().takeIf { it > 0 } ?: defaultHuHeight
-                else -> reader.skipField()
+        val firstByte = body.firstOrNull()?.toInt()?.and(0xFF)
+        val looksLikeProto = firstByte == 0x08 || firstByte == 0x10 || firstByte == 0x18
+        if (looksLikeProto) {
+            val reader = CarLifeWireProtobuf.Reader(body)
+            while (reader.readTag()) {
+                when (reader.lastFieldNumber) {
+                    1 -> actionCode = reader.readVarint32()
+                    2 -> x = reader.readVarint32()
+                    3 -> y = reader.readVarint32()
+                    4 -> width = reader.readVarint32().takeIf { it > 0 } ?: defaultHuWidth
+                    5 -> height = reader.readVarint32().takeIf { it > 0 } ?: defaultHuHeight
+                    else -> reader.skipField()
+                }
             }
+        } else if (body.size >= 12) {
+            val buf = ByteBuffer.wrap(body).order(ByteOrder.BIG_ENDIAN)
+            actionCode = buf.int
+            x = buf.int
+            y = buf.int
         }
 
         val eventType = when (actionCode) {
